@@ -1,0 +1,30 @@
+# TrackNetV3 のファインチューニング設定（smash-speed train --config configs/train.yaml）
+# 既定設定（default.yaml）に上書きされる。
+
+detection:
+  tracknet:
+    repo_dir: ../TrackNetV3                  # git clone した TrackNetV3
+    tracknet_ckpt: ../TrackNetV3/ckpts/TrackNet_best.pt
+    inpaintnet_ckpt: ../TrackNetV3/ckpts/InpaintNet_best.pt
+    python: null                             # TrackNetV3 用の Python（null なら現在の Python）
+
+train:
+  dataset_dir: data/tracknet_dataset         # smash-speed export-tracknet の出力（TrackNetV3/data にコピーされる）
+  run_preprocess: true                       # TrackNetV3 の preprocess.py（フレーム画像・val・背景画像の作成）
+  save_dir: exp_finetune                     # TrackNetV3 内の保存先
+  epochs: 10                                 # 学習済みの重みから追加で回すエポック数
+  batch_size: 10
+  learning_rate: 1.0e-4                      # ファインチューニングなので小さめ
+  seq_len: 8
+  bg_mode: concat                            # 学習済み重みと同じにする（重みの param_dict を確認）
+  mixup_alpha: 0.5
+  tolerance_px: 4
+  split_ratios: [0.7, 0.15, 0.15]            # グループ（撮影日・場所・選手）単位の分割
+  augment_copies: 1                          # 学習用にデータ拡張したコピーを何本加えるか
+  augment:
+    brightness: 25                           # 明るさの変化 [輝度]
+    contrast: 0.2                            # コントラストの変化（倍率 ±）
+    noise_sd: 4.0                            # ガウスノイズ [輝度]
+    scale: 0.1                               # 拡大縮小（倍率 ±）
+    shift_px: 40                             # 平行移動 [px]
+    blur_max: 2                              # ガウスぼかしのカーネル半径の上限

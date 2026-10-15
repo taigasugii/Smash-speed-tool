@@ -1,0 +1,140 @@
+# smash-speed 既定設定
+# 単位はキーの末尾またはコメントで明記する。解析ごとに使用した設定は出力先へスナップショット保存される。
+
+seed: 42
+
+# ---------------------------------------------------------------------------
+# 座標系（README「座標系」参照）
+#   原点: ネット直下のコート中央（床面）
+#   x: コート長辺方向。打者側が負、相手側が正 [m]
+#   y: コート短辺方向 [m]
+#   z: 鉛直上向き、床面 z = 0 [m]
+# ---------------------------------------------------------------------------
+court:
+  # BWF 競技規則の寸法（ライン幅 40 mm を含む外側寸法）。Phase 2 で原文と再照合する。
+  half_length_m: 6.70          # ネット〜バックバウンダリーライン外側
+  half_width_doubles_m: 3.05   # センター〜ダブルスサイドライン外側
+  half_width_singles_m: 2.59   # センター〜シングルスサイドライン外側
+  short_service_m: 1.98        # ネット〜ショートサービスライン
+  long_service_doubles_m: 5.94 # ネット〜ダブルスのロングサービスライン
+  line_width_m: 0.04
+  net_height_center_m: 1.524
+  net_height_post_m: 1.55
+
+# キャリブレーションでクリックするランドマーク（表示順）。
+# 名前の規則: <場所>_<x側: h=打者側(x<0) / o=相手側(x>0)>_<y側: n=y<0 / p=y>0>
+landmarks:
+  - {name: back_corner_h_n,        xyz: [-6.70, -3.05, 0.0]}
+  - {name: back_corner_h_p,        xyz: [-6.70,  3.05, 0.0]}
+  - {name: back_singles_h_n,       xyz: [-6.70, -2.59, 0.0]}
+  - {name: back_singles_h_p,       xyz: [-6.70,  2.59, 0.0]}
+  - {name: long_service_h_n,       xyz: [-5.94, -3.05, 0.0]}
+  - {name: long_service_h_p,       xyz: [-5.94,  3.05, 0.0]}
+  - {name: short_service_side_h_n, xyz: [-1.98, -3.05, 0.0]}
+  - {name: short_service_side_h_p, xyz: [-1.98,  3.05, 0.0]}
+  - {name: short_service_center_h, xyz: [-1.98,  0.00, 0.0]}
+  - {name: post_base_n,            xyz: [ 0.00, -3.05, 0.0]}
+  - {name: post_base_p,            xyz: [ 0.00,  3.05, 0.0]}
+  - {name: post_top_n,             xyz: [ 0.00, -3.05, 1.55]}
+  - {name: post_top_p,             xyz: [ 0.00,  3.05, 1.55]}
+  - {name: net_top_center,         xyz: [ 0.00,  0.00, 1.524]}
+  - {name: short_service_center_o, xyz: [ 1.98,  0.00, 0.0]}
+  - {name: short_service_side_o_n, xyz: [ 1.98, -3.05, 0.0]}
+  - {name: short_service_side_o_p, xyz: [ 1.98,  3.05, 0.0]}
+  - {name: long_service_o_n,       xyz: [ 5.94, -3.05, 0.0]}
+  - {name: long_service_o_p,       xyz: [ 5.94,  3.05, 0.0]}
+  - {name: back_singles_o_n,       xyz: [ 6.70, -2.59, 0.0]}
+  - {name: back_singles_o_p,       xyz: [ 6.70,  2.59, 0.0]}
+  - {name: back_corner_o_n,        xyz: [ 6.70, -3.05, 0.0]}
+  - {name: back_corner_o_p,        xyz: [ 6.70,  3.05, 0.0]}
+  # シングルスサイドライン・センターラインとの交点（追加の候補。映っていれば精度が上がる）
+  - {name: short_service_singles_h_n, xyz: [-1.98, -2.59, 0.0]}
+  - {name: short_service_singles_h_p, xyz: [-1.98,  2.59, 0.0]}
+  - {name: long_service_singles_h_n,  xyz: [-5.94, -2.59, 0.0]}
+  - {name: long_service_singles_h_p,  xyz: [-5.94,  2.59, 0.0]}
+  - {name: back_center_h,             xyz: [-6.70,  0.00, 0.0]}
+  - {name: long_service_center_h,     xyz: [-5.94,  0.00, 0.0]}
+  - {name: short_service_singles_o_n, xyz: [ 1.98, -2.59, 0.0]}
+  - {name: short_service_singles_o_p, xyz: [ 1.98,  2.59, 0.0]}
+  - {name: long_service_singles_o_n,  xyz: [ 5.94, -2.59, 0.0]}
+  - {name: long_service_singles_o_p,  xyz: [ 5.94,  2.59, 0.0]}
+  - {name: back_center_o,             xyz: [ 6.70,  0.00, 0.0]}
+  - {name: long_service_center_o,     xyz: [ 5.94,  0.00, 0.0]}
+
+video:
+  ffprobe: null      # null なら PATH から探す
+  ffmpeg: null
+
+detection:
+  baseline:
+    process_width: 1280        # 検出は横幅をこの値まで縮小して行う [px]
+    diff_threshold: 15         # 3フレーム差分の閾値 [輝度 0-255]
+    min_area_px: 2             # 候補の面積の範囲 [px^2]（縮小後）
+    max_area_px: 600
+    max_streak_area_px: 4000   # 細長い残像（低 fps のシャトル）ならこの面積まで許す
+    max_streak_width_px: 8.0   # 残像とみなす平均の太さ（面積 / 長さ）の上限 [px]
+    group_px: 5                # 途切れた残像をまとめる膨張の大きさ [px]
+    max_candidates: 30
+    max_speed_px_s: 8000.0     # 画像上の最大速さ [px/s]（縮小後）
+    gate_px: 12.0              # 予測位置からの許容ずれ [px]（縮小後）
+    max_gap_frames: 2
+    min_track_len: 4
+    outlier_px: 4.0
+    roi: null                  # [x0, y0, x1, y1]（元解像度 px）
+    min_brightness: 0
+  tracknet:
+    repo_dir: null             # TrackNetV3 を clone したディレクトリ
+    tracknet_ckpt: null        # ckpts/TrackNet_best.pt
+    inpaintnet_ckpt: null      # ckpts/InpaintNet_best.pt（省略可）
+    python: null               # TrackNetV3 用の Python（null なら現在の Python）
+  match_tolerance_px: 4.0      # 検出が正しいとみなす距離 [px]（評価用。解像度に応じて調整）
+
+events:
+  speed_of_sound_mps: 343.0    # 音速 [m/s]（20 °C）。打球音はカメラまでの距離 / 音速だけ遅れて届くので補正する
+  audio_highpass_hz: 2000.0    # 打球音検出の高域通過フィルタ [Hz]
+  audio_k_mad: 10.0            # 打球音の閾値（雑音の MAD の倍数）
+  manual_sigma_s: 0.003        # 手動指定した打点時刻の不確かさ [s]
+  max_flight_s: 1.2            # 打点からこの時間までの検出を当てはめに使う [s]
+  impact_lookback_s: 0.1       # 最初の検出よりどれだけ前まで打点を探すか [s]（低 fps では序盤が写らないことがある）
+  contact_offset_m: 0.3        # 打点は打者の足元から飛行方向へこれだけ前と仮定 [m]（hitter_position 法）
+  contact_sigma_m: 0.4         # 同・位置の不確かさ [m]
+
+calibration:
+  reproj_warn_px: 5.0     # この値を超える再投影誤差の点を警告 [px]
+  min_points: 6           # 3x4 投影行列（DLT）に必要な最少点数
+
+physics:
+  g_mps2: 9.81
+  terminal_velocity_mps: 6.7   # シャトルの終端速度 v_t（文献値）。推定オプションあり
+  estimate_terminal_velocity: false
+  integrator: DOP853           # solve_ivp の積分法。数値微分ヤコビアンを安定させるため許容誤差は小さめ
+  rtol: 1.0e-10
+  atol: 1.0e-12
+  loss: huber
+  loss_scale_px: 2.0           # Huber 損失の切り替え点 [px]
+  ci_method: jacobian          # jacobian | bootstrap | none
+  bootstrap_n: 200
+  ci_level: 0.95
+  impact_time_sigma_s: 0.002   # 打点時刻の不確かさ（音声で推定した場合の既定値）[s]。信頼区間に加算
+  # 飛行平面のずれは初速に大きく効く（向き 1° ≈ 5%、位置 10 cm ≈ 3%。合成データでの例）。
+  # refine_plane を有効にすると、平面の向き・位置も再投影誤差から同時に推定する。
+  refine_plane: true
+  plane_sigma_deg: 5.0         # クリックで決めた平面の向きの不確かさ [deg]
+  plane_sigma_m: 0.5           # 同・法線方向の位置の不確かさ [m]
+
+# 合成データ（テスト・精度検証用）
+synthetic:
+  camera:
+    eye_m: [-1.0, -9.5, 4.0]   # コートの側方・高い位置
+    target_m: [-1.0, 0.0, 1.0]
+    f_px: 1500.0
+    width: 1920
+    height: 1080
+  smash:
+    impact_m: [-4.5, -0.8, 2.7]  # 打点の位置
+    landing_xy_m: [3.0, 0.6]     # 着地点の目安（飛行平面の向きを決める）
+    elevation_deg: -12.0         # 打ち出し角（下向きが負）[deg]
+    speed_range_mps: [50.0, 100.0]
+  noise_px: 1.5                # 検出位置のガウスノイズ（標準偏差）[px]
+  dropout: 0.1                 # 検出漏れの割合
+  exposure_s: 0.0              # 0 なら瞬間露光。>0 なら露光中の平均位置（ブレの重心）を観測とする

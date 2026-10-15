@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smash-speed"
+version = "0.0.1"
+description = "バドミントンのスマッシュ動画からシャトルの初速・平均速度を推定する研究用ツール"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "pyyaml>=6.0",
+    "matplotlib>=3.8",
+    "opencv-python>=4.9",
+]
+
+[project.optional-dependencies]
+# Phase 6 で導入（CPU 版で可）
+dl = ["torch>=2.2", "torchvision>=0.17"]
+# 打点推定の補助（任意）
+pose = ["mediapipe>=0.10"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+smash-speed = "smash_speed.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["smash_speed*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

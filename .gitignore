@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# 動画・ラベル・学習済み重み・出力は Git 管理外
+data/*
+!data/.gitkeep
+outputs/
+ckpts/
+*.mp4
+*.mov
+*.MOV
+*.avi
+*.pt
+*.pth

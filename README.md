@@ -1,0 +1,290 @@
+# smash-speed
+
+バドミントンのスマッシュ動画から、シャトルの **初速（インパクト直後の速さ）** と **平均速度** を推定する研究用ツール。
+240fps の高速度撮影に加え、一般的なスマホ動画（30 / 60fps）でどこまで正確に推定できるかを検証する仕組みを含む。
+
+フレーム間の差分ではなく、**空気抵抗つきの運動方程式を軌道全体に当てはめ**、打点時刻での速さを求める。
+低 fps では打点直後の数十 ms に大きく減速する区間が写らないため、差分では初速を大きく過小評価する（下の「合成データでの検証結果」）。
+
+## 処理の流れ
+
+```
+動画読み込み（ffprobe, VFR 対応）→ キャリブレーション（コート・ネットをクリック → 3x4 投影）
+→ シャトル検出（背景差分ベースライン / TrackNetV3）→ 打点時刻（打球音・軌道の交点・打者の位置）
+→ 3次元化（鉛直な飛行平面との交点 / 2台の三角測量）→ 運動方程式の当てはめ（再投影誤差 + Huber 損失）
+→ 初速・平均速度・到達時速度と 95% 信頼区間 → CSV・グラフ・オーバーレイ動画
+```
+
+途中結果（`calibration.json`・`detections.csv`・`events.json` など）はすべて保存し、どの段階からでもやり直せる。
+
+---
+
+## セットアップ（Windows）
+
+前提：Python 3.11 以上（開発は 3.12）、ffmpeg / ffprobe。
+
+```powershell
+# ffmpeg（未導入の場合。インストール後はターミナルを開き直す）
+winget install --id Gyan.FFmpeg -e
+
+# 仮想環境
+cd smash-speed
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+
+# 任意：深層学習（TrackNetV3 の推論・学習。CPU 版で可）／姿勢推定（MediaPipe）
+python -m pip install -e ".[dl]"
+python -m pip install -e ".[pose]"
+
+# テスト（合成データで全モジュールを確認。1 分ほど）
+pytest
+```
+
+ffmpeg が PATH にない場合も、winget の既定のインストール先は自動で探す。別の場所なら `configs/default.yaml` の `video.ffmpeg` / `video.ffprobe` に書く。
+
+---
+
+## 使い方
+
+### 0. まず合成データで通しで動かす
+
+```powershell
+smash-speed synth --out outputs/demo --speed 80 --fps 240
+smash-speed analyze --video outputs/demo/synthetic.mp4 --calib outputs/demo/calibration.json `
+    --audio outputs/demo/synthetic.wav "--hitter=-4.8,-0.86" "--landing=5.16,1.0" --out outputs/demo/analysis
+```
+
+`outputs/demo/truth.json` に正解（初速 288 km/h、打者・着地点の座標）がある。
+
+> **負の座標の渡し方**：`--hitter -4.8,-0.86` はオプションと誤認されるので、`"--hitter=-4.8,-0.86"` のように `=` でつなぐ。
+
+### 1. スマッシュを探す（長い動画の場合）
+
+```powershell
+smash-speed onsets --video IMG_4521.MOV > onsets.csv      # 打球音の候補時刻と強さ
+```
+
+### 2. キャリブレーション（カメラごとに1回）
+
+```powershell
+smash-speed calibrate --video smash01.mp4 --time 12.0 --out calib.json
+```
+
+ウィンドウに1フレームが表示され、右上の上面図で **赤く光るランドマーク** を順にクリックする（映っていない点は `s` でスキップ）。
+
+| 操作 | キー |
+|---|---|
+| 点を置く | 左クリック |
+| スキップ / 元に戻す | `s` / `u`・BackSpace |
+| 前 / 次のランドマーク | `b` / `n` |
+| 点の微調整（刻み 0.25 / 1 / 5 px） | 矢印キー（刻みは `[` `]`） |
+| 拡大縮小・移動 | ホイール・`z` `x`・右ドラッグ・`r` |
+| 推定して再投影を重ね描き | `c` |
+| 保存 / 中止 | Enter / Esc |
+
+`c` を押すとコートのラインとネットが重ね描きされ、点ごとの再投影誤差がコンソールに出る（5 px を超える点は赤丸と警告）。
+同じ位置に固定したカメラの別の動画には `calib.json` をそのまま使える。確認は
+`smash-speed check-calib --video smash02.mp4 --calib calib.json --out check.png`。
+
+- クリックの座標を JSON（`{"ランドマーク名": [u, v], ...}`）で渡して GUI なしでも推定できる（`--points pts.json --no-gui`）。
+- レンズの歪みが大きい（超広角など）場合は `--k1`、またはチェッカーボードで内部パラメータを求めて `--intrinsics` で渡す
+  （`smash_speed.calibration.solve.intrinsics_from_checkerboard`）。
+
+### 3. 解析
+
+```powershell
+smash-speed analyze --video smash01.mp4 --calib calib.json --start 61.8 --end 62.8 `
+    "--hitter=-4.5,-0.8" "--landing=4.0,1.2" --out outputs/smash01
+```
+
+| 入力 | 説明 |
+|---|---|
+| `--start` `--end` | 解析区間 [s]。打点の少し前から着地まで（1 本のスマッシュ） |
+| `--capture-fps` | 実際の撮影 fps。スロー動画が 30fps として記録されている場合などに指定（時刻を実時間に換算） |
+| 飛行平面 | `--hitter` `--landing`（コート座標 [m]）、`--hitter-px` `--landing-px`（画像座標）、`--plane-gui`（クリック）、`--plane plane.json` のいずれか。省略すると格子探索で推定（試験的） |
+| 打点時刻 | 既定 `--impact-method auto`：打球音 → 打点前の軌道との交点 → 打者の位置 → 最初の検出 の順。`--impact-time` で手動指定も可 |
+| `--detections` | 既存の検出 CSV（TrackNetV3 の結果やアノテーション）を使う |
+| `--ci bootstrap` | 信頼区間をブートストラップで出す（既定はヤコビアン） |
+| `--force` | 保存済みの途中結果を使わず作り直す |
+
+出力（`--out`）：
+
+| ファイル | 内容 |
+|---|---|
+| `result.csv` | 初速・平均速度（移動距離 / 直線距離）・到達時速度・減速率（m/s と km/h）、95% 信頼区間、フレーム間差分による参考値、使用フレーム数、fps、モード |
+| `speed_time.png` | 時刻と速さ（物理モデル・フレーム間差分・初速の信頼区間） |
+| `trajectory.png` | 3次元軌道の側面図・上面図 |
+| `image_fit.png` | 画像上の検出と当てはめた軌道の比較 |
+| `overlay.mp4` | 検出位置・当てはめた軌道・初速を描き込んだ動画 |
+| `config_used.yaml` ほか | 使用した設定・実行メタデータ・各段階の途中結果 |
+
+複数本の集計：`smash-speed summarize --results outputs --out summary.csv`
+
+### 4. 2台カメラ（高精度モード）
+
+```powershell
+smash-speed stereo --videos camA.mp4 camB.mp4 --calibs calibA.json calibB.json --start 10.0 --end 11.0 --out outputs/stereo01
+```
+
+時刻合わせは打球音の相互相関（`--offset` で手動指定・微調整も可）。平面拘束を使わず 6 自由度で当てはめる。
+
+### 5. 正解ラベル・学習データ・TrackNetV3
+
+```powershell
+smash-speed annotate --video smash01_240.mp4 --start 61.8 --end 62.8 --out labels/smash01 --init outputs/smash01/detections.csv
+smash-speed make-lowfps --video smash01_240.mp4 --labels labels/smash01/labels.csv --target-fps 30 60 120 --blur --out data/lowfps
+smash-speed export-tracknet --index data/index.csv --out data/tracknet_dataset
+smash-speed train --config configs/train.yaml          # PC に GPU があれば。なければ notebooks/ の Colab 版
+smash-speed detect --video smash01.mp4 --start 61.8 --end 62.8 --detector tracknet --out det_tn.csv
+smash-speed eval-detection --pred det_tn.csv --gt labels/smash01/labels.csv
+```
+
+アノテーションの操作：左クリック（位置。自動で次へ）、`x`（見えない）、`h`（打点）、`g`（着地）、`i`（前後の手動ラベルから線形補間）、
+Space（提案位置を採用）、`a` `d` / `A` `D` / `f` `F`（1 / 10 / 30 フレーム移動）、`w`（保存）、Esc（保存して終了）。
+出力は本ツールの `labels.csv` と TrackNetV3 形式の `<動画名>_ball.csv`（Frame, Visibility, X, Y）。
+
+`data/index.csv` の列：`video, labels, session, date, player`（分割は **撮影セッション単位**。フレーム単位では分けない）。
+
+### 6. 精度検証
+
+```powershell
+smash-speed validate --synthetic --n 100 --out outputs/validation_synthetic      # 合成データ
+smash-speed validate --dataset data/validation/index.csv --out outputs/validation   # 240fps 実データを正解に
+```
+
+実データの一覧 CSV の列：`shot, video, labels, calib, capture_fps, hitter_x, hitter_y, landing_x, landing_y`。
+`--reference speedgun.csv`（`shot, speed_kmh`）でスピードガンなどの外部計測値も併記できる。
+出力：`results.csv`（1本・1条件ごと）、`summary.csv`（MAE・MAPE・バイアス・一致限界・CI の被覆率）、`mape_vs_fps.png`、
+`bland_altman.png`、`correction.csv`（線形補正の前後）。
+
+---
+
+## 座標系
+
+| 軸 | 定義 |
+|---|---|
+| 原点 | ネット直下のコート中央（床面） |
+| x | コートの長辺方向（-6.70 〜 +6.70 m）。打者側が負、相手側が正 |
+| y | コートの短辺方向（-3.05 〜 +3.05 m） |
+| z | 鉛直上向き（床面が z = 0） |
+
+ランドマークの名前は `<場所>_<h: 打者側 x<0 / o: 相手側 x>0>_<n: y<0 / p: y>0>`。一覧と実寸は `configs/default.yaml` の `landmarks`。
+コートの寸法はラインの幅（40 mm）を含むので、**ラインの外側の角** をクリックする。
+寸法（13.40 × 6.10 m、ショートサービスライン 1.98 m、ダブルスのロングサービスライン 0.76 m 内側、シングルスのサイドライン 0.46 m 内側、
+ネットの高さ 中央 1.524 m・ポスト 1.55 m）は BWF 競技規則の値。
+
+## 撮影ガイド
+
+精度に効く順に：
+
+1. **音声を録る**（打球音で打点時刻が 2 ms 程度で決まる）。打点時刻の誤差は初速の誤差に直結する（初速 80 m/s 付近で 1 ms ≈ 1.3 m/s）。
+2. **コートの側方・高い位置（2〜4 m）から、飛行平面をほぼ正面に見る**。カメラは飛行平面から 6〜10 m 離す。
+   ネット際の低い位置から斜めに見ると、平面との交点の誤差が大きくなる。
+3. **三脚で固定し、ズームしない**（キャリブレーションを使い回せる）。キャリブレーション用に、ネットポストの上端・根元とコートの角が
+   なるべく多く映るようにする（高さのある点を最低 1 つ）。
+4. **シャッター速度を速く**（1/1000 s 以上が目安）。低 fps・長い露光ではシャトルが薄く長い残像になり、
+   打点直後の数フレームが検出できないことがある（合成データで確認）。
+5. 可能なら 240fps のスロー撮影。スロー動画を書き出すと 30fps として記録されることがあるので `--capture-fps 240` を指定する。
+6. 超広角（0.5x）は歪みが大きいので、可能なら 1x を使う。使う場合は `--k1` を試す。
+
+## 精度に影響する仮定（結果を解釈するときの注意）
+
+| 仮定 | 影響（合成データでの例） | 対策 |
+|---|---|---|
+| **平面拘束**：シャトルは打者の足元と着地点を通る鉛直な平面内を飛ぶ | 平面の向きが 1° ずれると初速が約 5%、位置が 10 cm ずれると約 3% ずれる | `refine_plane`（既定で有効）で平面の向き・位置も再投影誤差から推定する。2° / 0.2 m のずれでも補正後は数 % |
+| **空気抵抗**：速度の2乗に比例し、終端速度 v_t は一定（既定 6.7 m/s） | v_t はシャトルの種類（羽根 / ナイロン）・気温・気圧で変わる | `estimate_terminal_velocity: true` でデータから推定（240fps で軌道が長く写っている場合） |
+| **打点時刻** | 80 m/s では 1 ms のずれ ≈ 1.3 m/s | 打球音（伝搬遅れ＝カメラまでの距離 / 343 m/s を自動補正）、軌道の交点、打者の位置。信頼区間に打点時刻の不確かさを加算 |
+| **音と映像の同期** | スマホの音声と映像の内部的なずれは機種による | 必要なら `--av-offset` で補正（手を叩く様子を撮って確認できる） |
+| **打点直後のシャトルの反転（フリップ）** | 打点後 数 ms の過渡的な挙動はモデル化していない | 初速は「当てはめた軌道を打点時刻に外挿した速さ」と定義する |
+| **平面の補正が効く条件** | 平面の向き・位置の補正は、強い減速による軌道の曲がりを手がかりにする。終端速度に近い落下（高いクリアの落ち際など）では、ほぼ等速直線運動になり「近くて遅い」と「遠くて速い」を区別できない | スマッシュの序盤には有効。落下中のシャトルを解析するときは `refine_plane: false` にして平面を正しく与える |
+| **カメラモデル** | 歪みを無視すると画像の端で誤差が出る | `--k1`・チェッカーボード |
+| **観測時刻 = 露光の中央** | ローリングシャッター（行ごとの時刻のずれ）は無視している | 高速シャッターで影響は小さくなる |
+
+## 合成データでの検証結果
+
+`smash-speed validate --synthetic --n 100`（初速 50〜100 m/s、検出ノイズ 1.5 px、検出漏れ 10%、飛行平面のずれ 2° / 0.2 m を
+`refine_plane` で補正、打球音による打点時刻の誤差 σ = 2 ms）。初速の MAPE [%]：
+
+| 方法 | 30fps | 60fps | 120fps | 240fps | 30fps のバイアス |
+|---|---|---|---|---|---|
+| フレーム間差分（最初の区間） | 36.0 | 22.6 | 12.9 | 6.9 | -98 km/h |
+| 物理モデル + 打球音 | 4.4 | 4.4 | 3.9 | 3.2 | ±0 km/h |
+| 物理モデル + 打者の位置 | 9.0 | 8.1 | 6.0 | 5.6 | +5 km/h |
+| 物理モデル + 最初の検出 | 17.1 | 8.0 | 4.9 | 2.9 | +2 km/h |
+
+物理モデル + 打球音の 95% 信頼区間の被覆率：0.94〜0.97（名目 0.95）。
+
+- **物理モデル + 打球音** は 30fps でも 240fps とほぼ同じ精度で、誤差の大半は打点時刻（2 ms）と飛行平面のずれによる。
+- **フレーム間差分** は、低 fps ほど初速を大きく過小評価する（30fps で −36%）。線形補正（前半 50 本で学習・後半で評価）でも 30fps では 12% 残る（補正係数は撮影条件ごとに違うので使い回せない）。
+- 音声がない場合、最初の検出から打点を推定すると 30fps で 17%。打者の位置（打点 = 足元の 0.3 m 前、σ 0.4 m）から推定すると 9% に改善する。
+- 240fps では最初の検出から推定しても打点時刻の誤差が ±2 ms 程度に収まるため、打球音と同程度以上の精度になる。
+
+> これは合成データ（仮定どおりの理想的な条件）での結果で、実データの精度は 240fps 実動画での検証（`validate --dataset`）で確かめる必要がある。
+
+## 実動画（IMG_4521.MOV, iPhone 17, 4K 30fps）で試した結果
+
+| 段階 | 結果 |
+|---|---|
+| 動画の読み込み | 3840×2160、平均 29.96fps（わずかに可変）、150.8 s、音声あり。位置情報のタグは出力に含めない |
+| キャリブレーション | 7 点（ダブルス / シングルスのサイドライン × バックバウンダリー・ショートサービスライン、ネットポストの上端 2・根元 1）で RMSE 6.6 px。カメラ位置 (0.54, −4.25, 0.95) m、f = 1668 px（水平画角 約 98°＝超広角）。ラインとネットの再投影は目視でほぼ一致 |
+| 打球音 | 285 個の候補（隣のコートの音も含む） |
+| シャトル検出 | 打者に向かって落ちてくるシャトル（遅い）は ROI を絞ると 12 フレーム連続で検出できた。一方、打った直後の速いシャトルは 30fps の長い露光で薄い残像になり、ベースライン検出では拾えなかった |
+| 初速 | **この動画では信頼できる値を出せなかった**。映っている打球の多くはクリア（すぐ画面の上に出る）で、左半面の選手のスマッシュは見つからなかった。落下中のシャトルは上記の理由で平面を補正できず、平面を固定した当てはめも再投影誤差 12 px と悪い |
+
+この動画のキャリブレーションの点は、クリック GUI ではなく画像からの目視・直線の当てはめで決めたもの。正式には `calibrate` の GUI でやり直すこと。
+次に撮るときは「撮影ガイド」のとおり、スマッシュを打つ選手の側方・高い位置から、速いシャッターで撮るのがよい。
+
+## 再現性
+
+- 乱数シードは設定の `seed` で固定する。
+- 各出力に、使用した設定のスナップショット（`config_used.yaml`）と実行メタデータ（バージョン・git コミット・日時・コマンドの引数）を保存する。
+
+## 外部のモデル・データ
+
+- [TrackNetV3](https://github.com/qaz812345/TrackNetV3)（MIT License。学習済み重みも同ライセンスと README に記載）を
+  サブプロセスとして呼び出す（コードは同梱しない）。準備：
+  1. `git clone https://github.com/qaz812345/TrackNetV3` し、README の Google Drive から `TrackNet_best.pt`・`InpaintNet_best.pt` を `ckpts/` に置く
+  2. TrackNetV3 用の環境を作り（`pip install -r requirements.txt`）、`configs/default.yaml` の `detection.tracknet` にパスを書く
+  - 学習データセット（Shuttlecock Trajectory Dataset）のライセンスは README に記載がないため、使う場合は別途確認する。
+  - ファインチューニングは、学習済み重みを `TrackNet_cur.pt` としてコピーし `--resume_training` で再開する方式（`train.py` に任意の重みから始めるオプションがないため）。
+
+## 開発フェーズ
+
+| フェーズ | 内容 | 状態 |
+|---|---|---|
+| 0 | 環境構築、骨組み | ✅ |
+| 1 | 合成データ生成、物理モデルのフィッティング・信頼区間 | ✅ |
+| 2 | 動画読み込み（VFR・撮影 fps の上書き）、キャリブレーション GUI | ✅（GUI の実操作は未確認） |
+| 3 | 平面拘束による3次元化（平面の補正つき） | ✅ |
+| 4 | ベースライン検出、イベント検出、`analyze` の通し処理 | ✅（合成動画。240fps 実動画は未確認） |
+| 5 | アノテーションツール、疑似低 fps データ生成、学習データの書き出し | ✅（GUI の実操作は未確認） |
+| 6 | TrackNetV3 の導入とファインチューニング | ✅ ラッパー・Colab ノートブックまで（重みでの実行は未確認） |
+| 7 | 精度検証、レポート出力 | ✅（合成データ。実データは 240fps 動画のラベル待ち） |
+| 8 | 2台カメラモード | ✅（合成データ） |
+
+## ディレクトリ構成
+
+```
+configs/default.yaml    既定設定（物理定数、コート寸法とランドマーク、検出・イベントの閾値、合成データ）
+configs/train.yaml      TrackNetV3 のファインチューニング設定
+smash_speed/
+  camera.py             カメラモデル（投影・視線）
+  calibration/          推定（DLT・焦点距離探索 + LM）、GUI、保存
+  video_io.py           ffprobe・タイムスタンプ・区間の切り出し・音声
+  detection/            ベースライン検出、TrackNetV3 ラッパー
+  events.py             打点（音声・交点・打者の位置・最初の検出）と着地
+  geometry.py           飛行平面・三角測量
+  physics.py            運動方程式・フィッティング・信頼区間・速度指標
+  pipeline.py           analyze の一連の処理
+  stereo.py             2台カメラ
+  annotate/             アノテーションツール
+  train/                疑似低 fps・学習データ・ファインチューニング・検出の評価
+  validate.py           精度検証（合成・実データ）、Bland–Altman、補正
+  report.py             CSV・グラフ・オーバーレイ動画
+  synth.py              合成データ・合成動画
+  cli.py                コマンドライン
+notebooks/              Colab でのファインチューニング
+tests/                  合成データによるテスト
+data/, outputs/         動画・ラベル・出力（Git 管理外）
+```
