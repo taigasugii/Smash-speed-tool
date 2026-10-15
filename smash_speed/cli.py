@@ -116,10 +116,16 @@ def cmd_onsets(a: argparse.Namespace, cfg: dict) -> int:
     from smash_speed.video_io import extract_audio, load_wav, probe
 
     meta = probe(a.video, a.capture_fps, cfg)
-    with tempfile.TemporaryDirectory() as d:
-        wav = extract_audio(a.video, Path(d) / "a.wav", start_s=a.start / meta.time_scale if a.start else None,
-                            end_s=a.end / meta.time_scale if a.end else None, cfg=cfg)
-        x, rate = load_wav(wav)
+    if a.audio:
+        x, rate = load_wav(a.audio)
+    elif not meta.has_audio:
+        print("この動画には音声がありません（--audio で別の音声ファイルを指定できます）", file=sys.stderr)
+        return 1
+    else:
+        with tempfile.TemporaryDirectory() as d:
+            wav = extract_audio(a.video, Path(d) / "a.wav", start_s=a.start / meta.time_scale if a.start else None,
+                                end_s=a.end / meta.time_scale if a.end else None, cfg=cfg)
+            x, rate = load_wav(wav)
     ev = cfg["events"]
     t0 = a.start or 0.0
     ons = audio_onsets(x, rate, ev["audio_highpass_hz"], k_mad=a.k_mad or ev["audio_k_mad"])
@@ -161,7 +167,7 @@ def cmd_analyze(a: argparse.Namespace, cfg: dict) -> int:
         landing_px=_xy(a.landing_px) if a.landing_px else None, plane_gui=a.plane_gui,
         impact_time_s=a.impact_time, impact_method=a.impact_method, av_offset_s=a.av_offset,
         audio_path=Path(a.audio) if a.audio else None, ci_method=a.ci, overlay=not a.no_overlay,
-        force=a.force, name=a.name,
+        force=a.force, name=a.name, roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
     )
     row = analyze(o, cfg)
     lo, hi = row["speed_initial_ci_low_kmh"], row["speed_initial_ci_high_kmh"]
@@ -339,6 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("onsets")
     video_args(p, rng=True)
     p.add_argument("--k-mad", type=float)
+    p.add_argument("--audio", help="動画の音声の代わりに使う音声ファイル（WAV）")
     p.set_defaults(func=cmd_onsets)
 
     p = add("detect")
@@ -369,6 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ci", choices=["jacobian", "bootstrap", "none"])
     p.add_argument("--no-overlay", action="store_true")
     p.add_argument("--force", action="store_true", help="保存済みの途中結果を使わずに作り直す")
+    p.add_argument("--roi", help="シャトルを検出する範囲 x0,y0,x1,y1（元解像度 px）")
     p.set_defaults(func=cmd_analyze)
 
     p = add("stereo")

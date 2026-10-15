@@ -64,6 +64,7 @@ class AnalyzeOptions:
     overlay: bool = True
     force: bool = False
     name: str | None = None
+    roi: list[float] | None = None          # 検出する範囲 [x0, y0, x1, y1]（元解像度 px）
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -170,7 +171,10 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     elif det_path.exists() and not o.force:
         det = pd.read_csv(det_path)
     else:
-        det = detect(meta, o.start_s, o.end_s, BaselineParams.from_config(cfg), n_tracks=4)
+        bp = BaselineParams.from_config(cfg)
+        if o.roi:
+            bp.roi = list(o.roi)
+        det = detect(meta, o.start_s, o.end_s, bp, n_tracks=4)
         det.to_csv(det_path, index=False)
     out_tr, in_tr = _select_tracks(det)
     if len(out_tr) < 4:
