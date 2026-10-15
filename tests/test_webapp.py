@@ -1,0 +1,102 @@
+"""GUI（ローカル Web アプリ）のサーバー側のテスト。"""
+
+import json
+import time
+
+import numpy as np
+import pytest
+
+from smash_speed.config import load_config
+from smash_speed.validate import make_synthetic_session
+
+
+@pytest.fixture(scope="module")
+def session(tmp_path_factory):
+    cfg = load_config()
+    cfg["synthetic"]["camera"].update(width=960, height=540, f_px=750.0)
+    d = tmp_path_factory.mktemp("web")
+    info = make_synthetic_session(cfg, d, speed=75.0, fps=120.0)
+    return d, info
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch, session):
+    from smash_speed.webapp import server
+
+    d, _ = session
+    monkeypatch.setattr(server, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(server, "S", server.Session())
+    server.S.state = {"out_root": str(d / "out")}
+    return server.app.test_client()
+
+
+def test_open_video_and_frames(client, session):
+    d, _ = session
+    r = client.post("/api/video", json={"path": str(d / "synthetic.mp4")}).get_json()
+    assert r["ok"] and r["meta"]["width"] == 960 and len(r["meta"]["timestamps"]) == r["meta"]["n_frames"]
+    img = client.get("/api/frame?i=10&w=480")
+    assert img.status_code == 200 and img.data[:2] == b"\xff\xd8"  # JPEG
+    lm = client.get("/api/landmarks").get_json()
+    assert len(lm["landmarks"]) >= 23 and lm["segments"]
+
+
+def test_calibration_solve_save_and_floor(client, session, tmp_path):
+    d, info = session
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    pts = {p["name"]: p["image_px"] for p in json.loads((d / "calibration.json").read_text(encoding="utf-8"))["points"]}
+    few = dict(list(pts.items())[:3])
+    assert not client.post("/api/calib/solve", json={"points": few}).get_json()["ok"]  # 4 点未満
+    r = client.post("/api/calib/solve", json={"points": pts}).get_json()
+    assert r["ok"] and r["rmse"] < 1.5 and r["overlay"] and set(pts) <= set(r["predicted"])
+    path = tmp_path / "calib.json"
+    s = client.post("/api/calib/save", json={"points": pts, "path": str(path), "view": {"theta": 0}}).get_json()
+    assert s["ok"] and path.exists() and s["calib"]["view"] == {"theta": 0}
+    # 打つ人の足元を投影した画像座標 → 床の座標に戻る
+    X = [info["hitter_xy"][0], info["hitter_xy"][1], 0.0]
+    uv = client.post("/api/project", json={"points": [X]}).get_json()["points"][0]
+    f = client.post("/api/floor", json={"u": uv[0], "v": uv[1]}).get_json()
+    assert f["x"] == pytest.approx(X[0], abs=0.02) and f["y"] == pytest.approx(X[1], abs=0.02)
+    assert not client.post("/api/floor", json={"u": 480, "v": 0}).get_json()["ok"]  # 地平線より上
+
+
+def test_analyze_task_and_result(client, session):
+    d, info = session
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    client.post("/api/state", json={"calib": str(d / "calibration.json"), "calib_video": str(d / "synthetic.mp4"),
+                                    "start": 0.0, "end": info["t_land_video_s"] + 0.1, "shot": "web_test",
+                                    "hitter": {"x": info["hitter_xy"][0], "y": info["hitter_xy"][1]},
+                                    "landing": {"x": info["landing_xy"][0], "y": info["landing_xy"][1]},
+                                    "audio": str(d / "synthetic.wav"), "overlay": False})
+    client.post("/api/calib/load", json={})
+    r = client.post("/api/run/analyze", json={}).get_json()
+    assert r["ok"]
+    tid = r["task"]
+    assert not client.post("/api/run/analyze", json={}).get_json()["ok"]  # 実行中は二重に起動しない
+    t0 = time.time()
+    while time.time() - t0 < 300:
+        st = client.get(f"/api/task/{tid}").get_json()
+        if st["status"] != "running":
+            break
+        time.sleep(0.5)
+    assert st["status"] == "done", "\n".join(client.get(f"/api/task/{tid}").get_json()["lines"])
+    res = client.get("/api/result").get_json()
+    assert res["ok"] and res["row"]["speed_initial_mps"] == pytest.approx(75.0, rel=0.05)
+    assert "image_fit" in res["files"]
+    lst = client.get("/api/results").get_json()["rows"]
+    assert any(row["shot"] == "web_test" for row in lst)
+    img = client.get("/file", query_string={"path": res["files"]["image_fit"]})
+    assert img.status_code == 200
+
+
+def test_labels_roundtrip_and_file_guard(client, session, tmp_path):
+    d, _ = session
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    rows = [{"frame": 20, "x": 100.0, "y": 50.0, "visible": 1, "event": "hit", "source": "manual"},
+            {"frame": 21, "x": None, "y": None, "visible": 0, "event": "", "source": "manual"},
+            {"frame": 22, "x": None, "y": None, "visible": -1, "event": "", "source": ""}]
+    out = tmp_path / "labels"
+    r = client.post("/api/labels", json={"dir": str(out), "rows": rows, "start": 0.1, "end": 0.2}).get_json()
+    assert r["ok"] and (out / "synthetic_ball.csv").exists()
+    back = client.get("/api/labels", query_string={"dir": str(out)}).get_json()["rows"]
+    assert [b["visible"] for b in back] == [1, 0, -1] and back[0]["event"] == "hit"
+    assert client.get("/file", query_string={"path": "C:/Windows/win.ini"}).status_code == 404

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "smash-speed-web",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "smash_speed.webapp", "--no-browser", "--port=8766"],
+      "port": 8766
+    }
+  ]
+}

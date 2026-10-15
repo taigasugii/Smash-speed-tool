@@ -212,3 +212,18 @@ def render_overlay(reader, start_s: float, end_s: float, detections: pd.DataFram
             cv2.putText(frame, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
         writer.write(frame)
     writer.release()
+    make_web_video(Path(path))
+
+
+def make_web_video(src: Path) -> Path | None:
+    """ブラウザや Windows の標準プレーヤーで再生できる H.264 版（``<名前>_web.mp4``）を ffmpeg で作る。"""
+    import subprocess
+
+    from smash_speed.video_io import find_tool
+    dst = src.with_name(src.stem + "_web.mp4")
+    try:
+        subprocess.run([find_tool("ffmpeg"), "-v", "error", "-y", "-i", str(src), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-preset", "fast", "-crf", "20", "-movflags", "+faststart", str(dst)], check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return dst

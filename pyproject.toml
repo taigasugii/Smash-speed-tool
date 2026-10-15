@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6.0",
     "matplotlib>=3.8",
     "opencv-python>=4.9",
+    "flask>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +29,7 @@ dev = ["pytest>=8.0"]
 smash-speed = "smash_speed.cli:main"
 
 [project.gui-scripts]
-smash-speed-gui = "smash_speed.app.main:main"
+smash-speed-gui = "smash_speed.webapp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["smash_speed*"]
