@@ -52,9 +52,21 @@ class CalibrationResult:
     errors_px: np.ndarray    # (N,) 各点の再投影誤差 [px]
     method: str
     warnings: list[str] = field(default_factory=list)
+    excluded: list[str] = field(default_factory=list)  # クリックの間違いとみなして推定から外した点
+
+    @property
+    def used(self) -> np.ndarray:
+        """推定に使った点のマスク。"""
+        return np.array([n not in self.excluded for n in self.names], bool)
 
     @property
     def rmse_px(self) -> float:
+        """推定に使った点の再投影誤差の RMS [px]（除外した点は含めない）。"""
+        e = self.errors_px[self.used]
+        return float(np.sqrt(np.mean(e**2))) if len(e) else float("nan")
+
+    @property
+    def rmse_all_px(self) -> float:
         return float(np.sqrt(np.mean(self.errors_px**2)))
 
 
@@ -119,8 +131,44 @@ def _pnp(world: np.ndarray, image: np.ndarray, f: float, cx: float, cy: float,
 
 def calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: int, height: int,
               intrinsics: Intrinsics | None = None, estimate_k1: bool = False,
-              warn_px: float = 5.0) -> CalibrationResult:
+              warn_px: float = 5.0, reject_outliers: bool = True) -> CalibrationResult:
     """ランドマークの対応からカメラを推定する。
+
+    ``reject_outliers`` が真なら、ほかの点と明らかに合わない点（別の場所をクリックした点）を
+    1 点ずつ外して推定し直す。外した点は ``excluded`` に入り、誤差は最終的なカメラで計算する。
+    """
+    res = _calibrate(names, world, image, width, height, intrinsics, estimate_k1, warn_px)
+    if not reject_outliers:
+        return res
+    world, image, names = np.asarray(world, float), np.asarray(image, float), list(names)
+    # 外れ値の基準：30 px 以上、かつ残りの点の誤差の中央値の 6 倍以上
+    floor_px = 30.0
+    excluded: list[str] = []
+    while len(names) - len(excluded) >= 7 and len(excluded) < len(names) // 4:
+        keep = np.array([n not in excluded for n in names])
+        e = np.linalg.norm(res.camera.project(world) - image, axis=1)
+        e_keep = np.where(keep, e, -1.0)
+        j = int(np.argmax(e_keep))
+        med = float(np.median(e[keep & (np.arange(len(e)) != j)]))
+        if e[j] <= max(floor_px, 6.0 * med):
+            break
+        excluded.append(names[j])
+        keep[j] = False
+        res = _calibrate([n for n, k in zip(names, keep) if k], world[keep], image[keep], width, height,
+                         intrinsics, estimate_k1, warn_px)
+    if not excluded:
+        return res
+    errors = np.linalg.norm(res.camera.project(world) - image, axis=1)
+    errors = np.where(np.isfinite(errors), errors, 1e4)
+    warns = [f"{n}: 再投影誤差 {errors[names.index(n)]:.0f} px。ほかの点と合わないため、推定から外しました"
+             "（別の場所をクリックした可能性があります）。" for n in excluded]
+    return CalibrationResult(res.camera, names, world, image, errors, res.method, warns + res.warnings, excluded)
+
+
+def _calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: int, height: int,
+               intrinsics: Intrinsics | None = None, estimate_k1: bool = False,
+               warn_px: float = 5.0) -> CalibrationResult:
+    """すべての点を使ってカメラを推定する（``calibrate`` の本体）。
 
     Args:
         names: ランドマーク名

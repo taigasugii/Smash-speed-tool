@@ -21,9 +21,11 @@ def save_calibration(result: CalibrationResult, path: str | Path, video: str | N
         "method": result.method,
         "rmse_px": result.rmse_px,
         "points": [
-            {"name": n, "world_m": w.tolist(), "image_px": i.tolist(), "error_px": float(e)}
+            {"name": n, "world_m": w.tolist(), "image_px": i.tolist(), "error_px": float(e),
+             **({"excluded": True} if n in result.excluded else {})}
             for n, w, i, e in zip(result.names, result.world, result.image, result.errors_px)
         ],
+        "excluded": list(result.excluded),
         "warnings": result.warnings,
         "video": video,
         "frame_time_s": frame_time_s,

@@ -1,6 +1,9 @@
 // 手順 2：コートを合わせる（キャリブレーションの案内つきウィザード）
 "use strict";
 
+// ずれの評価の目安は横幅 1920 px 基準。4K なら 2 倍の px まで同じ評価にする
+const rmseScale = () => Math.max(1, ((App.meta && App.meta.width) || 1920) / 1920);
+
 App.views.calib = {
   title: "手順 2　コートを合わせる",
   crumb: () => App.meta ? App.meta.name : "",
@@ -48,12 +51,13 @@ App.views.calib = {
   // ---------------- 保存済みのときの画面 ----------------
   summary() {
     const c = App.calib;
-    const bad = c.rmse_px >= 8 || c.n_points < 6;
-    const q = bad ? ["bad", "要確認"] : c.rmse_px < 3 ? ["ok", "良好"] : ["warn", "まずまず"];
+    const k = rmseScale();
+    const bad = c.rmse_px >= 8 * k || c.n_points < 6;
+    const q = bad ? ["bad", "要確認"] : c.rmse_px < 3 * k ? ["ok", "良好"] : ["warn", "まずまず"];
     const reasons = (c.warnings || []).map((w) => `<li>${esc(w)}</li>`).join("");
     this.el.appendChild(h(`<div class="card"><h2>${bad ? "保存済みのコート合わせに問題がありそうです" : "このカメラ位置のコート合わせは済んでいます"}</h2>
       <p class="desc">${bad ? "点が少ないか、クリックした位置とコートの形が合っていません。このまま解析すると速度が大きくずれるので、<b>最初からやり直す</b>のがおすすめです。" : "カメラを動かしていなければ、このまま使えます。"}</p>
-      <div class="quality"><span class="big">${fmt(c.rmse_px, 1)} px</span><span class="badge ${q[0]}">${q[1]}</span><span class="muted">${c.n_points} 点を使用・ファイル：${esc(App.state.calib)}</span></div>
+      <div class="quality"><span class="big">${fmt(c.rmse_px, 1)} px</span><span class="badge ${q[0]}">${q[1]}</span><span class="muted">${c.n_points} 点を使用${(c.excluded || []).length ? `（${c.excluded.length} 点は合わないため除外）` : ""}・ファイル：${esc(App.state.calib)}</span></div>
       ${reasons ? `<ul class="muted small" style="margin:10px 0 0">${reasons}</ul>` : ""}
       <div class="row" style="margin-top:14px">
         <button class="btn ${bad ? "" : "primary"}" id="use">このまま使う（次へ）</button>
@@ -253,7 +257,7 @@ App.views.calib = {
       const enough = nDone >= 6;
       const hasHeight = Object.keys(this.points).some((n) => lmByName[n].xyz[2] > 0 || n.startsWith("post_base"));
       status.innerHTML = `<div class="row" style="justify-content:space-between"><b>${nDone} 点クリック済み</b>
-        ${this.solved ? `<span class="badge ${this.solved.rmse < 3 ? "ok" : this.solved.rmse < 8 ? "warn" : "bad"}">ずれ ${fmt(this.solved.rmse, 1)} px</span>` : `<span class="badge">あと ${Math.max(0, 5 - nDone)} 点で計算開始</span>`}</div>
+        ${this.solved ? `<span class="badge ${this.solved.rmse < 3 * rmseScale() ? "ok" : this.solved.rmse < 8 * rmseScale() ? "warn" : "bad"}">ずれ ${fmt(this.solved.rmse, 1)} px</span>` : `<span class="badge">あと ${Math.max(0, 5 - nDone)} 点で計算開始</span>`}</div>
         <p class="muted small" style="margin:6px 0">${enough ? "6 点以上あるので確認に進めます。映っている点が多いほど正確になります。" : "最低 6 点（できれば 8 点以上）クリックしてください。"}${!hasHeight && nDone >= 4 ? "<br><b>ネットポストの上端など、高さのある点も 1 つ以上入れる</b>と安定します。" : ""}${this.autoSkipped.size ? `<br>画面の外にあると予想される ${this.autoSkipped.size} 点は自動でとばしました。` : ""}</p>
         <button class="btn primary block" id="tocheck" ${enough ? "" : "disabled"}>確認へ →</button>`;
       $("#tocheck", status).onclick = () => this.step("check");
@@ -302,30 +306,35 @@ App.views.calib = {
     const ws = h(`<div class="workspace"><div class="left"></div><div class="side stack"></div></div>`);
     this.el.appendChild(ws);
     const left = $(".left", ws), side = $(".side", ws);
+    const ex = new Set(r.excluded || []);
     const fv = new FrameView(left, {
       width: 2560, loupe: false,
       draw: (ctx, f) => {
         drawCourtOverlay(ctx, f, r.overlay, 0.95);
-        for (const [n, p] of Object.entries(this.points)) drawMarker(ctx, f, p[0], p[1], r.errors[n] > r.warn_px ? "#ef4444" : "#22c55e");
+        for (const [n, p] of Object.entries(this.points)) drawMarker(ctx, f, p[0], p[1], ex.has(n) ? "#a855f7" : r.errors[n] > r.warn_px ? "#ef4444" : "#22c55e");
       },
     });
     const tl = new Timeline(left, { onSeek: (t, i) => fv.show(i), keys: false });
-    const q = r.rmse < 3 ? ["ok", "良好です"] : r.rmse < 8 ? ["warn", "使えますが、赤い点を直すとよくなります"] : ["bad", "ずれが大きいです。赤い点を直してください"];
+    const k = rmseScale();
+    const q = r.rmse < 3 * k ? ["ok", "良好です"] : r.rmse < 8 * k ? ["warn", "使えますが、赤い点を直すとよくなります"] : ["bad", "ずれが大きいです。赤い点を直してください"];
     if (r.rmse > 20) side.appendChild(h(`<div class="callout bad"><b>このままでは使えません。</b>いくつかの点が、名前と違う場所をクリックしているようです（例：ネットポストの「上端」と「根元」、手前と奥の取り違え）。下の一覧の上から順に、ずれの大きい点を「直す」で確認してください。</div>`));
     side.appendChild(h(`<div class="card"><h2>黄色い線が、実際のコートのラインに重なっていますか？</h2>
       <p class="desc">ピンクはネットです。大きくずれている所があれば、その近くの点を直してください。</p>
       <div class="quality"><span class="big">${fmt(r.rmse, 1)} px</span><span class="badge ${q[0]}">${q[1]}</span></div>
-      <p class="muted small" style="margin:6px 0 0">クリックした点と、推定したカメラから計算した位置との平均のずれ（4K で 5 px 以下が目安）。</p></div>`));
+      <p class="muted small" style="margin:6px 0 0">クリックした点と、推定したカメラから計算した位置との平均のずれ（目安：${fmt(3 * k, 0)} px 未満なら良好、${fmt(8 * k, 0)} px 未満なら使えます。画像が大きいほど px の値は大きくなります）。</p></div>`));
     const lmByName = Object.fromEntries(App.landmarks.landmarks.map((l) => [l.name, l]));
+    const title = (n) => Court.describe(lmByName[n], this.view ? this.view.theta : 0).title;
+    if (ex.size) side.appendChild(h(`<div class="callout warn"><b>${ex.size} 点は、ほかの点と合わないため計算から外しました</b>（紫の点）：${[...ex].map((n) => esc(title(n))).join("、")}。
+      名前と違う場所をクリックしている可能性があります。<b>このままでも解析できます</b>が、直すと少し正確になります。</div>`));
     const list = h(`<div class="card" style="padding:12px"><b>点ごとのずれ</b><div class="pointlist"></div></div>`);
     for (const [n, e] of Object.entries(r.errors).sort((a, b) => b[1] - a[1])) {
       const d = Court.describe(lmByName[n], this.view ? this.view.theta : 0);
-      const row = h(`<div class="p"><span class="badge ${e > r.warn_px ? "bad" : e > r.warn_px / 2 ? "warn" : "ok"}">${fmt(e, 1)} px</span><span style="flex:1">${esc(d.title)}</span><span class="muted small">直す ›</span></div>`);
+      const row = h(`<div class="p"><span class="badge ${ex.has(n) ? "" : e > r.warn_px ? "bad" : e > r.warn_px / 2 ? "warn" : "ok"}">${ex.has(n) ? "除外" : `${fmt(e, 1)} px`}</span><span style="flex:1">${esc(d.title)}${ex.has(n) ? `<span class="muted small">（${fmt(e, 0)} px ずれ）</span>` : ""}</span><span class="muted small">直す ›</span></div>`);
       row.onclick = () => { this.cur = n; this.sel = n; this.step("points"); };
       $(".pointlist", list).appendChild(row);
     }
     side.appendChild(list);
-    for (const w of r.warnings.filter((w) => !w.includes("再投影誤差"))) side.appendChild(h(`<div class="callout warn">${esc(w)}</div>`));
+    for (const w of r.warnings.filter((w) => !w.includes("再投影誤差") && !w.includes("推定から外しました"))) side.appendChild(h(`<div class="callout warn">${esc(w)}</div>`));
     const save = h(`<div class="card"><div class="stack"></div>
       <label class="row small" style="margin-top:8px"><input type="checkbox" id="k1"> レンズのゆがみも補正する（超広角で撮った場合）</label>
       <div class="row" style="margin-top:12px"><button class="btn" id="back">← 点を直す</button><button class="btn primary" id="save" style="flex:1">保存して次へ →</button></div></div>`);

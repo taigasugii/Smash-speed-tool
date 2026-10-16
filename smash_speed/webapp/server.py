@@ -186,7 +186,9 @@ def load_camera() -> dict[str, Any] | None:
         S.camera = _camera_for_video(cam, S.meta)
     except ValueError:
         return {"error": "この動画とキャリブレーションの画像サイズが合いません"}
-    return {"rmse_px": data.get("rmse_px"), "n_points": len(data.get("points", [])),
+    pts = data.get("points", [])
+    return {"rmse_px": data.get("rmse_px"), "n_points": sum(1 for q in pts if not q.get("excluded")),
+            "excluded": [q["name"] for q in pts if q.get("excluded")],
             "points": {q["name"]: q["image_px"] for q in data.get("points", [])},
             "camera_center": S.camera.center.round(2).tolist(), "warnings": data.get("warnings", []),
             "view": data.get("meta", {}).get("view")}
@@ -392,7 +394,7 @@ def calib_solve():
         if np.isfinite(uv).all():
             pred[n] = [round(float(uv[0]), 1), round(float(uv[1]), 1)]
     return ok(rmse=res.rmse_px, errors={n: float(e) for n, e in zip(res.names, res.errors_px)},
-              warnings=res.warnings, overlay=project_court(res.camera, cfg), predicted=pred,
+              excluded=res.excluded, warnings=res.warnings, overlay=project_court(res.camera, cfg), predicted=pred,
               camera_center=res.camera.center.round(2).tolist(), f=res.camera.f,
               warn_px=cfg["calibration"]["reproj_warn_px"])
 

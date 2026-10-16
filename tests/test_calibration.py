@@ -132,3 +132,23 @@ def test_point_picker_state_machine():
 def test_court_diagram_renders(cfg):
     img = court_diagram(cfg, "post_top_n", {"back_corner_h_n": np.zeros(2), "back_corner_h_p": None})
     assert img.ndim == 3 and img.shape[1] == 260
+
+
+def test_calibration_excludes_misclicked_points(cfg, truth, tmp_path):
+    # ネットポストの「上端」を「根元」の近くにクリックした、などの取り違えを自動で外す
+    rng = np.random.default_rng(3)
+    names, world, image = _visible_landmarks(cfg, truth, rng)
+    top = names.index("post_top_n") if "post_top_n" in names else 0
+    image[top] += [-100.0, 300.0]
+    image[5] += [50.0, -45.0]
+    res = calibrate(names, world, image, truth.width, truth.height)
+    assert set(res.excluded) == {names[top], names[5]}
+    assert res.rmse_px < 1.5 and res.rmse_all_px > 50
+    assert np.linalg.norm(res.camera.center - truth.center) < 0.15
+    assert res.errors_px[top] > 200  # 外した点の誤差も最終的なカメラで出す
+    save_calibration(res, tmp_path / "c.json")
+    _, data = load_calibration(tmp_path / "c.json")
+    assert sorted(data["excluded"]) == sorted(res.excluded) and data["rmse_px"] < 1.5
+    # 正しい点だけなら何も外さない
+    names, world, image = _visible_landmarks(cfg, truth, np.random.default_rng(4), noise=2.0)
+    assert calibrate(names, world, image, truth.width, truth.height).excluded == []
