@@ -285,6 +285,22 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         plane = auto_plane(obs, impact.t, phys, cfg)
         opts.plane_sigma_deg, opts.plane_sigma_m = 10.0, 1.0
 
+    if plane is not None:
+        # カメラから打点への視線と飛行平面のなす角。小さい（飛ぶ方向を正面に近い角度から見ている）ほど、
+        # 平面の位置のわずかなずれで奥行き＝速さが大きく変わる
+        Xc = hit_X if hit_X is not None else plane.origin + np.array([0.0, 0.0, 2.5])
+        ray = Xc - camera.center
+        graze = float(np.degrees(np.arcsin(min(1.0, abs(ray @ plane.normal) / np.linalg.norm(ray)))))
+        if graze < 35.0:
+            log.append(f"カメラがシャトルの飛ぶ方向を斜め前（後ろ）から見ています（視線と飛行面の角度 {graze:.0f}°）。"
+                       "この角度では、打つ人・着地点の位置が少しずれるだけで速さが大きく変わります。"
+                       "コートの横（ネットの延長線上の少し後ろ）から撮ると安定します。")
+
+    if hit_X is not None and impact.method in ("audio", "manual") and ev_cfg.get("use_hit_prior", True):
+        # 打点時刻が別に決まっているときは、その時刻の位置を打つ人の位置の近くに寄せる
+        opts.p0_prior_m = hit_X
+        opts.p0_prior_sigma_m = (ev_cfg.get("hit_prior_sigma_m", 0.6), ev_cfg.get("hit_height_sigma_m", 0.5))
+
     if opts.refine_plane and len(obs.t) <= ev_cfg.get("min_frames_refine_plane", 5):
         opts.refine_plane = False
         log.append(f"使えるコマが {len(obs.t)} 個と少ないため、飛行平面は補正せず、指定どおりに使いました"

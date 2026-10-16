@@ -137,9 +137,10 @@ def plot_image_fit(t_obs: np.ndarray, uv_obs: np.ndarray, fit: FitResult, phys: 
     ax.plot(curve[:, 0], curve[:, 1], "-", color="C1", lw=1.2, label="当てはめた軌道")
     ax.plot(uv_obs[:, 0], uv_obs[:, 1], "o", mfc="none", color="C0", ms=6, label="検出")
     ax.plot(uv_pred[:, 0], uv_pred[:, 1], "+", color="C3", ms=7, label="同時刻の予測")
-    if background is None:
-        ax.invert_yaxis()
-        ax.set_aspect("equal")
+    # 軌道の投影はカメラの近く・後ろで画面の外へ大きく飛ぶので、表示は画像の範囲に限る
+    ax.set_xlim(0, camera.width)
+    ax.set_ylim(camera.height, 0)
+    ax.set_aspect("equal")
     ax.set_title(f"再投影誤差 RMS {fit.rms_px:.2f} px")
     ax.legend(fontsize=8)
     fig.tight_layout()

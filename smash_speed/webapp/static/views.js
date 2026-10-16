@@ -97,6 +97,8 @@ App.views.clip = {
     el.appendChild(ws);
     const left = $(".left", ws), side = $(".side", ws);
     const onsetRows = () => (st.onsets && st.onsets.video === App.meta.path ? st.onsets.rows : []);
+    let ons = null;  // 「打球音から探す」カード（下で作る）。時間軸の描画はこれより先に走る
+    const minS = () => +((ons && $("#mins", ons)?.value) || 20);
     const fv = new FrameView(left, { width: 1280 });
     const tl = new Timeline(left, { onSeek: (t, i) => fv.show(i), marks: () => onsetRows().filter((r) => r[1] >= minS()), range: () => [st.start, st.end] });
     this.tl = tl;
@@ -126,13 +128,12 @@ App.views.clip = {
     };
     upd();
 
-    const ons = h(`<div class="card"><h2>打球音から探す</h2>
+    ons = h(`<div class="card"><h2>打球音から探す</h2>
       <p class="desc">ラケットで打った音の候補を探し、上の時間軸にオレンジの線で表示します。クリックするとその少し前へ移動します。</p>
       <div class="row"><button class="btn" id="find">打球音を探す</button>
       <label class="small muted">強さ <input class="input num" id="mins" value="20" style="width:64px;height:30px"> 以上</label></div>
       <div class="onsets" id="list" style="margin-top:10px"></div></div>`);
     side.appendChild(ons);
-    const minS = () => +($("#mins", ons)?.value || 0);
     const fill = () => {
       const list = $("#list", ons); list.innerHTML = "";
       const rows = onsetRows().filter((r) => r[1] >= minS());

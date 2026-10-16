@@ -101,6 +101,11 @@ events:
   contact_offset_m: 0.3        # 打点は打者の足元から飛行方向へこれだけ前と仮定 [m]（hitter_position 法）
   contact_sigma_m: 0.4         # 同・位置の不確かさ [m]
   hit_height_m: 2.5            # 打点の高さの目安 [m]（軌道の選択・打球音の伝搬遅れの見積もりに使う）
+  # 打点時刻を打球音・手動で決めたとき、その時刻のシャトルの位置を「打つ人の足元の少し前・高さ hit_height」に寄せる。
+  # カメラが飛行方向を正面に近い角度で見ていると、少ないコマでは奥行き（＝速さ）が決まらないため
+  use_hit_prior: true
+  hit_prior_sigma_m: 0.6       # 同・水平方向の不確かさ [m]（足元のクリックのずれと打点の前後を含む）
+  hit_height_sigma_m: 0.5      # 同・高さの不確かさ [m]
   min_frames_refine_plane: 5   # 使えるコマがこれ以下なら、飛行平面の補正はしない（推定が不安定になるため）
 
 calibration:

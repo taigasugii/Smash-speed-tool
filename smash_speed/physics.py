@@ -218,6 +218,10 @@ class FitOptions:
     refine_plane: bool = False       # 飛行平面の向き・位置もデータから補正する（plane モード）
     plane_sigma_deg: float = 5.0     # 平面の向きの事前の不確かさ [deg]
     plane_sigma_m: float = 0.5       # 平面の位置（法線方向）の事前の不確かさ [m]
+    # 打点の位置の目安 [m]（打つ人の位置から）。打点時刻を音などで別に決めたとき、軌道の始点がここから
+    # 大きく離れないようにする（カメラが飛行方向を正面に近い角度で見ていると、奥行きが決まりにくいため）
+    p0_prior_m: Any = None
+    p0_prior_sigma_m: tuple[float, float] = (0.6, 0.5)  # （水平, 高さ）の不確かさ [m]
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], **overrides: Any) -> "FitOptions":
@@ -238,13 +242,18 @@ class _Model:
     """パラメータベクトル θ ⇔ (p0, v0, v_t) の変換。"""
 
     def __init__(self, mode: str, plane: FlightPlane | None, estimate_vt: bool, vt: float,
-                 refine_plane: bool = False, plane_sigma_rad: float = 0.1, plane_sigma_m: float = 0.5):
+                 refine_plane: bool = False, plane_sigma_rad: float = 0.1, plane_sigma_m: float = 0.5,
+                 p0_prior: Any = None, p0_prior_sigma: tuple[float, float] = (0.6, 0.5)):
         if mode == "plane" and plane is None:
             raise ValueError("plane モードには飛行平面が必要です")
         self.mode, self.plane, self.estimate_vt, self.vt = mode, plane, estimate_vt, vt
         self.n_kin = 4 if mode == "plane" else 6
         self.n_plane = 2 if (mode == "plane" and refine_plane) else 0
         self.plane_sigma = np.array([plane_sigma_rad, plane_sigma_m])
+        self.p0_prior = None if p0_prior is None else np.asarray(p0_prior, float)
+        sh, sz = p0_prior_sigma
+        self.p0_prior_sigma = np.array([sh, sh, sz])
+        self.prior_px = 1.0  # 打点の位置の事前分布の重み（1σ が何 px の残差に当たるか）
 
     def plane_at(self, theta: np.ndarray) -> FlightPlane | None:
         """θ に含まれる平面の補正（向き dψ [rad]・法線方向の平行移動 dn [m]）を反映した平面。"""
@@ -268,10 +277,11 @@ class _Model:
         return p0, v0, vt
 
     def prior_residuals(self, theta: np.ndarray) -> np.ndarray:
-        """平面の補正に対する事前分布の残差（標準偏差で割った値。1σ ≈ 1 px の残差と同じ重み）。"""
-        if self.n_plane == 0:
-            return np.empty(0)
-        return theta[self.n_kin:self.n_kin + 2] / self.plane_sigma
+        """平面の補正・打点の位置に対する事前分布の残差（標準偏差で割った値。1σ ≈ 1 px の残差と同じ重み）。"""
+        res = [theta[self.n_kin:self.n_kin + 2] / self.plane_sigma] if self.n_plane else []
+        if self.p0_prior is not None:
+            res.append(self.prior_px * (self.unpack(theta)[0] - self.p0_prior) / self.p0_prior_sigma)
+        return np.concatenate(res) if res else np.empty(0)
 
     def pack(self, p0: np.ndarray, v0: np.ndarray, vt: float) -> np.ndarray:
         if self.mode == "plane":
@@ -389,7 +399,8 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
     if mode == "free" and len(obs) < 2:
         raise ValueError("free モードには2台以上のカメラの観測が必要です")
     model = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity,
-                   opts.refine_plane, np.deg2rad(opts.plane_sigma_deg), opts.plane_sigma_m)
+                   opts.refine_plane, np.deg2rad(opts.plane_sigma_deg), opts.plane_sigma_m,
+                   opts.p0_prior_m, opts.p0_prior_sigma_m)
     n_par = model.n_kin + model.n_plane + int(opts.estimate_terminal_velocity)
     n_res = 2 * sum(len(o.t) for o in obs)
     if n_res <= n_par:
@@ -413,6 +424,11 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
                              x_scale="jac", max_nfev=200 * n_par)
 
     sol = solve(obs, theta0)
+    if model.p0_prior is not None:
+        # 事前分布の 1σ を、画像上の誤差の大きさ（当てはめの残差から見積もる）と同じ重みにして解き直す
+        rms0 = float(np.sqrt(np.mean(sol.fun[:n_res] ** 2)))
+        model.prior_px = max(opts.loss_scale_px, rms0)
+        sol = solve(obs, sol.x)
     p0, v0, vt = model.unpack(sol.x)
     r = sol.fun[:n_res]
     rms = float(np.sqrt(np.mean(r**2)))
