@@ -79,20 +79,40 @@ def _camera_for_video(camera: Camera, meta: VideoMeta) -> Camera:
     return camera.scaled(s)
 
 
-def _select_tracks(det: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """検出から、打点後（画像上で最も速い軌道）と、その直前に終わる打点前の軌道を選ぶ。"""
+def _select_tracks(det: pd.DataFrame, onsets: list[tuple[float, float]] | None = None,
+                   hit_uv: np.ndarray | None = None, img_w: float = 1.0
+                   ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """検出から、打点後の軌道と、その直前に終わる打点前の軌道を選ぶ。
+
+    手がかり（あるものだけ使う）:
+        - 画像上の速さと長さ（速く長く続くほどシャトルらしい）
+        - 打球音の直後に始まっているか（強い打球音の 0.04 s 前〜0.2 s 後）
+        - 打つ人の打点（足元の上 2.5 m）の近くから始まっているか
+    """
     vis = det[det.visible == 1]
     if "track_id" not in vis or vis["track_id"].nunique() <= 1:
         return vis, vis.iloc[0:0]
-    speeds = {}
+    strong = []
+    if onsets:
+        smax = max(s_ for _, s_ in onsets)
+        strong = [t for t, s_ in onsets if s_ >= 0.3 * smax]
+    scores = {}
     for tid, g in vis.groupby("track_id"):
-        if len(g) < 3:
+        if len(g) < 3 or tid < 0:
             continue
         uv = g[["x_px", "y_px"]].to_numpy()
-        speeds[tid] = np.median(np.linalg.norm(np.diff(uv, axis=0), axis=1) / np.diff(g.timestamp))
-    if not speeds:
+        speed = np.median(np.linalg.norm(np.diff(uv, axis=0), axis=1) / np.diff(g.timestamp))
+        score = speed * np.sqrt(len(g))
+        t0 = float(g.timestamp.min())
+        if strong:
+            score *= 1.0 if any(t - 0.04 <= t0 <= t + 0.2 for t in strong) else 0.15
+        if hit_uv is not None and np.isfinite(hit_uv).all():
+            dd = np.linalg.norm(uv[0] - hit_uv) / img_w
+            score *= 1.0 / (1.0 + (dd / 0.12) ** 2)
+        scores[tid] = score
+    if not scores:
         return vis, vis.iloc[0:0]
-    out_id = max(speeds, key=speeds.get)
+    out_id = max(scores, key=scores.get)
     out = vis[vis.track_id == out_id]
     t0 = out.timestamp.min()
     before = vis[(vis.track_id != out_id) & (vis.timestamp < t0)]
@@ -174,29 +194,22 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         bp = BaselineParams.from_config(cfg)
         if o.roi:
             bp.roi = list(o.roi)
-        det = detect(meta, o.start_s, o.end_s, bp, n_tracks=4)
+        det = detect(meta, o.start_s, o.end_s, bp, n_tracks=cfg.get("detection", {}).get("n_track_candidates", 12))
         det.to_csv(det_path, index=False)
-    out_tr, in_tr = _select_tracks(det)
-    if len(out_tr) < 4:
-        raise RuntimeError(f"シャトルの検出が {len(out_tr)} 点しかありません（区間・ROI・閾値を確認してください）")
-    t_first = float(out_tr.timestamp.min())
-
-    # --- 飛行平面（打球音の伝搬遅れの見積もりにも使うので先に決める）
+    # --- 飛行平面（軌道の選択・打球音の伝搬遅れの見積もりにも使うので先に決める）
     reader = VideoReader(meta) if o.plane_gui else None
-    plane, plane_src = _resolve_plane(o, camera, cfg, reader, t_first)
+    plane, plane_src = _resolve_plane(o, camera, cfg, reader, o.start_s or 0.0)
     if reader is not None:
         reader.close()
     ev_cfg = cfg.get("events", {})
     c_sound = ev_cfg.get("speed_of_sound_mps", 343.0)
-    first_uv = out_tr[["x_px", "y_px"]].to_numpy()[:1]
-    if plane is not None:
-        X_first = intersect_plane(camera, first_uv, plane)[0]
-    else:  # 平面が未定なら、カメラからコート中央までと同じ距離にあると仮定する
-        c0, d0 = camera.rays(first_uv)
-        X_first = c0 + np.linalg.norm(c0) * d0[0]
-    dist0 = float(np.linalg.norm(camera.center - X_first)) if np.isfinite(X_first).all() else 0.0
+    hitter_known = plane is not None and plane_src in ("file", "court_xy", "image_px", "gui")
+    # 打点の位置の目安：打つ人の足元から飛行方向へ contact_offset 前、高さ hit_height
+    hit_X = plane.to_world(np.array([ev_cfg.get("contact_offset_m", 0.3)]),
+                           np.array([ev_cfg.get("hit_height_m", 2.5)]))[0] if hitter_known else None
+    hit_uv = camera.project(hit_X[None])[0] if hit_X is not None else None
 
-    # --- 打点時刻
+    # --- 打球音
     onsets: list[tuple[float, float]] = []
     wav = o.audio_path
     if wav is None and meta.has_audio:
@@ -215,6 +228,28 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
             x, rate, ev_cfg.get("audio_highpass_hz", 2000.0), k_mad=ev_cfg.get("audio_k_mad", 10.0))]
         if meta.time_scale != 1.0:
             log.append("撮影 fps を上書きしたため、音声の時刻も同じ倍率で換算しました。音声と映像のずれを確認してください。")
+
+    # --- 打点後の軌道を選ぶ
+    out_tr, in_tr = _select_tracks(det, onsets, hit_uv, float(meta.width))
+    if len(out_tr) < 4:
+        raise RuntimeError(f"シャトルの検出が {len(out_tr)} 点しかありません（区間・ROI・閾値を確認してください）")
+    t_first = float(out_tr.timestamp.min())
+    if onsets:
+        smax = max(s_ for _, s_ in onsets)
+        strong = [t for t, s_ in onsets if s_ >= 0.3 * smax]
+        if strong and not any(t - 0.04 <= t_first <= t + 0.2 for t in strong):
+            log.append(f"使った軌道（{t_first:.2f} s から）は、強い打球音（{', '.join(f'{t:.2f}' for t in strong)} s）の直後に"
+                       "始まっていません。打つ前のシャトルや別の物を拾っている可能性があります。"
+                       "手順 3 の「検出する範囲」で、打った後にシャトルが飛ぶ範囲（選手の頭より上など）を囲んでください。")
+    first_uv = out_tr[["x_px", "y_px"]].to_numpy()[:1]
+    if hit_X is not None:
+        X_first = hit_X
+    elif plane is not None:
+        X_first = intersect_plane(camera, first_uv, plane)[0]
+    else:  # 平面が未定なら、カメラからコート中央までと同じ距離にあると仮定する
+        c0, d0 = camera.rays(first_uv)
+        X_first = c0 + np.linalg.norm(c0) * d0[0]
+    dist0 = float(np.linalg.norm(camera.center - X_first)) if np.isfinite(X_first).all() else 0.0
 
     sigma_audio = cfg["physics"].get("impact_time_sigma_s", 0.002)
     impact: events.ImpactEstimate | None = None
@@ -250,6 +285,11 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         plane = auto_plane(obs, impact.t, phys, cfg)
         opts.plane_sigma_deg, opts.plane_sigma_m = 10.0, 1.0
 
+    if opts.refine_plane and len(obs.t) <= ev_cfg.get("min_frames_refine_plane", 5):
+        opts.refine_plane = False
+        log.append(f"使えるコマが {len(obs.t)} 個と少ないため、飛行平面は補正せず、指定どおりに使いました"
+                   "（打つ人と着地点の位置が結果に直接効きます）。")
+
     # --- 当てはめ（外れ値を除いて再当てはめ）
     def run_fit(t_ref: float, sigma: float, o_: Observations) -> FitResult:
         opts.t_ref_sigma = sigma
@@ -268,7 +308,10 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     sound_delay = None
     if audio_raw_t is not None:
         for _ in range(2):
-            dist = float(np.linalg.norm(camera.center - fit.p0))
+            ref = hit_X if hit_X is not None else fit.p0
+            if hit_X is None and (abs(ref[0]) > 9 or abs(ref[1]) > 6):  # 当てはめた打点がコートから遠すぎる
+                ref = X_first
+            dist = float(np.linalg.norm(camera.center - ref))
             sound_delay = dist / c_sound
             t_new = audio_raw_t + o.av_offset_s - sound_delay
             if abs(t_new - impact.t) < 1e-5:

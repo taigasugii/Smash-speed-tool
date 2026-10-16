@@ -36,6 +36,7 @@ class BaselineParams:
     max_candidates: int = 30          # 1フレームあたりの候補の上限（面積の小さい順ではなく差分の強い順）
     max_speed_px_s: float = 8000.0    # 画像上の最大速さ [px/s]（縮小後）。対応付けの探索半径に使う
     gate_px: float = 12.0             # 予測位置からの許容ずれ [px]（縮小後）
+    gate_step_ratio: float = 0.8      # 直前の移動量に対する許容ずれの割合（カメラに近づくシャトルは画面上で加速して見える）
     max_gap_frames: int = 2           # 軌道の途切れを許すフレーム数
     min_track_len: int = 4
     outlier_px: float = 4.0           # 局所2次式からのずれがこれを超える点を外れ値とする [px]（縮小後）
@@ -135,7 +136,7 @@ def link_tracks(cands: pd.DataFrame, p: BaselineParams) -> list[_Track]:
             if len(tr.t) >= 2:
                 # 低 fps では1フレームで大きく減速するので、直前の移動量に比例して探索半径を広げる
                 step = np.linalg.norm(tr.xy[-1] - tr.xy[-2])
-                radius = p.gate_px * (1 + tr.misses) + 0.4 * step * (1 + tr.misses)
+                radius = (p.gate_px + p.gate_step_ratio * step) * (1 + tr.misses)
             else:
                 radius = p.max_speed_px_s * dt + p.gate_px
             dist = np.linalg.norm(pts - pred, axis=1)
@@ -170,7 +171,7 @@ def merge_tracks(tracks: list[_Track], p: BaselineParams) -> list[_Track]:
                     continue
                 step = np.linalg.norm(a.xy[-1] - a.xy[-2]) if len(a.xy) >= 2 else p.gate_px
                 gap = b.frames[0] - a.frames[-1]
-                tol = (p.gate_px + 0.5 * step) * gap
+                tol = (p.gate_px + p.gate_step_ratio * step) * gap
                 if np.linalg.norm(a.predict(b.t[0]) - b.xy[0]) <= tol:
                     a.ids += b.ids
                     a.frames += b.frames
@@ -185,33 +186,48 @@ def merge_tracks(tracks: list[_Track], p: BaselineParams) -> list[_Track]:
 
 
 def track_score(tr: _Track) -> float:
-    """シャトルらしさのスコア：長さ × 画像上の速さの中央値 ÷ (1 + 滑らかさの残差)。"""
+    """シャトルらしさのスコア：長さ^1.5 × 画像上の速さの中央値 ÷ (1 + 滑らかさの残差)。
+
+    3 点以下では 2 次式が必ずぴったり合ってしまうので、直線からのずれで滑らかさを測る。
+    """
     t, xy = np.array(tr.t), np.array(tr.xy)
     if len(t) < 3:
         return 0.0
     speed = np.median(np.linalg.norm(np.diff(xy, axis=0), axis=1) / np.diff(t))
-    c = [np.polyfit(t - t[0], xy[:, j], 2) for j in range(2)]
+    deg = 2 if len(t) >= 5 else 1
+    c = [np.polyfit(t - t[0], xy[:, j], deg) for j in range(2)]
     fit = np.column_stack([np.polyval(cj, t - t[0]) for cj in c])
     resid = np.sqrt(np.mean(np.sum((fit - xy) ** 2, axis=1)))
-    return float(len(t) * speed / (1.0 + resid))
+    return float(len(t) ** 1.5 * speed / (1.0 + resid))
 
 
-def remove_outliers(t: np.ndarray, xy: np.ndarray, thr: float, window: int = 7) -> np.ndarray:
-    """局所的な2次式（前後 ``window`` 点）からのずれが ``thr`` [px] を超える点を False にする。"""
+def remove_outliers(t: np.ndarray, xy: np.ndarray, thr: float, n_neighbors: int = 4,
+                    step_ratio: float = 0.25) -> np.ndarray:
+    """近くの点に当てはめた 2 次式から大きく外れた点を、最も外れたものから 1 つずつ除く。
+
+    許容するずれは ``thr`` [px] と「近くの点の 1 コマあたりの移動量 × step_ratio」の大きい方
+    （速いシャトルの残像は重心が数 px〜十数 px ぶれるため）。端の点も、近い 4 点からの外挿で調べる。
+    """
     n = len(t)
     keep = np.ones(n, bool)
-    if n < 5:
-        return keep
-    h = window // 2
-    for i in range(n):
-        lo, hi = max(0, i - h), min(n, i + h + 1)
-        idx = [k for k in range(lo, hi) if k != i]
-        if len(idx) < 4:
-            continue
-        tt = t[idx] - t[i]
-        pred = [np.polyval(np.polyfit(tt, xy[idx, j], 2), 0.0) for j in range(2)]
-        if np.hypot(xy[i, 0] - pred[0], xy[i, 1] - pred[1]) > thr:
-            keep[i] = False
+    for _ in range(n):
+        idx = np.flatnonzero(keep)
+        if len(idx) < n_neighbors + 1:
+            break
+        worst, worst_r = -1, 1.0
+        for pos, i in enumerate(idx):
+            others = np.delete(idx, pos)
+            nb = others[np.argsort(np.abs(others - i), kind="stable")[:n_neighbors]]
+            nb.sort()
+            tt = t[nb] - t[i]
+            pred = np.array([np.polyval(np.polyfit(tt, xy[nb, j], 2), 0.0) for j in range(2)])
+            step = np.median(np.linalg.norm(np.diff(xy[nb], axis=0), axis=1))
+            r = np.linalg.norm(xy[i] - pred) / max(thr, step_ratio * step)
+            if r > worst_r:
+                worst, worst_r = i, r
+        if worst < 0:
+            break
+        keep[worst] = False
     return keep
 
 

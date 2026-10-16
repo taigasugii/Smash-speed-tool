@@ -73,10 +73,11 @@ detection:
     max_area_px: 600
     max_streak_area_px: 4000   # 細長い残像（低 fps のシャトル）ならこの面積まで許す
     max_streak_width_px: 8.0   # 残像とみなす平均の太さ（面積 / 長さ）の上限 [px]
-    group_px: 5                # 途切れた残像をまとめる膨張の大きさ [px]
+    group_px: 13               # 途切れた残像をまとめる膨張の大きさ [px]（縮小後）
     max_candidates: 30
     max_speed_px_s: 8000.0     # 画像上の最大速さ [px/s]（縮小後）
     gate_px: 12.0              # 予測位置からの許容ずれ [px]（縮小後）
+    gate_step_ratio: 0.8       # 直前の移動量に対する許容ずれの割合（カメラに近づくシャトルは画面上で加速して見える）
     max_gap_frames: 2
     min_track_len: 4
     outlier_px: 4.0
@@ -87,6 +88,7 @@ detection:
     tracknet_ckpt: null        # ckpts/TrackNet_best.pt
     inpaintnet_ckpt: null      # ckpts/InpaintNet_best.pt（省略可）
     python: null               # TrackNetV3 用の Python（null なら現在の Python）
+  n_track_candidates: 12       # 解析で打点後の軌道を選ぶときの候補の数（打球音・打点の位置で選ぶ）
   match_tolerance_px: 4.0      # 検出が正しいとみなす距離 [px]（評価用。解像度に応じて調整）
 
 events:
@@ -98,6 +100,8 @@ events:
   impact_lookback_s: 0.1       # 最初の検出よりどれだけ前まで打点を探すか [s]（低 fps では序盤が写らないことがある）
   contact_offset_m: 0.3        # 打点は打者の足元から飛行方向へこれだけ前と仮定 [m]（hitter_position 法）
   contact_sigma_m: 0.4         # 同・位置の不確かさ [m]
+  hit_height_m: 2.5            # 打点の高さの目安 [m]（軌道の選択・打球音の伝搬遅れの見積もりに使う）
+  min_frames_refine_plane: 5   # 使えるコマがこれ以下なら、飛行平面の補正はしない（推定が不安定になるため）
 
 calibration:
   reproj_warn_px: 5.0     # この値を超える再投影誤差の点を警告 [px]

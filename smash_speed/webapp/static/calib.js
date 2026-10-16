@@ -311,6 +311,7 @@ App.views.calib = {
     });
     const tl = new Timeline(left, { onSeek: (t, i) => fv.show(i), keys: false });
     const q = r.rmse < 3 ? ["ok", "良好です"] : r.rmse < 8 ? ["warn", "使えますが、赤い点を直すとよくなります"] : ["bad", "ずれが大きいです。赤い点を直してください"];
+    if (r.rmse > 20) side.appendChild(h(`<div class="callout bad"><b>このままでは使えません。</b>いくつかの点が、名前と違う場所をクリックしているようです（例：ネットポストの「上端」と「根元」、手前と奥の取り違え）。下の一覧の上から順に、ずれの大きい点を「直す」で確認してください。</div>`));
     side.appendChild(h(`<div class="card"><h2>黄色い線が、実際のコートのラインに重なっていますか？</h2>
       <p class="desc">ピンクはネットです。大きくずれている所があれば、その近くの点を直してください。</p>
       <div class="quality"><span class="big">${fmt(r.rmse, 1)} px</span><span class="badge ${q[0]}">${q[1]}</span></div>
@@ -334,6 +335,10 @@ App.views.calib = {
     k1.onchange = async () => { await App.save({ calib_k1: k1.checked }); this.step("check"); };
     $("#back", save).onclick = () => this.step("points");
     $("#save", save).onclick = async () => {
+      if (r.rmse > 20 && !confirm(`ずれが ${r.rmse.toFixed(0)} px と大きく、このまま使うと速度が大きく狂います。
+「点ごとのずれ」の上の方（赤）の点を直すことをおすすめします。
+
+それでも保存しますか？`)) return;
       const res = await api.post("/api/calib/save", { points: this.points, k1: k1.checked, time: tl.t, view: this.view, path: App.state.calib });
       if (!res.ok) return toast(res.error, "bad");
       App.calib = res.calib; App.state.calib = res.path; App.state.draft_points = {}; this.points = {};

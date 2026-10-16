@@ -276,7 +276,7 @@ App.views.analyze = {
     const st = App.state;
     const items = [
       ["clip", "解析する区間", st.start != null && st.end != null ? `${(+st.start).toFixed(2)} 〜 ${(+st.end).toFixed(2)} s（${(st.end - st.start).toFixed(2)} 秒）` : "まだ決めていません"],
-      ["calib", "コートの合わせ込み", App.calib && !App.calib.error ? `誤差 ${fmt(App.calib.rmse_px, 1)} px・${App.calib.n_points} 点` : "まだです"],
+      ["calib", "コートの合わせ込み", App.calib && !App.calib.error ? `ずれ ${fmt(App.calib.rmse_px, 1)} px・${App.calib.n_points} 点${App.calib.rmse_px > 20 || App.calib.n_points < 6 ? "（大きすぎます）" : ""}` : "まだです"],
       ["plane", "打つ人と着地点", st.hitter && st.landing ? `打つ人 (${fmt(st.hitter.x, 2)}, ${fmt(st.hitter.y, 2)}) → 着地 (${fmt(st.landing.x, 2)}, ${fmt(st.landing.y, 2)}) m` : "まだ決めていません（空のままでも自動で推定しますが、精度は下がります）"],
     ];
     const g = h(`<div class="grid2"><div class="card"><h2>準備の確認</h2><div class="checklist"></div></div>
@@ -294,8 +294,9 @@ App.views.analyze = {
       </div></div>`);
     el.appendChild(g);
     const cl = $(".checklist", g);
+    const calibBad = App.calib && !App.calib.error && (App.calib.rmse_px > 20 || App.calib.n_points < 6);
     for (const [id, name, val] of items) {
-      const okk = stepDone(id);
+      const okk = stepDone(id) && !(id === "calib" && calibBad);
       const row = h(`<div class="ci"><span class="ic ${okk ? "ok" : "ng"}">${okk ? "✓" : "!"}</span><span class="t"><b>${name}</b><span class="muted small">${esc(val)}</span></span><button class="btn sm ghost">${okk ? "変更" : "設定する"}</button></div>`);
       $("button", row).onclick = () => go(id);
       cl.appendChild(row);
@@ -309,8 +310,11 @@ App.views.analyze = {
     const ovl = $("#ovl", g); ovl.checked = st.overlay !== false; ovl.onchange = () => App.save({ overlay: ovl.checked });
     $("#audio", g).appendChild(pathField("別の音声ファイル（任意・WAV）", "audio", "file", { label: "WAV", pattern: "*.wav" }));
 
-    const ready = stepDone("clip") && stepDone("calib");
+    const ready = stepDone("clip") && stepDone("calib") && !calibBad;
     const runCard = h(`<div class="card" style="margin-top:16px;text-align:center">
+      ${calibBad ? `<div class="callout bad" style="text-align:left;margin-bottom:12px"><b>コートの合わせ込みのずれが ${fmt(App.calib.rmse_px, 0)} px（${App.calib.n_points} 点）と大きいため、解析できません。</b>
+        このまま計算すると速度が大きく狂います。手順 2 で、ずれの大きい点を直してください（目安：5 px 以下、6 点以上）。
+        <div style="margin-top:8px"><button class="btn sm" onclick="go('calib')">手順 2 へ</button></div></div>` : ""}
       <button class="btn primary big" id="run" ${ready ? "" : "disabled"} style="min-width:280px">▶ 解析する</button>
       <p class="muted small" style="margin:8px 0 0">${ready ? "4K の動画では 1〜3 分ほどかかります。進み具合は画面の下に出ます。" : "区間とコートの合わせ込みが済むと押せます。"}</p></div>`);
     el.appendChild(runCard);
@@ -337,7 +341,7 @@ App.views.result = {
     if (R.rms_px > 10) quality.push(["bad", "画面上のずれが大きい（" + fmt(R.rms_px, 1) + " px）。シャトルの検出かコートの合わせ込みを確認してください"]);
     else if (R.rms_px > 4) quality.push(["warn", "画面上のずれがやや大きい（" + fmt(R.rms_px, 1) + " px）"]);
     else quality.push(["ok", "画面上のずれは小さい（" + fmt(R.rms_px, 1) + " px）"]);
-    if (R.n_frames_used < 6) quality.push(["bad", `使えたコマが ${R.n_frames_used} 個と少ない。区間や検出範囲を見直してください`]);
+    if (R.n_frames_used < 6) quality.push(["bad", `使えたコマが ${R.n_frames_used} 個と少ない。手順 3 の「検出する範囲」で、打った後にシャトルが飛ぶ範囲を囲むと拾いやすくなります`]);
     else quality.push(["ok", `${R.n_frames_used} コマを使って計算`]);
     const impName = { audio: "打球音", crossing: "軌道の交点", hitter_position: "打つ人の位置", first_frame: "最初に写ったコマ", manual: "手動" }[R.impact_method] || R.impact_method;
     quality.push([R.impact_method === "audio" || R.impact_method === "manual" ? "ok" : "warn", `打った瞬間は「${impName}」から推定（±${fmt(R.impact_sigma_s * 1000, 1)} ms）`]);
