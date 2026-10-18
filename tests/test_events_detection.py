@@ -91,3 +91,55 @@ def test_baseline_detection_on_synthetic_video(tmp_path):
     assert events.impact_from_audio(ons, t_first) is None  # 補正しないと最初の検出より後になる
     imp = events.impact_from_audio(ons, t_first, av_offset_s=-delay)
     assert imp.t == pytest.approx(0.2, abs=1e-3)
+
+
+def _cands(rows):
+    import pandas as pd
+
+    df = pd.DataFrame(rows, columns=["frame", "timestamp", "x", "y", "strength"])
+    return df.assign(cid=np.arange(len(df)), area=20.0, length=10.0, angle=0.0, brightness=200.0)
+
+
+def test_linking_keeps_strongly_decelerating_shuttle_against_clutter():
+    """遠ざかるシャトル（画面上で 1 コマごとに約半分に減速）を、まわりの雑音・別の動きに取られずにつなぐ。
+
+    実際の動画（30fps・カメラが打つ人の後ろ）で起きた失敗の再現：
+    - 打つ直前の腕の動きの点が、シャトルの最初の点を先に取る
+    - 予想位置のすぐ近くの小さな雑音が、少し離れた本物の残像より選ばれる
+    - ゆっくり動く遠くの人の軌道に、途中からシャトルがつながる
+    """
+    from smash_speed.detection.baseline import BaselineParams, _dedupe_overlapping, link_tracks, merge_tracks, \
+        split_at_jumps, track_score
+
+    p = BaselineParams()
+    fps = 30.0
+    shuttle = [(480, 145), (570, 207), (618, 240), (645, 262), (665, 276), (679, 288), (691, 299), (700, 307)]
+    rows = []
+    for k, (x, y) in enumerate(shuttle):
+        f = 10 + k
+        rows.append((f, f / fps, x, y, 5000.0 + 300 * (-1) ** k))
+    rows.append((9, 9 / fps, 340, 27, 4000.0))                       # 腕の動き（シャトルの直前）
+    rows.append((12, 12 / fps, 645, 270, 120.0))                      # 予想位置の近くの小さな雑音
+    for k in range(20):                                               # 遠くでゆっくり動く人
+        rows.append((4 + k, (4 + k) / fps, 600 + 3 * k, 280 + 0.3 * k, 3000.0))
+    for f in range(4, 24):                                            # 動かない雑音
+        rows.append((f, f / fps, 100.0, 400.0, 2500.0))
+    tracks = split_at_jumps(merge_tracks(link_tracks(_cands(rows).sort_values("frame"), p), p))
+    tracks = _dedupe_overlapping([t for t in tracks if len(t.t) >= p.min_track_len])
+    # シャトルの軌道が途切れず・余計な点なしで候補に残り、打った前後（9〜12 コマ目）に始まる軌道の中で最もよい
+    # （遠くの人のような長い軌道との選び分けは、解析で打球音・打つ人の位置を使って行う）
+    near = [t for t in tracks if 9 <= t.frames[0] <= 12]
+    best = max(near, key=track_score)
+    assert best.frames == list(range(10, 18))
+    assert np.allclose(np.array(best.xy), np.array(shuttle, float))
+
+
+def test_remove_outliers_keeps_early_points_of_decelerating_track():
+    from smash_speed.detection.baseline import remove_outliers
+
+    t = np.arange(8) / 30.0
+    x = 700 - 220 * 0.55 ** np.arange(8) * 1.0
+    steps = np.r_[0, 220 * 0.55 ** np.arange(7)]
+    xy = np.column_stack([np.cumsum(steps), 0.4 * np.cumsum(steps)])
+    keep = remove_outliers(t, xy, 4.0)
+    assert keep[:3].all()

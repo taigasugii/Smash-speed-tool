@@ -449,7 +449,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI を実行し、終了コードを返す。"""
     args = build_parser().parse_args(argv)
     cfg = load_config(args.config if args.command != "train" else None)
-    return int(args.func(args, cfg) or 0)
+    from smash_speed.errors import AnalysisError
+
+    try:
+        return int(args.func(args, cfg) or 0)
+    except AnalysisError as e:
+        # 想定している失敗：原因と対処だけを出す（GUI はこの行を読んで画面に出す）
+        for line in e.report_lines():
+            print(line, flush=True)
+        return 2
+    except Exception as e:  # noqa: BLE001  想定外の失敗：詳細を残しつつ、最後に要点を出す
+        import traceback
+
+        traceback.print_exc()
+        print(f"[エラー] 予期しないエラーで止まりました（{type(e).__name__}: {e}）", flush=True)
+        print("[対処] 上の詳細をコピーして開発者に伝えてください。区間や設定を変えると通ることがあります。", flush=True)
+        return 1
 
 
 if __name__ == "__main__":

@@ -287,7 +287,8 @@ App.views.analyze = {
         <div class="field hidden" id="manual" style="margin-top:8px"><label>打点時刻 [s]</label><input class="input num" id="impt" value="${esc(st.impact_time ?? "")}"></div>
         <details class="adv"><summary>詳細設定</summary>
           <div class="stack" style="margin-top:10px">
-            <div class="field"><label>シャトルの見つけ方</label><div class="seg" id="det"><button data-v="baseline">ふつう（背景との差）</button><button data-v="tracknet">TrackNetV3（要準備）</button></div></div>
+            <div class="field"><label>シャトルの見つけ方</label><div class="seg" id="det"><button data-v="baseline">ふつう（背景との差）</button><button data-v="labels">手でつけた位置</button><button data-v="tracknet">TrackNetV3（要準備）</button></div>
+              <span class="muted small">「手でつけた位置」は、研究ツールの「正解ラベルを付ける」で保存した位置を使います（打った瞬間の印があれば、その後のコマを使います）。</span></div>
             <div class="field"><label>信頼区間（誤差の幅）の計算</label><div class="seg" id="ci"><button data-v="jacobian">速い</button><button data-v="bootstrap">丁寧（遅い）</button><button data-v="none">出さない</button></div></div>
             <label class="row small"><input type="checkbox" id="ovl"> 結果を描き込んだ動画も作る</label>
             <div id="audio"></div>
@@ -319,10 +320,21 @@ App.views.analyze = {
       <button class="btn primary big" id="run" ${ready ? "" : "disabled"} style="min-width:280px">▶ 解析する</button>
       <p class="muted small" style="margin:8px 0 0">${ready ? "4K の動画では 1〜3 分ほどかかります。進み具合は画面の下に出ます。" : "区間とコートの合わせ込みが済むと押せます。"}</p></div>`);
     el.appendChild(runCard);
-    $("#run", runCard).onclick = () => Task.start("analyze", {}, async (okk) => {
+    const errBox = h(`<div></div>`);
+    el.appendChild(errBox);
+    $("#run", runCard).onclick = () => { errBox.innerHTML = ""; Task.start("analyze", {}, async (okk, id) => {
       await App.save({ last_result_ok: okk });
-      if (okk) { toast("解析が終わりました", "ok"); go("result"); } else toast("解析に失敗しました。下のログを確認してください。", "bad");
-    }, "解析しています");
+      if (okk) { toast("解析が終わりました", "ok"); go("result"); return; }
+      // 失敗の理由（[エラー]）と対処（[対処]）をログから取り出して、画面に出す
+      const lines = ((await api.get(`/api/task/${id}?since=0`)).lines || []);
+      const msg = lines.filter((l) => l.startsWith("[エラー]")).map((l) => l.slice(5).trim());
+      const hints = lines.filter((l) => l.startsWith("[対処]")).map((l) => l.slice(4).trim());
+      errBox.appendChild(h(`<div class="callout bad" style="margin-top:16px"><b>解析できませんでした。</b>
+        ${msg.length ? `<p style="margin:6px 0">${esc(msg.join(" "))}</p>` : `<p style="margin:6px 0">画面の下の「ログを表示」で詳細を確認してください。</p>`}
+        ${hints.length ? `<b>次のことを試してください</b><ol style="margin:6px 0 0;padding-left:20px">${hints.map((x) => `<li>${esc(x)}</li>`).join("")}</ol>` : ""}</div>`));
+      errBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      toast("解析できませんでした。理由を画面に表示しました。", "bad");
+    }, "解析しています"); };
   },
 };
 

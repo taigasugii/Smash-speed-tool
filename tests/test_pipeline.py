@@ -50,3 +50,45 @@ def test_analyze_reuses_cached_detections(session):
                        landing_xy=tuple(info["landing_xy"]), overlay=False)
     analyze(o, cfg)
     assert (out / "detections.csv").stat().st_mtime == before
+
+
+def test_analyze_reports_cause_when_shuttle_not_found(session, capsys):
+    # 検出する範囲にシャトルが通らないとき：トレースバックではなく、原因と対処を返す
+    from smash_speed import cli
+    from smash_speed.errors import AnalysisError
+
+    cfg, d, info = session
+    o = AnalyzeOptions(video=d / "synthetic.mp4", calib=d / "calibration.json", out_dir=d / "out_noshuttle",
+                       hitter_xy=tuple(info["hitter_xy"]), landing_xy=tuple(info["landing_xy"]),
+                       overlay=False, roi=[0, 500, 40, 540], start_s=0.0, end_s=0.6)
+    with pytest.raises(AnalysisError) as e:
+        analyze(o, cfg)
+    assert "シャトル" in e.value.message and any("検出する範囲" in h for h in e.value.hints)
+    code = cli.main(["analyze", "--video", str(d / "synthetic.mp4"), "--calib", str(d / "calibration.json"),
+                     "--out", str(d / "out_noshuttle_cli"), "--start", "0", "--end", "0.6",
+                     f"--hitter={info['hitter_xy'][0]},{info['hitter_xy'][1]}",
+                     f"--landing={info['landing_xy'][0]},{info['landing_xy'][1]}", "--roi", "0,500,40,540",
+                     "--no-overlay"])
+    out = capsys.readouterr().out
+    assert code == 2 and "[エラー]" in out and "[対処]" in out and "Traceback" not in out
+
+
+def test_analyze_with_hand_labels(session, tmp_path):
+    # 手でつけた位置（打った瞬間の印つき）からも解析できる。打つ前のシャトルは使わない
+    cfg, d, info = session
+    det = pd.read_csv(d / "out_True" / "detections.csv")
+    det = det[det.visible == 1].drop_duplicates("frame")[["frame", "timestamp", "x_px", "y_px", "visible"]]
+    det = det.assign(event="", source="manual")
+    first = det.frame.min()
+    det.loc[det.frame == first, "event"] = "hit"
+    # 打つ前（打点のコマより前）に、ありえない位置の点を足しておく
+    det = pd.concat([pd.DataFrame({"frame": [first - 2, first - 1], "timestamp": [0.0, 0.001],
+                                   "x_px": [5.0, 6.0], "y_px": [5.0, 6.0], "visible": [1, 1],
+                                   "event": ["", ""], "source": ["manual"] * 2}), det])
+    lab = tmp_path / "labels.csv"
+    det.to_csv(lab, index=False)
+    o = AnalyzeOptions(video=d / "synthetic.mp4", calib=d / "calibration.json", out_dir=tmp_path / "out",
+                       audio_path=d / "synthetic.wav", detections=lab, hitter_xy=tuple(info["hitter_xy"]),
+                       landing_xy=tuple(info["landing_xy"]), overlay=False)
+    row = analyze(o, cfg)
+    assert row["speed_initial_mps"] == pytest.approx(75.0, rel=0.05)

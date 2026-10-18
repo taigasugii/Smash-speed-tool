@@ -187,6 +187,11 @@ App.views.calib = {
           if (this.points[n] || this.skipped.has(n) || this.autoSkipped.has(n)) continue;
           if (n === this.cur) drawMarker(ctx, f, p[0], p[1], "#60a5fa", "このあたり？", "ghost");
         }
+        if (this.suspect && this.suspect.pred && this.points[this.suspect.name]) {
+          const q = this.points[this.suspect.name], pr = this.suspect.pred;
+          drawPolyline(ctx, f, [q, pr], "#f97316", 2, [6, 5]);
+          drawMarker(ctx, f, pr[0], pr[1], "#f97316", "予想位置", "ghost");
+        }
         const ord = this.order().map((l) => l.name);
         for (const [n, p] of Object.entries(this.points)) {
           const e = this.solved ? this.solved.errors[n] : undefined;
@@ -203,6 +208,7 @@ App.views.calib = {
       onClick: async (u, v) => {
         if (!this.cur) return toast("全部の点が終わりました。「確認へ」を押してください。");
         const placed = this.cur;
+        this.suspect = this.checkClick(placed, u, v);
         this.points[placed] = [+u.toFixed(1), +v.toFixed(1)];
         this.skipped.delete(placed);
         this.sel = placed;
@@ -219,6 +225,8 @@ App.views.calib = {
     left.appendChild(h(`<p class="muted small" style="margin:8px 2px">選手でラインが隠れているときは、下の時間軸で見やすいコマに動かしてください。
       拡大：マウスホイール　移動：右ドラッグ（またはスペース＋ドラッグ）　ルーペで角をよく見てクリック</p>`));
 
+    const warn = h(`<div></div>`);
+    side.appendChild(warn);
     const target = h(`<div class="target"></div>`);
     side.appendChild(target);
     const ctl = h(`<div class="row"><button class="btn" id="skip">映っていない → とばす <span class="kbd">S</span></button><button class="btn ghost" id="undo">1 つ戻す <span class="kbd">⌫</span></button></div>`);
@@ -231,6 +239,16 @@ App.views.calib = {
     side.appendChild(status);
 
     const refresh = () => {
+      warn.innerHTML = "";
+      if (this.suspect && this.points[this.suspect.name]) {
+        const sd = Court.describe(lmByName[this.suspect.name], this.view.theta);
+        const box = h(`<div class="callout bad"><b>「${esc(sd.title)}」は、ほかの点から予想される位置と合いません</b>
+          <p style="margin:6px 0">${esc(this.suspect.msg)}名前と違う場所（例：ネットポストの「上端」と「根元」、手前と奥）をクリックしていないか確認してください。オレンジの丸が予想位置です。</p>
+          <div class="row"><button class="btn sm primary" id="redo1">置き直す</button><button class="btn sm ghost" id="keep1">このままでよい</button></div></div>`);
+        $("#redo1", box).onclick = async () => { const n = this.suspect.name; delete this.points[n]; this.cur = n; this.sel = null; this.suspect = null; await this.solve(); this.saveDraft(); refresh(); };
+        $("#keep1", box).onclick = () => { this.suspect = null; refresh(); };
+        warn.appendChild(box);
+      } else this.suspect = null;
       const ord = this.order();
       const nDone = Object.keys(this.points).length;
       const lm = this.cur && lmByName[this.cur];
@@ -241,7 +259,7 @@ App.views.calib = {
           <div class="name">${esc(d.title)}</div>
           <div class="what">${esc(d.what)}</div>
           <div class="muted small" style="margin-top:4px">映っていない・隠れているときは「とばす」。右下の図の点を押せば、どの点からでも始められます。</div>
-          <div class="hint">${Court.hintSvg(d.hint)}<div class="small"><b>${esc(d.where)}・${esc(d.side)}</b><br>${{ posttop: "支柱の<b>いちばん上の中心</b>を狙ってください。", postbase: "支柱の<b>中心が床に接する所</b>を狙ってください。", net: "ネットの白帯の<b>上の縁</b>の、左右の真ん中です。", teec: "センターラインの<b>中心</b>と、横線の<b>外側の縁</b>が交わる所です。", cross: "2 本の線が交わる所の、<b>外側の縁</b>どうしの角です。" }[d.hint] || "線の太さの中ではなく、<b>線の外側の縁</b>（コートの外向き）が交わる所を狙ってください。"}<br>${this.solved && this.solved.predicted[lm.name] ? "動画の上の<b>青い点線の丸</b>が予想位置です。" : ""}</div></div>`;
+          <div class="hint">${Court.hintSvg(d.hint)}<div class="small"><b>${esc(d.where)}・${esc(d.side)}</b><br>${{ posttop: "支柱の<b>いちばん上の先端</b>を狙ってください。<b>床に立っている根元ではありません</b>（ネットの白帯と同じくらいの高さ）。", postbase: "支柱の<b>中心が床に接する所</b>を狙ってください。", net: "ネットの白帯の<b>上の縁</b>の、左右の真ん中です。", teec: "センターラインの<b>中心</b>と、横線の<b>外側の縁</b>が交わる所です。", cross: "2 本の線が交わる所の、<b>外側の縁</b>どうしの角です。" }[d.hint] || "線の太さの中ではなく、<b>線の外側の縁</b>（コートの外向き）が交わる所を狙ってください。"}<br>${this.solved && this.solved.predicted[lm.name] ? "動画の上の<b>青い点線の丸</b>が予想位置です。" : ""}</div></div>`;
         fv.setTip(`「${d.title}」をクリック`);
       } else {
         target.innerHTML = `<div class="step">すべての点が終わりました</div><div class="name">確認へ進んでください</div><div class="what">クリックした点は動画の上で直せます（一覧から選んで矢印キーで微調整）。</div>`;
@@ -280,6 +298,25 @@ App.views.calib = {
     window.addEventListener("keydown", this.keyh);
     this.solve().then(refresh);
     tl.seek(App.state.start != null ? +App.state.start : 0);
+  },
+
+  /** クリックした位置が、ほかの点から予想される位置と大きく違えば理由を返す（違わなければ null）。 */
+  checkClick(name, u, v) {
+    const k = rmseScale();
+    // 高さのある点：ネットポストの上端が根元とほぼ同じ高さ（またはそれより下）にある
+    if (name.startsWith("post_top_")) {
+      const base = this.points[name.replace("post_top_", "post_base_")];
+      const pt = this.solved && this.solved.predicted[name], pb = this.solved && this.solved.predicted[name.replace("post_top_", "post_base_")];
+      const expect = pt && pb ? Math.hypot(pt[0] - pb[0], pt[1] - pb[1]) : 0;
+      if (base && base[1] - v < Math.max(20 * k, 0.4 * expect))
+        return { name, pred: pt || null, msg: `クリックした位置が、ネットポストの根元とほぼ同じ高さです（${fmt(base[1] - v, 0)} px 上${expect ? `。予想では約 ${fmt(expect, 0)} px 上` : ""}）。上端は支柱のいちばん上の先です。` };
+    }
+    if (!this.solved || Object.keys(this.points).filter((n) => n !== name).length < 6) return null;
+    const pred = this.solved.predicted[name];
+    if (!pred) return null;
+    const d = Math.hypot(u - pred[0], v - pred[1]);
+    const tol = Math.max(40 * k, 6 * (this.solved.rmse || 0));
+    return d > tol ? { name, pred, msg: `予想位置から ${fmt(d, 0)} px 離れています（ほかの点のずれは平均 ${fmt(this.solved.rmse, 1)} px）。` } : null;
   },
 
   skipCur(refresh) {

@@ -503,6 +503,12 @@ def run(kind: str):
             det = out / "detections_tracknet.csv"
             cmds.append(cli("detect", *common, "--detector", "tracknet", "--out", str(det)))
             args += ["--detections", str(det)]
+        elif st.get("detector") == "labels":
+            lab = Path(st.get("ann_dir") or "") / "labels.csv"
+            if not st.get("ann_dir") or not lab.exists():
+                return err("手でつけたシャトルの位置がありません。「研究ツール」の「正解ラベルを付ける」で、"
+                           "打った直後の数コマに位置をつけて保存してください。")
+            args += ["--detections", str(lab)]
         elif st.get("roi"):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
         cmds.append(cli(*args))

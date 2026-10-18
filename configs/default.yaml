@@ -88,7 +88,7 @@ detection:
     tracknet_ckpt: null        # ckpts/TrackNet_best.pt
     inpaintnet_ckpt: null      # ckpts/InpaintNet_best.pt（省略可）
     python: null               # TrackNetV3 用の Python（null なら現在の Python）
-  n_track_candidates: 12       # 解析で打点後の軌道を選ぶときの候補の数（打球音・打点の位置で選ぶ）
+  n_track_candidates: 40       # 解析で打点後の軌道を選ぶときの候補の数（打球音・打点の位置で選ぶ）
   match_tolerance_px: 4.0      # 検出が正しいとみなす距離 [px]（評価用。解像度に応じて調整）
 
 events:

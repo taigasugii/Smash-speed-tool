@@ -173,7 +173,11 @@ def render_overlay(reader, start_s: float, end_s: float, detections: pd.DataFram
         traj = simulate_until_ground(fit.p0, fit.v0, fit.t_ref, fit.phys(phys))
         curve_t = traj["t"]
         curve = cam_s.project(traj["pos"])
-    det = detections.set_index("frame")
+    # 同じフレームに複数の検出がある場合（軌道の候補をすべて出した検出）は、信頼度の高い 1 点だけを描く
+    vis = detections[detections.visible == 1]
+    if "confidence" in vis:
+        vis = vis.sort_values("confidence", ascending=False)
+    det = vis.drop_duplicates("frame").set_index("frame")
     trail: list[tuple[int, int]] = []
     court_layer = None
     for i, t, img in reader.iter_range(start_s, end_s):

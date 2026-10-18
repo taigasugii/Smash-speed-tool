@@ -28,7 +28,8 @@ from smash_speed import events, report
 from smash_speed.calibration.io import load_calibration
 from smash_speed.camera import Camera
 from smash_speed.config import save_config
-from smash_speed.detection.baseline import BaselineParams, detect
+from smash_speed.detection.baseline import DETECTOR_VERSION, BaselineParams, detect
+from smash_speed.errors import AnalysisError
 from smash_speed.geometry import FlightPlane, floor_point, intersect_plane
 from smash_speed.physics import (
     FitOptions, FitResult, Observations, PhysicsParams, finite_difference_speeds, fit_trajectory,
@@ -68,14 +69,24 @@ class AnalyzeOptions:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+def _same_json(path: Path, obj: dict[str, Any]) -> bool:
+    """保存済みの JSON が obj と同じか（検出結果を使い回してよいかの判定）。"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) == json.loads(json.dumps(obj, default=str))
+    except (OSError, ValueError):
+        return False
+
+
 def _camera_for_video(camera: Camera, meta: VideoMeta) -> Camera:
     """キャリブレーションした画像サイズと動画のサイズが違えば、カメラを拡大縮小する。"""
     if camera.width == meta.width and camera.height == meta.height:
         return camera
     s = meta.width / camera.width
     if abs(meta.height / camera.height - s) > 1e-3:
-        raise ValueError(f"キャリブレーションの画像サイズ {camera.width}x{camera.height} と動画 "
-                         f"{meta.width}x{meta.height} の縦横比が違います")
+        raise AnalysisError(f"キャリブレーションの画像サイズ {camera.width}x{camera.height} と動画 "
+                            f"{meta.width}x{meta.height} の縦横比が違います",
+                            ["この動画で手順 2「コートを合わせる」をやり直してください（別のカメラ位置・解像度の"
+                             "キャリブレーションが選ばれています）。"])
     return camera.scaled(s)
 
 
@@ -85,11 +96,15 @@ def _select_tracks(det: pd.DataFrame, onsets: list[tuple[float, float]] | None =
     """検出から、打点後の軌道と、その直前に終わる打点前の軌道を選ぶ。
 
     手がかり（あるものだけ使う）:
-        - 画像上の速さと長さ（速く長く続くほどシャトルらしい）
-        - 打球音の直後に始まっているか（強い打球音の 0.04 s 前〜0.2 s 後）
+        - 検出のスコア（長さ・速さ・滑らかさ・向きのそろい方。``confidence`` 列から戻す）
+        - 打球音の直後に始まっているか（強い打球音の 0.04 s 前〜0.2 s 後。直後ほどよい）
         - 打つ人の打点（足元の上 2.5 m）の近くから始まっているか
     """
     vis = det[det.visible == 1]
+    if "event" in det and (det["event"].fillna("") == "hit").any():
+        # 手でつけた位置：「打った瞬間」の印のあるコマから後を打点後の軌道とする
+        f_hit = int(det.loc[det["event"].fillna("") == "hit", "frame"].iloc[-1])
+        return vis[vis.frame >= f_hit], vis[vis.frame < f_hit]
     if "track_id" not in vis or vis["track_id"].nunique() <= 1:
         return vis, vis.iloc[0:0]
     strong = []
@@ -102,10 +117,16 @@ def _select_tracks(det: pd.DataFrame, onsets: list[tuple[float, float]] | None =
             continue
         uv = g[["x_px", "y_px"]].to_numpy()
         speed = np.median(np.linalg.norm(np.diff(uv, axis=0), axis=1) / np.diff(g.timestamp))
-        score = speed * np.sqrt(len(g))
+        c = float(g["confidence"].iloc[0]) if "confidence" in g else 0.0
+        if 0.0 < c < 1.0:
+            score = 1000.0 * c / (1.0 - c)  # ベースライン検出の track_score
+        else:  # TrackNet・手動ラベルなど
+            score = speed * np.sqrt(len(g))
         t0 = float(g.timestamp.min())
         if strong:
-            score *= 1.0 if any(t - 0.04 <= t0 <= t + 0.2 for t in strong) else 0.15
+            gaps = [t0 - t for t in strong if t - 0.04 <= t0 <= t + 0.2]
+            # 打った直後から写っている軌道ほどよい（0.06 s 遅れで半分）
+            score *= 1.0 / (1.0 + (max(min(gaps, key=abs), 0.0) / 0.06) ** 2) if gaps else 0.15
         if hit_uv is not None and np.isfinite(hit_uv).all():
             dd = np.linalg.norm(uv[0] - hit_uv) / img_w
             score *= 1.0 / (1.0 + (dd / 0.12) ** 2)
@@ -143,7 +164,8 @@ def auto_plane(obs: Observations, t_ref: float, phys: PhysicsParams, cfg: dict[s
             if f.success and f.rms_px < best[0]:
                 best = (f.rms_px, plane)
     if best[1] is None:
-        raise RuntimeError("飛行平面を自動で決められませんでした。--hitter / --landing を指定してください。")
+        raise AnalysisError("シャトルが飛んだ面（打つ人 → 着地点）を自動で決められませんでした。",
+                            ["手順 3 で「打つ人の足元」と「着地点」を指定してください。"])
     return best[1]
 
 
@@ -185,17 +207,23 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
 
     # --- シャトル検出
     det_path = out / "detections.csv"
-    if o.detections is not None:
+    det_meta_path = out / "detections_meta.json"
+    bp = BaselineParams.from_config(cfg)
+    if o.roi:
+        bp.roi = list(o.roi)
+    n_cand = cfg.get("detection", {}).get("n_track_candidates", 40)
+    det_key = {"version": DETECTOR_VERSION, "start": o.start_s, "end": o.end_s, "roi": bp.roi,
+               "params": {k: v for k, v in vars(bp).items() if k != "extra"} | dict(bp.extra), "n": n_cand}
+    own_detection = o.detections is None
+    if not own_detection:
         det = pd.read_csv(o.detections)
         det.to_csv(det_path, index=False)
-    elif det_path.exists() and not o.force:
+    elif det_path.exists() and not o.force and _same_json(det_meta_path, det_key):
         det = pd.read_csv(det_path)
-    else:
-        bp = BaselineParams.from_config(cfg)
-        if o.roi:
-            bp.roi = list(o.roi)
-        det = detect(meta, o.start_s, o.end_s, bp, n_tracks=cfg.get("detection", {}).get("n_track_candidates", 12))
+    else:  # 検出の方法・設定・区間が前回と違えば、保存済みの検出は使わない
+        det = detect(meta, o.start_s, o.end_s, bp, n_tracks=n_cand, exclusive=False)
         det.to_csv(det_path, index=False)
+        det_meta_path.write_text(json.dumps(det_key, ensure_ascii=False, default=str), encoding="utf-8")
     # --- 飛行平面（軌道の選択・打球音の伝搬遅れの見積もりにも使うので先に決める）
     reader = VideoReader(meta) if o.plane_gui else None
     plane, plane_src = _resolve_plane(o, camera, cfg, reader, o.start_s or 0.0)
@@ -231,8 +259,38 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
 
     # --- 打点後の軌道を選ぶ
     out_tr, in_tr = _select_tracks(det, onsets, hit_uv, float(meta.width))
+    if len(out_tr) < 4 and own_detection:
+        # 条件を緩めてもう一度探す（薄い残像・短い軌道も拾う）
+        relaxed = BaselineParams(**{k: v for k, v in vars(bp).items() if k != "extra"}, extra=dict(bp.extra))
+        relaxed.diff_threshold = max(6, int(round(bp.diff_threshold * 0.6)))
+        relaxed.max_candidates = bp.max_candidates * 2
+        relaxed.max_streak_area_px = bp.max_streak_area_px * 2
+        relaxed.min_track_len = 3
+        det2 = detect(meta, o.start_s, o.end_s, relaxed, n_tracks=n_cand, exclusive=False)
+        out2, in2 = _select_tracks(det2, onsets, hit_uv, float(meta.width))
+        if len(out2) > len(out_tr):
+            log.append(f"シャトルが見つかりにくかったため、検出の条件を緩めて探し直しました（{len(out_tr)} → {len(out2)} 点）。")
+            det, out_tr, in_tr = det2, out2, in2
+            det.to_csv(det_path, index=False)
     if len(out_tr) < 4:
-        raise RuntimeError(f"シャトルの検出が {len(out_tr)} 点しかありません（区間・ROI・閾値を確認してください）")
+        hints = []
+        if o.start_s is not None and o.end_s is not None and o.end_s - o.start_s < 0.5:
+            hints.append(f"区間が {o.end_s - o.start_s:.2f} 秒と短すぎます。手順 1 で、打つ 0.3 秒ほど前から"
+                         "シャトルが落ちるまで（1 秒前後）にしてください。")
+        if bp.roi:
+            hints.append("手順 3 の「検出する範囲」が狭すぎる可能性があります。打った後にシャトルが飛ぶ範囲全体を"
+                         "囲み直すか、「消す」で範囲の指定をやめてください。")
+        else:
+            hints.append("手順 3 の「検出する範囲」で、打った後にシャトルが飛ぶ範囲（選手の頭より上など）を囲むと、"
+                         "選手の動きと区別しやすくなります。")
+        hints.append("手順 1 で動画を 1 コマずつ動かし、打った直後のシャトルが写っているか確認してください。"
+                     "写っていない・ほとんど見えない場合は、シャッター速度を速くするか、シャトルが画面を横切る"
+                     "向き（コートの横）から撮り直してください。")
+        hints.append("それでも見つからない場合は、「研究ツール」の「正解ラベルを付ける」で打った直後の数コマに"
+                     "シャトルの位置をつけて保存し、手順 4 の「詳細設定」→「シャトルの見つけ方」で"
+                     "「手でつけた位置」を選ぶと解析できます。")
+        raise AnalysisError(f"打った後のシャトルが {len(out_tr)} コマ分しか見つかりませんでした（4 コマ以上必要です）。",
+                            hints)
     t_first = float(out_tr.timestamp.min())
     if onsets:
         smax = max(s_ for _, s_ in onsets)
@@ -273,8 +331,18 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         impact = provisional
 
     # --- 観測
-    use = out_tr[out_tr.timestamp >= min(impact.t, provisional.t) - 1e-9]
+    if impact.method in ("audio", "manual"):
+        # 打った瞬間が音・手動でわかっていれば、それより前のコマ（ラケットとシャトルが重なって写る）は使わない
+        use = out_tr[out_tr.timestamp > impact.t]
+        if len(use) < len(out_tr):
+            log.append(f"打った瞬間（{impact.t:.3f} s）より前の {len(out_tr) - len(use)} コマは、ラケットと重なって写るため使いませんでした。")
+    else:
+        use = out_tr[out_tr.timestamp >= min(impact.t, provisional.t) - 1e-9]
     use = use[use.timestamp <= impact.t + ev_cfg.get("max_flight_s", 1.2)]
+    if len(use) < 4:
+        raise AnalysisError(f"打った後のシャトルが {len(use)} コマ分しか使えませんでした（4 コマ以上必要です）。",
+                            ["手順 1 の区間の終わりを、シャトルが床に落ちた後まで延ばしてください。",
+                             "手順 3 の「検出する範囲」で、打った後にシャトルが飛ぶ範囲全体を囲んでください。"])
     obs = Observations(camera, use.timestamp.to_numpy(), use[["x_px", "y_px"]].to_numpy())
 
     opts = FitOptions.from_config(cfg)
@@ -309,7 +377,14 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     # --- 当てはめ（外れ値を除いて再当てはめ）
     def run_fit(t_ref: float, sigma: float, o_: Observations) -> FitResult:
         opts.t_ref_sigma = sigma
-        return fit_trajectory(o_, t_ref, o.mode, plane, phys, opts)
+        try:
+            return fit_trajectory(o_, t_ref, o.mode, plane, phys, opts)
+        except ValueError as e:
+            raise AnalysisError(f"シャトルの軌道を計算できませんでした（{e}）。",
+                                ["手順 3 の「打つ人の足元」「着地点」が実際の位置と合っているか確認してください。",
+                                 "手順 2 のコートの合わせ込みで、黄色い線が実際のラインに重なっているか確認してください。",
+                                 "検出したシャトルの位置が少なすぎる可能性があります。「検出する範囲」を囲んで"
+                                 "やり直してください。"]) from e
 
     fit = run_fit(impact.t, impact.sigma, obs)
     pred, _ = fit.evaluate(obs.t, phys)
@@ -399,7 +474,8 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         if o.overlay:
             t0 = o.start_s if o.start_s is not None else max(0.0, impact.t - 0.3)
             t1 = o.end_s if o.end_s is not None else metrics["t_land_s"] + 0.3
-            report.render_overlay(r, t0, t1, det, fit, phys, camera, cfg, out / "overlay.mp4", metrics)
+            used = pd.concat([in_tr, out_tr[out_tr.timestamp.isin(obs.t)]])  # 当てはめに使った軌道だけを描く
+            report.render_overlay(r, t0, t1, used, fit, phys, camera, cfg, out / "overlay.mp4", metrics)
     for line in log:
         print("[注意]", line)
     return row
