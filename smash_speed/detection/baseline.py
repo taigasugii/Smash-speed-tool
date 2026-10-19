@@ -21,7 +21,7 @@ import pandas as pd
 from smash_speed.video_io import VideoMeta, VideoReader
 
 # 検出の方法を変えたら上げる（保存済みの検出結果を使い回さないため）
-DETECTOR_VERSION = 2
+DETECTOR_VERSION = 3
 
 DETECTION_COLUMNS = ["frame", "timestamp", "x_px", "y_px", "visible", "confidence"]
 
@@ -44,6 +44,7 @@ class BaselineParams:
     min_track_len: int = 4
     outlier_px: float = 4.0           # 局所2次式からのずれがこれを超える点を外れ値とする [px]（縮小後）
     roi: list[float] | None = None    # [x0, y0, x1, y1]（元解像度 px）。None なら全体
+    roi_polygon: list[list[float]] | None = None  # 多角形の範囲 [[x, y], ...]（元解像度 px）。roi と両方なら重なる部分
     min_brightness: int = 0           # 候補の最低輝度（白いシャトルに限る場合に使う）
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -420,6 +421,26 @@ def remove_outliers(t: np.ndarray, xy: np.ndarray, thr: float, n_neighbors: int 
     return keep
 
 
+def make_roi_mask(p: BaselineParams, shape: tuple[int, int], scale: float) -> np.ndarray | None:
+    """検出する範囲（``roi`` の四角と ``roi_polygon`` の多角形の重なり）のマスク（縮小後の画像の大きさ）。
+
+    範囲の指定がなければ None。
+    """
+    if p.roi is None and p.roi_polygon is None:
+        return None
+    mask = np.full(shape, 255, np.uint8)
+    if p.roi is not None:
+        rect = np.zeros(shape, np.uint8)
+        x0, y0, x1, y1 = (np.array(p.roi) * scale).round().astype(int)
+        rect[max(y0, 0):max(y1, 0), max(x0, 0):max(x1, 0)] = 255
+        mask = cv2.bitwise_and(mask, rect)
+    if p.roi_polygon is not None:
+        poly = np.zeros(shape, np.uint8)
+        cv2.fillPoly(poly, [(np.asarray(p.roi_polygon, float) * scale).round().astype(np.int32)], 255)
+        mask = cv2.bitwise_and(mask, poly)
+    return mask
+
+
 def detect(meta: VideoMeta, start_s: float | None = None, end_s: float | None = None,
            params: BaselineParams | None = None, n_tracks: int = 1,
            return_candidates: bool = False, exclusive: bool = True) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
@@ -459,10 +480,8 @@ def detect_frames(frames: Iterable[tuple[int, float, np.ndarray]], scale: float,
     buf: list[tuple[int, float, np.ndarray]] = []
     for i, t, g in frames:
         g = cv2.GaussianBlur(g, (3, 3), 0)
-        if roi_mask is None and p.roi is not None:
-            roi_mask = np.zeros_like(g)
-            x0, y0, x1, y1 = (np.array(p.roi) * scale).round().astype(int)
-            roi_mask[y0:y1, x0:x1] = 255
+        if roi_mask is None:
+            roi_mask = make_roi_mask(p, g.shape[:2], scale)
         buf.append((i, t, g))
         frames_meta.append((i, t))
         if len(buf) < 3:

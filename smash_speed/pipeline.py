@@ -8,6 +8,8 @@
       detections.csv     フレームごとのシャトルの画像座標
       audio.wav          解析区間の音声
       events.json        打点時刻（方法・不確かさ）、打球音の一覧、着地時刻
+      candidates.csv     検出の候補（軌道にする前の、動く小さな物の一覧）
+      observations.csv   当てはめに使ったシャトルの位置
       plane.json         飛行平面（モード A）
       fit_result.json    軌道フィッティングの結果
       result.csv         速度指標（1行）
@@ -21,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -28,11 +31,12 @@ from smash_speed import events, report
 from smash_speed.calibration.io import load_calibration
 from smash_speed.camera import Camera
 from smash_speed.config import save_config
-from smash_speed.detection.baseline import DETECTOR_VERSION, BaselineParams, detect
+from smash_speed.detection import guided
+from smash_speed.detection.baseline import DETECTOR_VERSION, BaselineParams, detect, make_roi_mask
 from smash_speed.errors import AnalysisError
 from smash_speed.geometry import FlightPlane, floor_point, intersect_plane
 from smash_speed.physics import (
-    FitOptions, FitResult, Observations, PhysicsParams, finite_difference_speeds, fit_trajectory,
+    FitOptions, FitResult, Observations, PhysicsParams, finite_difference_speeds, fit_trajectory, simulate,
     speed_metrics,
 )
 from smash_speed.repro import run_metadata, set_seed
@@ -146,6 +150,25 @@ def _select_tracks(det: pd.DataFrame, onsets: list[tuple[float, float]] | None =
     return out, inc
 
 
+def _strong_onsets(onsets: list[tuple[float, float]], ratio: float = 0.3, n_max: int = 3) -> list[float]:
+    """強い打球音（いちばん強い音の ``ratio`` 倍以上）の時刻 [s]。強い順に最大 ``n_max`` 個。"""
+    if not onsets:
+        return []
+    smax = max(s_ for _, s_ in onsets)
+    strong = sorted((o_ for o_ in onsets if o_[1] >= ratio * smax), key=lambda o_: -o_[1])
+    return [t for t, _ in strong[:n_max]]
+
+
+def _as_track(points: pd.DataFrame) -> pd.DataFrame:
+    """点の表（列 ``frame, timestamp, x_px, y_px``）を、検出結果と同じ形の 1 本の軌道にする。"""
+    tr = points[["frame", "timestamp", "x_px", "y_px"]].copy()
+    tr["frame"] = tr["frame"].astype(int)
+    tr["visible"] = 1
+    tr["confidence"] = 1.0
+    tr["track_id"] = 0
+    return tr.sort_values("frame").reset_index(drop=True)
+
+
 def auto_plane(obs: Observations, t_ref: float, phys: PhysicsParams, cfg: dict[str, Any]
                ) -> FlightPlane:
     """飛行平面が与えられないとき、平面の位置と向きを格子探索して再投影誤差が最小のものを選ぶ（試験的）。
@@ -187,6 +210,18 @@ def _resolve_plane(o: AnalyzeOptions, camera: Camera, cfg: dict[str, Any], reade
     return None, "auto"
 
 
+def _landing_distance(o: AnalyzeOptions, camera: Camera, plane: FlightPlane) -> float | None:
+    """打つ人の足元から着地点までの水平距離 [m]（着地点がわからなければ None）。"""
+    if o.landing_xy is not None:
+        P = np.r_[np.asarray(o.landing_xy, float)[:2], 0.0]
+    elif o.landing_px is not None:
+        P = floor_point(camera, np.array([o.landing_px], float))[0]
+    else:
+        return None
+    s_land = float(plane.to_plane(P[None])[0, 0])
+    return s_land if np.isfinite(s_land) and s_land > 0 else None
+
+
 def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     """動画1本を解析して、速度指標の辞書を返す（ファイルは ``o.out_dir`` に保存）。"""
     out = Path(o.out_dir)
@@ -205,37 +240,51 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     camera = _camera_for_video(camera, meta)
     dt = 1.0 / meta.capture_fps
 
-    # --- シャトル検出
-    det_path = out / "detections.csv"
-    det_meta_path = out / "detections_meta.json"
-    bp = BaselineParams.from_config(cfg)
-    if o.roi:
-        bp.roi = list(o.roi)
-    n_cand = cfg.get("detection", {}).get("n_track_candidates", 40)
-    det_key = {"version": DETECTOR_VERSION, "start": o.start_s, "end": o.end_s, "roi": bp.roi,
-               "params": {k: v for k, v in vars(bp).items() if k != "extra"} | dict(bp.extra), "n": n_cand}
-    own_detection = o.detections is None
-    if not own_detection:
-        det = pd.read_csv(o.detections)
-        det.to_csv(det_path, index=False)
-    elif det_path.exists() and not o.force and _same_json(det_meta_path, det_key):
-        det = pd.read_csv(det_path)
-    else:  # 検出の方法・設定・区間が前回と違えば、保存済みの検出は使わない
-        det = detect(meta, o.start_s, o.end_s, bp, n_tracks=n_cand, exclusive=False)
-        det.to_csv(det_path, index=False)
-        det_meta_path.write_text(json.dumps(det_key, ensure_ascii=False, default=str), encoding="utf-8")
-    # --- 飛行平面（軌道の選択・打球音の伝搬遅れの見積もりにも使うので先に決める）
+    # --- 飛行平面（検出する範囲・軌道の選択・打球音の伝搬遅れの見積もりにも使うので先に決める）
     reader = VideoReader(meta) if o.plane_gui else None
     plane, plane_src = _resolve_plane(o, camera, cfg, reader, o.start_s or 0.0)
     if reader is not None:
         reader.close()
     ev_cfg = cfg.get("events", {})
+    det_cfg = cfg.get("detection", {})
     c_sound = ev_cfg.get("speed_of_sound_mps", 343.0)
     hitter_known = plane is not None and plane_src in ("file", "court_xy", "image_px", "gui")
     # 打点の位置の目安：打つ人の足元から飛行方向へ contact_offset 前、高さ hit_height
     hit_X = plane.to_world(np.array([ev_cfg.get("contact_offset_m", 0.3)]),
                            np.array([ev_cfg.get("hit_height_m", 2.5)]))[0] if hitter_known else None
     hit_uv = camera.project(hit_X[None])[0] if hit_X is not None else None
+
+    # --- シャトル検出
+    det_path = out / "detections.csv"
+    cand_path = out / "candidates.csv"
+    det_meta_path = out / "detections_meta.json"
+    bp = BaselineParams.from_config(cfg)
+    if o.roi:
+        bp.roi = list(o.roi)
+    own_detection = o.detections is None
+    if own_detection and not bp.roi and hitter_known and det_cfg.get("auto_roi", True):
+        # 検出する範囲が指定されていなければ、打つ人から着地点までの空間を画像に投影した範囲にする
+        length = _landing_distance(o, camera, plane)
+        poly = guided.corridor_polygon(camera, plane, length if length is not None else 10.0)
+        if poly is not None and guided.polygon_area_ratio(poly, meta.width, meta.height) < 0.9:
+            bp.roi_polygon = np.round(poly, 1).tolist()
+            log.append("検出する範囲を、打つ人から着地点までの空間（床〜高さ 4 m）に自動で絞りました。")
+    n_cand = det_cfg.get("n_track_candidates", 40)
+    det_key = {"version": DETECTOR_VERSION, "start": o.start_s, "end": o.end_s, "roi": bp.roi,
+               "params": {k: v for k, v in vars(bp).items() if k != "extra"} | dict(bp.extra), "n": n_cand}
+    cands = pd.DataFrame()
+    if not own_detection:
+        det = pd.read_csv(o.detections)
+        det.to_csv(det_path, index=False)
+    elif det_path.exists() and cand_path.exists() and not o.force and _same_json(det_meta_path, det_key):
+        det = pd.read_csv(det_path)
+        cands = pd.read_csv(cand_path)
+    else:  # 検出の方法・設定・区間が前回と違えば、保存済みの検出は使わない
+        det, cands = detect(meta, o.start_s, o.end_s, bp, n_tracks=n_cand, return_candidates=True, exclusive=False)
+        det.to_csv(det_path, index=False)
+        cands.to_csv(cand_path, index=False)
+        det_meta_path.write_text(json.dumps(det_key, ensure_ascii=False, default=str), encoding="utf-8")
+    unit_px = max(1.0, meta.width / bp.process_width)  # 検出に使った縮小画像の 1 px が元の解像度で何 px か
 
     # --- 打球音
     onsets: list[tuple[float, float]] = []
@@ -258,7 +307,60 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
             log.append("撮影 fps を上書きしたため、音声の時刻も同じ倍率で換算しました。音声と映像のずれを確認してください。")
 
     # --- 打点後の軌道を選ぶ
-    out_tr, in_tr = _select_tracks(det, onsets, hit_uv, float(meta.width))
+    # 打つ人の位置と打球音がわかっていれば、打点から打ち出した軌道を総当たりで作り、検出の候補を最も多く通るものを
+    # 選ぶ（選手・観客・ラケットの動きは、打点から出る物理的な軌道に乗らない）。見つからなければ従来の選び方にする
+    search = None
+    if own_detection and hitter_known and det_cfg.get("physics_search", True):
+        if o.impact_time_s is not None:
+            t_hits = [o.impact_time_s]
+        else:
+            delay0 = float(np.linalg.norm(camera.center - hit_X)) / c_sound
+            t_hits = [t + o.av_offset_s - delay0 for t in _strong_onsets(onsets)]
+        if t_hits:
+            max_flight = ev_cfg.get("max_flight_s", 1.2)
+            t0s, t1s = min(t_hits) - 3 * dt, max(t_hits) + max_flight + 2 * dt
+            if o.start_s is not None:
+                t0s = max(t0s, o.start_s)
+            if o.end_s is not None:
+                t1s = min(t1s, o.end_s)
+            scale = 1.0 / unit_px
+            with VideoReader(meta, scale=scale) as r:
+                frames = [(i, t, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)) for i, t, img in r.iter_range(t0s, t1s)]
+            mask = make_roi_mask(bp, frames[0][2].shape[:2], scale) if frames else None
+            maps = guided.evidence_maps(frames, mask)
+            del frames
+            search = guided.search_trajectory(maps, camera, plane, hit_X, t_hits, phys, scale, max_flight)
+            if search is not None:
+                predict = guided.trajectory_predictor(search.p0, search.v0, search.t_impact, phys, camera, t1s)
+                with VideoReader(meta) as r:
+                    gray = ((i, t, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+                            for i, t, img in r.iter_range(search.t_impact - 1.5 * dt, t1s))
+                    rd = guided.redetect_along(gray, predict, unit_px)
+                rd = rd[rd.timestamp > search.t_impact]
+                # 最初の検出の候補が予測位置の近くにあればそれを使い、候補のないコマだけ探し直した位置で補う
+                # （探し直しは予測位置を手がかりにするので、候補があるならそちらの方が偏りがない）
+                mc = guided.match_candidates(cands, predict, unit_px) if not cands.empty else rd.iloc[0:0]
+                mc = mc[mc.timestamp > search.t_impact]
+                pts = pd.concat([mc, rd[~rd.frame.isin(mc.frame)]]).sort_values("timestamp")
+                if len(pts) >= 4:
+                    search.matched = pts
+                else:
+                    search = None
+    old_tr, old_in = _select_tracks(det, onsets, hit_uv, float(meta.width))
+    if search is not None and len(old_tr) >= 4:
+        # 従来の選び方の軌道が探索した軌道とほぼ重なれば、そちらを使う（候補を時間方向につないだ軌道なので、
+        # 打った直後にラケットと重なった点が混じりにくい）。漏れたコマは当てはめの後で補う
+        near = guided.match_candidates(
+            old_tr.rename(columns={"x_px": "x", "y_px": "y"}), predict, unit_px)
+        if len(near) >= 0.8 * len(old_tr):
+            search.matched = old_tr
+    if search is not None:
+        out_tr = _as_track(search.matched)
+        in_tr = old_in if search.matched is old_tr else out_tr.iloc[0:0]
+        log.append(f"打点（打つ人の足元の少し前・高さ {ev_cfg.get('hit_height_m', 2.5):.1f} m）から打球音の時刻に打ち出した軌道を"
+                   f"探し、シャトルを {len(out_tr)} コマ見つけました（だいたいの初速 {search.speed0 * 3.6:.0f} km/h）。")
+    else:
+        out_tr, in_tr = old_tr, old_in
     if len(out_tr) < 4 and own_detection:
         # 条件を緩めてもう一度探す（薄い残像・短い軌道も拾う）
         relaxed = BaselineParams(**{k: v for k, v in vars(bp).items() if k != "extra"}, extra=dict(bp.extra))
@@ -355,12 +457,21 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         plane = auto_plane(obs, impact.t, phys, cfg)
         opts.plane_sigma_deg, opts.plane_sigma_m = 10.0, 1.0
 
+    fit_mode = o.mode
     if plane is not None:
         # カメラから打点への視線と飛行平面のなす角。小さい（飛ぶ方向を正面に近い角度から見ている）ほど、
         # 平面の位置のわずかなずれで奥行き＝速さが大きく変わる
         Xc = hit_X if hit_X is not None else plane.origin + np.array([0.0, 0.0, 2.5])
         ray = Xc - camera.center
         graze = float(np.degrees(np.arcsin(min(1.0, abs(ray @ plane.normal) / np.linalg.norm(ray)))))
+        free_below = cfg["physics"].get("free_below_graze_deg", 20.0)
+        if (o.mode == "plane" and search is not None and graze < free_below
+                and ev_cfg.get("use_hit_prior", True) and hit_X is not None):
+            # 視線が飛行平面に沿っていると、平面の横のわずかなずれで奥行き（＝速さ）が大きく変わる。
+            # 平面に縛らず、「打球音の時刻に打点の近くを出た」ことだけを手がかりに 3 次元の軌道を当てはめる
+            fit_mode = "free"
+            log.append(f"視線と飛行面の角度が {graze:.0f}° と小さいため、飛行面に縛らずに 3 次元の軌道を当てはめました"
+                       "（打球音の時刻に打点の近くを出たことを手がかりにします）。")
         if graze < 35.0:
             log.append(f"カメラがシャトルの飛ぶ方向を斜め前（後ろ）から見ています（視線と飛行面の角度 {graze:.0f}°）。"
                        "この角度では、打つ人・着地点の位置が少しずれるだけで速さが大きく変わります。"
@@ -371,6 +482,7 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         opts.p0_prior_m = hit_X
         opts.p0_prior_sigma_m = (ev_cfg.get("hit_prior_sigma_m", 0.6), ev_cfg.get("hit_height_sigma_m", 0.5))
 
+    want_refine = opts.refine_plane
     if opts.refine_plane and len(obs.t) <= ev_cfg.get("min_frames_refine_plane", 5):
         opts.refine_plane = False
         log.append(f"使えるコマが {len(obs.t)} 個と少ないため、飛行平面は補正せず、指定どおりに使いました"
@@ -379,8 +491,11 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     # --- 当てはめ（外れ値を除いて再当てはめ）
     def run_fit(t_ref: float, sigma: float, o_: Observations) -> FitResult:
         opts.t_ref_sigma = sigma
+        if search is not None:  # 探索で選んだ軌道を、この打点時刻まで進めて（戻して）初期値にする
+            p_, v_ = simulate(search.p0, search.v0, search.t_impact, np.array([t_ref]), phys)
+            opts.init_state = (p_[0], v_[0]) if np.isfinite(p_).all() else None
         try:
-            return fit_trajectory(o_, t_ref, o.mode, plane, phys, opts)
+            return fit_trajectory(o_, t_ref, fit_mode, plane, phys, opts)
         except ValueError as e:
             raise AnalysisError(f"シャトルの軌道を計算できませんでした（{e}）。",
                                 ["手順 3 の「打つ人の足元」「着地点」が実際の位置と合っているか確認してください。",
@@ -413,6 +528,58 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         log.append(f"再投影誤差の大きい {int(bad.sum())} 点を除いて当てはめ直しました。")
         obs = obs.subset(~bad)
         fit = run_fit(impact.t, impact.sigma, obs)
+
+    # --- 当てはめた軌道に沿って探し直す（最初の検出で漏れたコマを拾う）
+    if own_detection and "event" not in det and det_cfg.get("redetect", True):
+        n0, rms0 = len(obs.t), fit.rms_px
+        t_end = impact.t + ev_cfg.get("max_flight_s", 1.2)
+        if o.end_s is not None:
+            t_end = min(t_end, o.end_s)
+        for _ in range(2):
+            predict = guided.fit_predictor(fit, phys, camera, t_end)
+            t_lo = impact.t if impact.method in ("audio", "manual") else float(obs.t.min()) - 0.5 * dt
+            with VideoReader(meta) as r:
+                gray = ((i, t, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+                        for i, t, img in r.iter_range(t_lo - 1.5 * dt, t_end + 1.5 * dt))
+                rd = guided.redetect_along(gray, predict, unit_px)
+            rd = rd[(rd.timestamp > t_lo) & (rd.timestamp <= t_end)]
+            if rd.empty:
+                break
+            # 使っている点はそのままにし、点のないコマを補う：まず最初の検出の候補（予測位置の近く）、
+            # なければ探し直した位置（探し直しは予測位置を手がかりにするので、候補の方が偏りがない）
+            old_pts = pd.DataFrame({"frame": [meta.frame_at(t) for t in obs.t], "timestamp": obs.t,
+                                    "x_px": obs.uv[:, 0], "y_px": obs.uv[:, 1]})
+            mc = guided.match_candidates(cands, predict, unit_px) if not cands.empty else rd.iloc[0:0]
+            mc = mc[(mc.timestamp > t_lo) & (mc.timestamp <= t_end)]
+            add = pd.concat([mc, rd[~rd.frame.isin(mc.frame)]])
+            # 軌道にあったのに外したコマ（打つ前・ラケットと重なった・ずれの大きい点）は補わない
+            removed = set(out_tr.frame) - set(old_pts.frame)
+            add = add[~add.frame.isin(removed)]
+            new_pts = pd.concat([old_pts, add[~add.frame.isin(old_pts.frame)][old_pts.columns]])
+            new_pts = new_pts.drop_duplicates("frame").sort_values("timestamp")
+            if len(new_pts) == len(old_pts):
+                break
+            obs_new = Observations(camera, new_pts.timestamp.to_numpy(), new_pts[["x_px", "y_px"]].to_numpy())
+            if len(obs_new.t) < 4:
+                break
+            if want_refine and not opts.refine_plane and len(obs_new.t) > ev_cfg.get("min_frames_refine_plane", 5):
+                opts.refine_plane = True
+            f_new = run_fit(impact.t, impact.sigma, obs_new)
+            pred, _ = f_new.evaluate(obs_new.t, phys)
+            err = np.linalg.norm(camera.project(pred) - obs_new.uv, axis=1)
+            bad = err > 3 * max(opts.loss_scale_px, f_new.rms_px, unit_px)
+            if bad.any() and (~bad).sum() >= 4:
+                obs_new = obs_new.subset(~bad)
+                f_new = run_fit(impact.t, impact.sigma, obs_new)
+            if f_new.rms_px > max(1.5 * fit.rms_px, fit.rms_px + 1.5 * unit_px):
+                break  # 探し直した方が軌道に合わない（別の物を拾った）なら使わない
+            fit, obs = f_new, obs_new
+        if len(obs.t) != n0 or abs(fit.rms_px - rms0) > 1e-6:
+            log.append(f"当てはめた軌道に沿って、漏れたコマを探し直しました（使えたコマ {n0} → {len(obs.t)}、"
+                       f"画像上のずれ {rms0:.1f} → {fit.rms_px:.1f} px）。")
+            pts = pd.DataFrame({"frame": [meta.frame_at(t) for t in obs.t], "timestamp": obs.t,
+                                "x_px": obs.uv[:, 0], "y_px": obs.uv[:, 1]})
+            out_tr = _as_track(pd.concat([pts, out_tr[~out_tr.frame.isin(pts.frame)][pts.columns]]))
 
     # 打球音の伝搬遅れを、当てはめた打点の位置からの距離で見積もり直す
     sound_delay = None
@@ -457,7 +624,7 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         f0 = fit
         ev = cfg.get("events", {})
         hp = events.impact_from_hitter_position(
-            lambda t: f0.evaluate(np.array([t]), phys)[0][0], f0.plane, search_lo(f0), t_first + dt / 2,
+            lambda t: f0.evaluate(np.array([t]), phys)[0][0], f0.plane or plane, search_lo(f0), t_first + dt / 2,
             ev.get("contact_offset_m", 0.3), ev.get("contact_sigma_m", 0.4))
         if hp is not None:
             impact = hp
@@ -475,7 +642,7 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
             f0 = run_fit(provisional.t, provisional.sigma, obs_all)
             ev = cfg.get("events", {})
             hp = events.impact_from_hitter_position(
-                lambda t: f0.evaluate(np.array([t]), phys)[0][0], f0.plane, search_lo(f0), t_first + dt / 2,
+                lambda t: f0.evaluate(np.array([t]), phys)[0][0], f0.plane or plane, search_lo(f0), t_first + dt / 2,
                 ev.get("contact_offset_m", 0.3), ev.get("contact_sigma_m", 0.4))
             if hp is not None:
                 keep = obs_all.t > hp.t
@@ -500,6 +667,8 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         "audio_onset_used_s": audio_raw_t, "sound_delay_s": sound_delay,
         "landing_model_s": metrics["t_land_s"], "landing_detection_s": t_land_obs,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
+    pd.DataFrame({"frame": [meta.frame_at(t) for t in obs.t], "timestamp": obs.t, "x_px": obs.uv[:, 0],
+                  "y_px": obs.uv[:, 1]}).to_csv(out / "observations.csv", index=False)
     if fit.plane is not None:
         (out / "plane.json").write_text(json.dumps({**fit.plane.to_dict(), "source": plane_src},
                                                    indent=1), encoding="utf-8")

@@ -222,6 +222,9 @@ class FitOptions:
     # 大きく離れないようにする（カメラが飛行方向を正面に近い角度で見ていると、奥行きが決まりにくいため）
     p0_prior_m: Any = None
     p0_prior_sigma_m: tuple[float, float] = (0.6, 0.5)  # （水平, 高さ）の不確かさ [m]
+    # 初期値にする打点時刻の位置 [m]・速度 [m/s]（打点から出る軌道の探索の結果など）。None なら観測から計算する。
+    # カメラが飛行平面に近いと、視線と平面の交点（観測からの初期値）がカメラの後ろに出て計算できないため
+    init_state: Any = None
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], **overrides: Any) -> "FitOptions":
@@ -396,8 +399,9 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
     obs = [obs] if isinstance(obs, Observations) else list(obs)
     phys = phys or PhysicsParams()
     opts = opts or FitOptions()
-    if mode == "free" and len(obs) < 2:
-        raise ValueError("free モードには2台以上のカメラの観測が必要です")
+    if mode == "free" and len(obs) < 2 and (opts.init_state is None or opts.p0_prior_m is None):
+        # カメラ 1 台でも、打点の位置の目安（事前分布）と初期値があれば、平面に縛らずに解ける
+        raise ValueError("free モードには2台以上のカメラの観測（または打点の位置の目安と初期値）が必要です")
     model = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity,
                    opts.refine_plane, np.deg2rad(opts.plane_sigma_deg), opts.plane_sigma_m,
                    opts.p0_prior_m, opts.p0_prior_sigma_m)
@@ -406,24 +410,30 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
     if n_res <= n_par:
         raise ValueError(f"観測点が少なすぎます（残差 {n_res} 個 ≤ パラメータ {n_par} 個）")
 
-    if theta0 is None:
+    starts = [] if theta0 is None else [theta0]
+    if theta0 is None and opts.init_state is not None:
+        p_init, v_init = (np.asarray(x, float) for x in opts.init_state)
+        starts.append(model.pack(p_init, v_init, phys.terminal_velocity))
+    if theta0 is None and (mode == "plane" or len(obs) >= 2):
         t3, X3 = _points_3d(obs, mode, plane)
-        if len(t3) < 3:
+        if len(t3) >= 3:
+            p0, v0 = initial_guess(t3, X3, t_ref)
+            # 第1段階：3次元点に運動方程式を当てはめる（多項式外挿は強い減速を表せないため）。平面は固定
+            m1 = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity)
+            stage1 = least_squares(_residuals_3d, m1.pack(p0, v0, phys.terminal_velocity),
+                                   args=(m1, t3, X3, phys, t_ref), loss="soft_l1", f_scale=0.1,
+                                   diff_step=opts.diff_step, x_scale="jac", max_nfev=200 * n_par)
+            starts.append(np.insert(stage1.x, m1.n_kin, np.zeros(model.n_plane)))
+        elif not starts:
             raise ValueError("初期値の計算に使える3次元点が3点未満です")
-        p0, v0 = initial_guess(t3, X3, t_ref)
-        # 第1段階：3次元点に運動方程式を当てはめる（多項式外挿は強い減速を表せないため）。平面は固定
-        m1 = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity)
-        stage1 = least_squares(_residuals_3d, m1.pack(p0, v0, phys.terminal_velocity),
-                               args=(m1, t3, X3, phys, t_ref), loss="soft_l1", f_scale=0.1,
-                               diff_step=opts.diff_step, x_scale="jac", max_nfev=200 * n_par)
-        theta0 = np.insert(stage1.x, m1.n_kin, np.zeros(model.n_plane))
 
     def solve(o: list[Observations], th0: np.ndarray):
         return least_squares(_residuals, th0, args=(model, o, phys, t_ref), loss=opts.loss,
                              f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
                              x_scale="jac", max_nfev=200 * n_par)
 
-    sol = solve(obs, theta0)
+    # 初期値が複数あれば（探索で選んだ軌道・観測から計算した値）、それぞれから解いてずれの小さい方を使う
+    sol = min((solve(obs, th) for th in starts), key=lambda s_: s_.cost)
     if model.p0_prior is not None:
         # 事前分布の 1σ を、画像上の誤差の大きさ（当てはめの残差から見積もる）と同じ重みにして解き直す
         rms0 = float(np.sqrt(np.mean(sol.fun[:n_res] ** 2)))

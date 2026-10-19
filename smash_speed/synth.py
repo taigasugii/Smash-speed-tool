@@ -172,14 +172,157 @@ def render_video(shot: SyntheticShot, camera: Camera, cfg: dict[str, Any], phys:
     writer.release()
 
     if audio_path is not None:
-        from scipy.io import wavfile
-        rng = np.random.default_rng(seed)
-        n = int(np.ceil(n_frames / fps * audio_rate))
-        audio = rng.normal(0.0, 0.003, n)
         delay = 0.0 if speed_of_sound is None else float(np.linalg.norm(camera.center - shot.p0)) / speed_of_sound
-        i0 = int(round((pre_s + delay) * audio_rate))
-        click = np.exp(-np.arange(int(0.004 * audio_rate)) / (0.0006 * audio_rate))
-        click = click * rng.normal(0.0, 1.0, len(click))
-        audio[i0:i0 + len(click)] += 0.6 * click
-        wavfile.write(str(audio_path), audio_rate, (np.clip(audio, -1, 1) * 32767).astype(np.int16))
+        write_click_audio(audio_path, n_frames / fps, [(pre_s + delay, 0.6)], audio_rate, seed)
+    return pd.DataFrame(rows)
+
+
+def write_click_audio(path: str | Path, duration_s: float, clicks: list[tuple[float, float]],
+                      rate: int = 48000, seed: int = 0) -> None:
+    """雑音の上に、時刻 [s]・振幅のクリック音（打球音の代わり）を入れたモノラル WAV を書き出す。"""
+    from scipy.io import wavfile
+    rng = np.random.default_rng(seed)
+    audio = rng.normal(0.0, 0.003, int(np.ceil(duration_s * rate)))
+    for t, amp in clicks:
+        i0 = int(round(t * rate))
+        click = np.exp(-np.arange(int(0.004 * rate)) / (0.0006 * rate)) * rng.normal(0.0, 1.0, int(0.004 * rate))
+        n = max(0, min(len(click), len(audio) - i0))
+        audio[i0:i0 + n] += amp * click[:n]
+    wavfile.write(str(path), rate, (np.clip(audio, -1, 1) * 32767).astype(np.int16))
+
+
+def render_cluttered_video(shot: SyntheticShot, camera: Camera, cfg: dict[str, Any], phys: PhysicsParams,
+                           path: str | Path, fps: float = 60.0, exposure_s: float | None = None,
+                           pre_s: float = 0.3, post_s: float = 0.2, n_sub: int = 8,
+                           shuttle_radius_m: float = 0.033, noise: float = 2.0,
+                           audio_path: str | Path | None = None, seed: int = 0,
+                           speed_of_sound: float | None = 343.0,
+                           walkers: list[tuple[tuple[float, float], tuple[float, float]]] | None = None
+                           ) -> pd.DataFrame:
+    """実際の試合に近い、検出の難しい合成動画を書き出す（検出・軌道の選び方の検証用）。
+
+    ``render_video`` の白い背景と点だけの動画と違い、次のものを描く。
+
+    - 模様のある床とコートのライン、センサーの雑音
+    - 打つ人の体と、打点を通って振り抜く腕・ラケット（打った瞬間はシャトルと重なる）
+    - 打つ前に飛んでくるシャトル、相手の選手、隣のコートを歩く人
+    - 露光中のブレ（シャトルも人も ``n_sub`` 回に分けて描いて平均する）
+
+    Args:
+        exposure_s: 露光時間 [s]。省略時はフレーム間隔の半分（屋内のスマホ動画に近い）
+        walkers: コートの外を歩く人の（足元の位置 (x, y) [m]、速度 (vx, vy) [m/s]）。省略時は隣のコート側に 1 人
+
+    Returns:
+        各フレームの正解（``frame, timestamp, x_px, y_px, visible``。timestamp は動画の時刻 [s]）
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    exposure_s = 0.5 / fps if exposure_s is None else exposure_s
+    w, h = camera.width, camera.height
+    tex = cv2.GaussianBlur(rng.normal(0.0, 14.0, (h, w)).astype(np.float32), (0, 0), 3)
+    base = np.clip(np.full((h, w, 3), (96.0, 112.0, 104.0), np.float32) + tex[..., None], 0, 255).astype(np.uint8)
+    draw_court(base, camera, cfg, color_line=(205, 205, 205), color_net=(40, 40, 40), thickness=3)
+
+    d = shot.plane.direction
+    nrm = shot.plane.normal
+    ez = np.array([0.0, 0.0, 1.0])
+    feet = shot.p0 * np.array([1, 1, 0]) - cfg["events"]["contact_offset_m"] * d
+    shoulder = feet + 1.45 * ez + 0.2 * nrm
+    rel = shot.p0 - shoulder
+    reach = float(np.hypot(rel @ d, rel[2]))
+    phi0 = float(np.arctan2(rel[2], rel @ d))
+    side = float(rel @ nrm)
+    receiver0 = np.r_[shot.landing_xy, 0.0] + 0.8 * d
+    walkers = [((-5.0, 4.6), (1.4, 0.0))] if walkers is None else walkers
+
+    def px_radius(X: np.ndarray, r_m: float) -> float:
+        dist = float(np.linalg.norm(X - camera.center))
+        return max(1.0, camera.f * r_m / max(dist, 1e-3))
+
+    def draw_body(img: np.ndarray, foot: np.ndarray, height: float, color: tuple[int, ...]) -> None:
+        uv = camera.project(np.array([foot + 0.2 * ez, foot + height * ez]))
+        if not np.isfinite(uv).all():
+            return
+        r = px_radius(foot + 1.0 * ez, 0.22)
+        a, b = uv.round().astype(int)
+        cv2.line(img, tuple(a), tuple(b), color, int(round(2 * r)), cv2.LINE_AA)
+        head = camera.project((foot + (height + 0.12) * ez)[None])[0]
+        cv2.circle(img, tuple(head.round().astype(int)), int(round(px_radius(foot + height * ez, 0.12))),
+                   (120, 140, 175), -1, cv2.LINE_AA)
+
+    def racket_at(t: float) -> tuple[np.ndarray, np.ndarray]:
+        """時刻 t の手首と、ラケット面の中心 [m]（打点時刻に面の中心がシャトルと重なる）。"""
+        phi = phi0 - 1.8 * np.tanh((t - shot.t_impact) / 0.07)
+        u = np.cos(phi) * d + np.sin(phi) * ez
+        head = shoulder + reach * u + side * nrm
+        wrist = shoulder + 0.55 * reach * u + side * nrm
+        return wrist, head
+
+    def draw_scene(img: np.ndarray, t: float) -> None:
+        sway = 0.08 * np.sin(2 * np.pi * 1.3 * t)
+        draw_body(img, feet + sway * nrm, 1.55, (55, 45, 150))
+        wrist, head = racket_at(t)
+        uv = camera.project(np.array([shoulder, wrist, head]))
+        if np.isfinite(uv).all():
+            s_, w_, h_ = uv.round().astype(int)
+            cv2.line(img, tuple(s_), tuple(w_), (130, 150, 190), int(round(2 * px_radius(wrist, 0.05))), cv2.LINE_AA)
+            cv2.line(img, tuple(w_), tuple(h_), (40, 40, 40), max(2, int(round(2 * px_radius(head, 0.012)))), cv2.LINE_AA)
+            rr = int(round(px_radius(head, 0.13)))
+            cv2.circle(img, tuple(h_), rr, (180, 180, 170), -1, cv2.LINE_AA)
+            cv2.circle(img, tuple(h_), rr, (30, 30, 30), max(1, rr // 6), cv2.LINE_AA)
+        rec = receiver0 + 0.9 * np.sin(2 * np.pi * 0.8 * t) * nrm
+        draw_body(img, rec, 1.6, (150, 60, 40))
+        for (x0, y0), (vx, vy) in walkers:
+            draw_body(img, np.array([x0 + vx * t, y0 + vy * t, 0.0]), 1.65, (60, 90, 60))
+
+    def shuttle_pos(ts: np.ndarray) -> np.ndarray:
+        """打つ前は上から落ちてくるシャトル、打った後は運動方程式の軌道 [m]（着地後は NaN）。"""
+        out = np.full((len(ts), 3), np.nan)
+        after = (ts >= shot.t_impact) & (ts <= shot.t_land)
+        if after.any():
+            out[after] = simulate(shot.p0, shot.v0, shot.t_impact, ts[after], phys)[0]
+        before = ts < shot.t_impact
+        out[before] = shot.p0 + (shot.t_impact - ts[before])[:, None] * (4.0 * d + 7.0 * ez)
+        return out
+
+    t0 = shot.t_impact - pre_s
+    n_frames = int(np.ceil((shot.t_land - t0 + post_s) * fps))
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    rows = []
+    for k in range(n_frames):
+        t = t0 + k / fps
+        ts = t + np.linspace(-exposure_s / 2, exposure_s / 2, n_sub)
+        dense = t + np.linspace(-exposure_s / 2, exposure_s / 2, 8 * n_sub)
+        pos = shuttle_pos(dense)
+        uv_s = camera.project(pos)
+        acc = np.zeros((h, w, 3), np.float32)
+        for j, tj in enumerate(ts):
+            img = base.copy()
+            draw_scene(img, tj)
+            seg = uv_s[8 * j:8 * j + 8]
+            ok = np.isfinite(seg).all(axis=1)
+            if ok.sum() >= 1:
+                X = pos[8 * j:8 * j + 8][ok].mean(axis=0)
+                r = int(round(px_radius(X, shuttle_radius_m)))
+                pts = seg[ok].round().astype(np.int32)
+                if len(pts) >= 2:
+                    cv2.polylines(img, [pts], False, (245, 245, 245), 2 * r + 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(img, tuple(pts[0]), r, (245, 245, 245), -1, cv2.LINE_AA)
+            acc += img
+        frame = acc / n_sub + rng.normal(0.0, noise, (h, w, 1)).astype(np.float32)
+        writer.write(np.clip(frame, 0, 255).astype(np.uint8))
+        after = (dense >= shot.t_impact) & np.isfinite(uv_s).all(axis=1)
+        uv_c = uv_s[after].mean(axis=0) if after.any() else np.array([np.nan, np.nan])
+        vis = bool(np.isfinite(uv_c).all() and 0 <= uv_c[0] < w and 0 <= uv_c[1] < h)
+        rows.append({"frame": k, "timestamp": k / fps, "x_px": uv_c[0] if vis else np.nan,
+                     "y_px": uv_c[1] if vis else np.nan, "visible": int(vis)})
+    writer.release()
+
+    if audio_path is not None:
+        delay = 0.0 if speed_of_sound is None else float(np.linalg.norm(camera.center - shot.p0)) / speed_of_sound
+        # 打球音のほかに、弱い足音を 2 つ入れる
+        write_click_audio(audio_path, n_frames / fps, [(pre_s + delay, 0.6), (pre_s - 0.22, 0.12),
+                                                       (pre_s + 0.35, 0.1)], seed=seed)
     return pd.DataFrame(rows)

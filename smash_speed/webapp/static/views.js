@@ -226,7 +226,7 @@ App.views.plane = {
       <button class="btn primary block" id="next" style="margin-top:14px">次へ：解析する →</button></div>`);
     side.appendChild(card);
     const roiCard = h(`<div class="card"><h2>検出する範囲（任意）</h2>
-      <p class="desc">ネットのゆれや選手の動きをシャトルと間違えるときに、シャトルが飛ぶ範囲だけを四角で囲みます。</p>
+      <p class="desc">ふつうは不要です。①②を指定すると、打つ人から着地点までの空間に自動で絞り込み、打球音の時刻に打点から飛び出したシャトルを探します。それでも選手の動きなどと間違えるときだけ、シャトルが飛ぶ範囲を四角で囲みます。</p>
       <div class="row"><button class="btn" id="roi"></button><button class="btn ghost" id="roiclr">消す</button></div></div>`);
     side.appendChild(roiCard);
 
@@ -354,7 +354,7 @@ App.views.result = {
     if (R.rms_px > 10) quality.push(["bad", "画面上のずれが大きい（" + fmt(R.rms_px, 1) + " px）。シャトルの検出かコートの合わせ込みを確認してください"]);
     else if (R.rms_px > 4) quality.push(["warn", "画面上のずれがやや大きい（" + fmt(R.rms_px, 1) + " px）"]);
     else quality.push(["ok", "画面上のずれは小さい（" + fmt(R.rms_px, 1) + " px）"]);
-    if (R.n_frames_used < 6) quality.push(["bad", `使えたコマが ${R.n_frames_used} 個と少ない。手順 3 の「検出する範囲」で、打った後にシャトルが飛ぶ範囲を囲むと拾いやすくなります`]);
+    if (R.n_frames_used < 6) quality.push(["bad", `使えたコマが ${R.n_frames_used} 個と少ない。手順 3 の「打つ人の足元」「着地点」を正確に指定し直すか、「検出する範囲」で打った後にシャトルが飛ぶ範囲を囲むと拾いやすくなります`]);
     else quality.push(["ok", `${R.n_frames_used} コマを使って計算`]);
     const impName = { audio: "打球音", crossing: "軌道の交点", hitter_position: "打つ人の位置", first_frame: "最初に写ったコマ", manual: "手動" }[R.impact_method] || R.impact_method;
     quality.push([R.impact_method === "audio" || R.impact_method === "manual" ? "ok" : "warn", `打った瞬間は「${impName}」から推定（±${fmt(R.impact_sigma_s * 1000, 1)} ms）`]);
