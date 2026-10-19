@@ -160,7 +160,7 @@ def _approx_positions(p0: np.ndarray, v0: np.ndarray, tau: np.ndarray, k: float,
     return pos
 
 
-MAX_PLAUSIBLE_KMH = 420.0  # これより速い推定は失敗とみなす（男子の公式最速が約 565 km/h、一般は 300 km/h 前後まで）
+MAX_PLAUSIBLE_KMH = 450.0  # これより速い推定は失敗とみなす（男子の公式最速が約 565 km/h。一般でも上級者・軽量の攻撃型ラケットなら 400 km/h 前後まで出うる）
 
 
 def _back_extrapolate(t: np.ndarray, uv: np.ndarray, t_ref: float) -> tuple[np.ndarray, float]:

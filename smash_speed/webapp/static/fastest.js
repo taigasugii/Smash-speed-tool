@@ -48,7 +48,7 @@ App.views.fastest = {
   // ---- ③ の結果（速い順）
   renderRanking(el) {
     const overlap = (a, b) => Number.isFinite(a.ci_low_kmh) && Number.isFinite(b.ci_high_kmh) ? a.ci_low_kmh <= b.ci_high_kmh : true;
-    const MAX_KMH = 420;  // これより速い結果はありえないので、順位から外す（batch.MAX_PLAUSIBLE_KMH と同じ）
+    const MAX_KMH = 450;  // これより速い結果はありえないので、順位から外す（batch.MAX_PLAUSIBLE_KMH と同じ）
     const all = this.cands.filter((c) => c.result && c.result.kmh != null);
     const done = all.filter((c) => c.result.kmh <= MAX_KMH).sort((a, b) => b.result.kmh - a.result.kmh);
     const odd = all.filter((c) => c.result.kmh > MAX_KMH).sort((a, b) => b.result.kmh - a.result.kmh);
