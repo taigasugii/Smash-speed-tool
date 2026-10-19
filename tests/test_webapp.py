@@ -100,3 +100,42 @@ def test_labels_roundtrip_and_file_guard(client, session, tmp_path):
     back = client.get("/api/labels", query_string={"dir": str(out)}).get_json()["rows"]
     assert [b["visible"] for b in back] == [1, 0, -1] and back[0]["event"] == "hit"
     assert client.get("/file", query_string={"path": "C:/Windows/win.ini"}).status_code == 404
+
+
+def _wait(client, tid, limit=600):
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        st = client.get(f"/api/task/{tid}").get_json()
+        if st["status"] != "running":
+            return st
+        time.sleep(0.5)
+    raise TimeoutError
+
+
+def test_fastest_smash_flow(client, session):
+    """いちばん速いスマッシュを探す：候補探し → 打つ人・着地点の確認 → 詳しい解析 → 速い順。"""
+    d, info = session
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    client.post("/api/state", json={"calib": str(d / "calibration.json"), "calib_video": str(d / "synthetic.mp4"),
+                                    "audio": str(d / "synthetic.wav"), "overlay": False})
+    client.post("/api/calib/load", json={})
+    assert not client.post("/api/run/batch_analyze", json={}).get_json()["ok"]  # 先に候補を探す必要がある
+    r = client.post("/api/run/batch_find", json={"select": 8}).get_json()
+    assert r["ok"]
+    st = _wait(client, r["task"])
+    assert st["status"] == "done", "\n".join(client.get(f"/api/task/{r['task']}").get_json()["lines"])
+    b = client.get("/api/batch").get_json()
+    ok = [c for c in b["candidates"] if c["status"] == "ok"]
+    assert len(ok) == 1 and ok[0]["thumb_path"]
+    c = ok[0]
+    u = client.post("/api/batch/update", json={"id": c["id"], "selected": True, "confirmed": True,
+                                               "hitter": {"x": info["hitter_xy"][0], "y": info["hitter_xy"][1]},
+                                               "landing": {"x": info["landing_xy"][0], "y": info["landing_xy"][1]}})
+    assert u.get_json()["ok"]
+    r = client.post("/api/run/batch_analyze", json={}).get_json()
+    st = _wait(client, r["task"])
+    assert st["status"] == "done", "\n".join(client.get(f"/api/task/{r['task']}").get_json()["lines"])
+    c2 = [x for x in client.get("/api/batch").get_json()["candidates"] if x["id"] == c["id"]][0]
+    assert c2["confirmed"] and c2["result"]["kmh"] == pytest.approx(75.0 * 3.6, rel=0.05)
+    res = client.get("/api/result", query_string={"dir": c2["result"]["dir"]}).get_json()
+    assert res["ok"] and res["row"]["speed_initial_mps"] == pytest.approx(75.0, rel=0.05)

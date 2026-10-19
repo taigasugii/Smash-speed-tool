@@ -44,6 +44,7 @@ const NAV = [
   { id: "analyze", num: 4, label: "解析する", sub: "設定を確認して実行" },
   { id: "result", num: 5, label: "結果", sub: "初速・平均速度" },
   { group: "そのほか" },
+  { id: "fastest", num: "★", label: "いちばん速いスマッシュ", sub: "動画の中をまとめて解析" },
   { id: "list", num: "≡", label: "結果の一覧", sub: "これまでの解析" },
   { id: "tools", num: "⚗", label: "研究ツール", sub: "ラベル付け・検証など" },
   { id: "settings", num: "⚙", label: "設定", sub: "出力先・詳細設定" },

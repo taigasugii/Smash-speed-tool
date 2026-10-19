@@ -29,7 +29,7 @@ from smash_speed.camera import Camera
 from smash_speed.config import PROJECT_ROOT, load_config
 from smash_speed.court import court_segments
 from smash_speed.geometry import floor_point
-from smash_speed.video_io import VideoMeta, probe
+from smash_speed.video_io import VideoMeta, probe, seek_read
 
 APP_ID = "smash-speed-web"
 STATIC = Path(__file__).parent / "static"
@@ -325,6 +325,8 @@ def open_video():
                        draft_skipped=[], calib_view=None, last_result_ok=False, last_result=None, audio=None,
                        calib=S.state.get("calib") if S.state.get("calib_video") == path else
                        str(out_root() / f"{stem}_calibration.json"))
+        bd = out_root() / f"{stem}_smashes"  # この動画で前に探したスマッシュの候補があれば続きから
+        S.state["batch_dir"] = str(bd) if (bd / "candidates.json").exists() else None
     S.state["capture_fps"] = fps
     S.save()
     calib = load_camera()
@@ -342,9 +344,11 @@ def frame():
         if key in S.cache:
             data = S.cache[key]
         else:
-            if i != S.pos + 1:
-                S.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            good, img = S.cap.read()
+            if i == S.pos + 1:
+                good, img = S.cap.read()
+            else:  # 番号で読む位置を決めるとずれることがあるので、読んだフレームの時刻で確かめる
+                img = seek_read(S.cap, S.meta, i)
+                good = img is not None
             if not good:
                 abort(404)
             S.pos = i
@@ -515,6 +519,26 @@ def run(kind: str):
         st["last_result"] = str(out)
         S.save()
         t = start_task(f"解析：{name}", cmds)
+    elif kind == "batch_find":
+        if not st.get("video") or not st.get("calib"):
+            return err("動画を開き、手順 2 でコートを合わせてから探してください。")
+        out = root / f"{Path(st['video']).stem}_smashes"
+        st["batch_dir"] = str(out)
+        S.save()
+        args = ["find-smashes", *video_args(), "--calib", st["calib"], "--out", out, "--select", int(b.get("select", 8))]
+        if st.get("audio"):
+            args += ["--audio", st["audio"]]
+        if b.get("use_roi") and st.get("roi"):
+            args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
+        t = start_task("スマッシュの候補を探す", [cli(*args)])
+    elif kind == "batch_analyze":
+        d = st.get("batch_dir") or str(root / f"{Path(st['video']).stem}_smashes")
+        if not (Path(d) / "candidates.json").exists():
+            return err("先に候補を探してください。")
+        args = ["analyze-smashes", "--batch", d]
+        if not st.get("overlay", True):
+            args.append("--no-overlay")
+        t = start_task("選んだ候補を詳しく解析", [cli(*args)])
     elif kind == "synth":
         speed, fps = float(b.get("speed", 80)), float(b.get("fps", 240))
         out = root / f"synthetic_{speed:g}mps_{fps:g}fps"
@@ -634,6 +658,54 @@ def result():
                                         ("trajectory", "trajectory.png"), ("overlay", "overlay_web.mp4"),
                                         ("overlay_raw", "overlay.mp4"), ("csv", "result.csv")) if (d / f).exists()}
     return ok(row=r, log=log, files=files, dir=str(d))
+
+
+# =============================================================================
+# いちばん速いスマッシュを探す（一括解析）
+# =============================================================================
+def _batch_dir() -> Path | None:
+    d = request.args.get("dir") or (body().get("dir") if request.method == "POST" else None) or S.state.get("batch_dir")
+    if not d and S.state.get("video"):  # コマンドで探した結果も、決まった場所にあれば読む
+        d = str(out_root() / f"{Path(S.state['video']).stem}_smashes")
+    return Path(d) if d else None
+
+
+@app.get("/api/batch")
+def batch_get():
+    d = _batch_dir()
+    if d is None or not (d / "candidates.json").exists():
+        return ok(candidates=[], info={}, dir=str(d) if d else None)
+    data = json.loads((d / "candidates.json").read_text(encoding="utf-8"))
+    for c in data["candidates"]:
+        for k in ("thumb", "detections"):
+            if c.get(k):
+                c[k + "_path"] = str(d / c[k])
+    return ok(candidates=data["candidates"], info=data.get("info", {}), dir=str(d))
+
+
+@app.post("/api/batch/update")
+def batch_update():
+    """候補の打つ人・着地点（確認した値）や「詳しく解析する」の印を書き換える。"""
+    from smash_speed.batch import load_candidates, save_candidates
+
+    d = _batch_dir()
+    if d is None or not (d / "candidates.json").exists():
+        return err("候補がありません")
+    b = body()
+    cands, _ = load_candidates(d)
+    by_id = {c.id: c for c in cands}
+    for u in b.get("updates") or [b]:
+        c = by_id.get(int(u.get("id", -1)))
+        if c is None:
+            continue
+        for k in ("hitter", "landing"):
+            if u.get(k):
+                setattr(c, k, {"x": float(u[k]["x"]), "y": float(u[k]["y"])})
+        for k in ("selected", "confirmed"):
+            if k in u:
+                setattr(c, k, bool(u[k]))
+    save_candidates(d, cands)
+    return ok()
 
 
 # =============================================================================

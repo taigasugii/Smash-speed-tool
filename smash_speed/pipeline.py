@@ -91,7 +91,7 @@ def _camera_for_video(camera: Camera, meta: VideoMeta) -> Camera:
 
 
 def _select_tracks(det: pd.DataFrame, onsets: list[tuple[float, float]] | None = None,
-                   hit_uv: np.ndarray | None = None, img_w: float = 1.0
+                   hit_uv: np.ndarray | None = None, img_w: float = 1.0, lead_s: float = 0.04
                    ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """検出から、打点後の軌道と、その直前に終わる打点前の軌道を選ぶ。
 
@@ -124,7 +124,7 @@ def _select_tracks(det: pd.DataFrame, onsets: list[tuple[float, float]] | None =
             score = speed * np.sqrt(len(g))
         t0 = float(g.timestamp.min())
         if strong:
-            gaps = [t0 - t for t in strong if t - 0.04 <= t0 <= t + 0.2]
+            gaps = [t0 - t for t in strong if t - lead_s <= t0 <= t + 0.2]
             # 打った直後から写っている軌道ほどよい（0.06 s 遅れで半分）
             score *= 1.0 / (1.0 + (max(min(gaps, key=abs), 0.0) / 0.06) ** 2) if gaps else 0.15
         if hit_uv is not None and np.isfinite(hit_uv).all():
@@ -319,7 +319,9 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         impact = events.ImpactEstimate(o.impact_time_s, ev_cfg.get("manual_sigma_s", 0.003), "manual")
     if impact is None and method in ("auto", "audio") and onsets:
         # 音はカメラまで 距離 / 音速 だけ遅れて届くので、その分を引いてから打点を選ぶ
-        impact = events.impact_from_audio(onsets, t_first, sigma_s=sigma_audio,
+        # 最初の検出はラケットの残像のこともあるので、打球音がそれより 1 コマ後までなら打点の候補にする
+        # （打点より前のコマは、あとで当てはめから外す）
+        impact = events.impact_from_audio(onsets, t_first, sigma_s=sigma_audio, tolerance_s=dt + 0.005,
                                           av_offset_s=o.av_offset_s - dist0 / c_sound)
         if impact is None:
             log.append("最初の検出の直前に打球音が見つかりませんでした。")
@@ -387,6 +389,23 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
                                  "やり直してください。"]) from e
 
     fit = run_fit(impact.t, impact.sigma, obs)
+    # 打った直後のコマは、振ったラケットの残像がシャトルと重なって写ることがある。ずれが大きいときは、
+    # 最初の 2 点のどちらかを外すと大きく改善するか試す（全体のずれが小さいと外れ値の判定が効かないため）
+    if fit.rms_px > 5.0 and len(obs.t) >= 5:
+        best = None
+        for j in range(min(2, len(obs.t))):
+            keep = np.ones(len(obs.t), bool)
+            keep[j] = False
+            try:
+                f2 = run_fit(impact.t, impact.sigma, obs.subset(keep))
+            except AnalysisError:
+                continue
+            if f2.rms_px < 0.5 * fit.rms_px and (best is None or f2.rms_px < best[0].rms_px):
+                best = (f2, keep, j)
+        if best is not None:
+            log.append(f"打った直後の {best[2] + 1} コマ目は、ラケットなどと重なって写っているとみなして使いませんでした"
+                       f"（画像上のずれ {fit.rms_px:.0f} → {best[0].rms_px:.1f} px）。")
+            fit, obs = best[0], obs.subset(best[1])
     pred, _ = fit.evaluate(obs.t, phys)
     err = np.linalg.norm(camera.project(pred) - obs.uv, axis=1)
     bad = err > 3 * max(opts.loss_scale_px, fit.rms_px)
@@ -445,6 +464,30 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
             fit = run_fit(impact.t, impact.sigma, obs)
         else:
             log.append("軌道が打者の位置を通過する時刻を求められませんでした（打点時刻は最初の検出から推定）。")
+
+    # 打球音で決めた打点時刻で当てはめが悪いときは、映像だけで決めた打点時刻（軌道が打つ人の位置を通る時刻）も試す。
+    # 打球音が別の音（足音・隣のコート・返球）だったり、音と映像がずれていたりすると、音の時刻では軌道が合わない
+    if (impact.method == "audio" and method == "auto" and fit.rms_px > 6.0
+            and plane_src in ("file", "court_xy", "image_px", "gui")):
+        all_use = out_tr[out_tr.timestamp <= impact.t + ev_cfg.get("max_flight_s", 1.2)]
+        obs_all = Observations(camera, all_use.timestamp.to_numpy(), all_use[["x_px", "y_px"]].to_numpy())
+        try:
+            f0 = run_fit(provisional.t, provisional.sigma, obs_all)
+            ev = cfg.get("events", {})
+            hp = events.impact_from_hitter_position(
+                lambda t: f0.evaluate(np.array([t]), phys)[0][0], f0.plane, search_lo(f0), t_first + dt / 2,
+                ev.get("contact_offset_m", 0.3), ev.get("contact_sigma_m", 0.4))
+            if hp is not None:
+                keep = obs_all.t > hp.t
+                if keep.sum() >= 4:
+                    f_hp = run_fit(hp.t, hp.sigma, obs_all.subset(keep))
+                    if f_hp.rms_px < 0.5 * fit.rms_px:
+                        log.append(f"打球音（{impact.t:.3f} s）では軌道が合わないため（画像上のずれ {fit.rms_px:.0f} px）、"
+                                   f"軌道が打つ人の位置を通る時刻 {hp.t:.3f} s を打った瞬間としました（ずれ {f_hp.rms_px:.1f} px）。"
+                                   "打球音が別の音（足音・返球・隣のコート）だった可能性があります。")
+                        impact, fit, obs = hp, f_hp, obs_all.subset(keep)
+        except AnalysisError:
+            pass
 
     metrics = speed_metrics(fit, phys)
     X_obs = intersect_plane(camera, obs.uv, fit.plane) if fit.plane is not None else np.empty((0, 3))

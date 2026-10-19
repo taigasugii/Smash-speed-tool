@@ -179,8 +179,9 @@ def save_labels(state: AnnotationState, out_dir: Path, video_name: str, meta: Vi
 class _FrameCache:
     """直近のフレームを保持する（4K では1枚 約 25 MB なので上限つき）。"""
 
-    def __init__(self, path: str, max_bytes: float = 1.5e9):
+    def __init__(self, path: str, max_bytes: float = 1.5e9, meta=None):
         self.cap = cv2.VideoCapture(path)
+        self.meta = meta  # あれば、番号で読んだフレームの時刻を確かめる（``seek_read``）
         self.cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self.max_bytes = max_bytes
         self.pos = -1
@@ -189,9 +190,16 @@ class _FrameCache:
         if i in self.cache:
             self.cache.move_to_end(i)
             return self.cache[i]
-        if i != self.pos + 1:
+        if i == self.pos + 1:
+            ok, img = self.cap.read()
+        elif self.meta is not None:
+            from smash_speed.video_io import seek_read
+
+            img = seek_read(self.cap, self.meta, i)
+            ok = img is not None
+        else:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ok, img = self.cap.read()
+            ok, img = self.cap.read()
         if not ok:
             raise IndexError(i)
         self.pos = i
@@ -223,7 +231,7 @@ def run_annotation(meta: VideoMeta, out_dir: Path, start_s: float | None = None,
         n = state.load_initial(pd.read_csv(init_csv))
         print(f"初期値を {n} フレーム読み込みました: {init_csv}")
     name = Path(meta.path).stem
-    cache = _FrameCache(meta.path)
+    cache = _FrameCache(meta.path, meta=meta)
     view = ImageView(meta.width, meta.height)
     win = "annotate"
     mouse = {"xy": (0, 0), "drag": None}

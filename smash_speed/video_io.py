@@ -122,13 +122,21 @@ def probe(path: str | Path, capture_fps: float | None = None, cfg: dict[str, Any
     if abs(rotation) % 180 == 90:
         w, h = h, w
 
-    # 各フレームの表示時刻（パケットの pts をデコードせずに取得し、表示順に並べる）
+    # 各フレームの表示時刻（パケットの pts をデコードせずに取得し、表示順に並べる）。
+    # iPhone などの動画は、表示しない（デコードの準備用の）パケットが先頭にあり、flags に "D"（discard）が付いて
+    # pts が負になっている。これを含めて先頭の pts を 0 に合わせると、全フレームの時刻がずれて音声と合わなくなる
+    # （例：IMG_4521 では 0.1 s 遅れていた）。表示されるパケットだけを使い、ストリームの開始時刻を 0 とする
     pk = _run_json([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
-                    "packet=pts_time", "-of", "json", str(path)])
-    pts = np.array(sorted(float(p["pts_time"]) for p in pk.get("packets", []) if "pts_time" in p))
+                    "packet=pts_time,flags", "-of", "json", str(path)])
+    packets = [p for p in pk.get("packets", []) if "pts_time" in p]
+    shown = [p for p in packets if "D" not in p.get("flags", "")]
+    pts = np.array(sorted(float(p["pts_time"]) for p in shown))
+    if len(pts) and pts.min() < 0:  # flags が無い形式：負の時刻は表示されない
+        pts = pts[pts >= 0]
     if len(pts) == 0:
         raise ValueError(f"タイムスタンプを取得できません: {path}")
-    pts -= pts[0]
+    start = float(vs.get("start_time", 0.0) or 0.0)
+    pts -= max(start, 0.0) if pts[0] >= max(start, 0.0) else pts[0]
 
     avg = vs.get("avg_frame_rate", "0/1")
     fps_meta = float(Fraction(avg)) if avg not in ("0/0", "0/1") else (len(pts) - 1) / pts[-1]
@@ -143,6 +151,28 @@ def probe(path: str | Path, capture_fps: float | None = None, cfg: dict[str, Any
         n_frames=len(pts), duration_s=float(info["format"].get("duration", pts[-1])),
         rotation_deg=rotation, is_vfr=is_vfr, has_audio=has_audio, timestamps=pts * scale, tags=tags,
     )
+
+
+def seek_read(cap: cv2.VideoCapture, meta: "VideoMeta", index: int, tries: int = 3) -> np.ndarray | None:
+    """フレーム番号 index（本当の表示順）の画像を OpenCV で読む。
+
+    OpenCV はフレーム番号を「番号 / 公称 fps」の時刻に直して読む位置を決めるので、実際の fps が公称と少し違う
+    （iPhone の 30 fps は 29.97 fps 前後）動画では、動画の後ろの方で数コマずれたフレームが返ることがある
+    （IMG_4521 の 125 秒付近では 2 コマ）。読んだフレームの本当の時刻（CAP_PROP_POS_MSEC）から番号を確かめ、
+    違えばその分だけ読む位置を直して読み直す。続けて ``cap.read()`` すれば次の番号のフレームになる。
+    """
+    target = index
+    frame = None
+    for _ in range(tries):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, target))
+        ok, frame = cap.read()
+        if not ok:
+            return None
+        got = meta.frame_at(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 * meta.time_scale)
+        if got == index:
+            return frame
+        target += index - got
+    return frame
 
 
 class VideoReader:
@@ -167,9 +197,8 @@ class VideoReader:
 
     def read_frame(self, index: int) -> np.ndarray:
         """フレーム番号 ``index`` の画像（BGR）を返す。"""
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, frame = self.cap.read()
-        if not ok:
+        frame = seek_read(self.cap, self.meta, index)
+        if frame is None:
             raise IndexError(f"フレーム {index} を読めません")
         return self._resize(frame)
 
@@ -184,10 +213,13 @@ class VideoReader:
         ts = self.meta.timestamps
         i0 = 0 if start_s is None else int(np.searchsorted(ts, start_s))
         i1 = len(ts) - 1 if end_s is None else int(np.searchsorted(ts, end_s, side="right")) - 1
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
+        frame = seek_read(self.cap, self.meta, i0)  # 最初だけ番号を確かめ、あとは順に読む
         for i in range(i0, i1 + 1):
-            ok, frame = self.cap.read()
-            if not ok:
+            if i > i0:
+                ok, frame = self.cap.read()
+                if not ok:
+                    break
+            if frame is None:
                 break
             yield i, float(ts[i]), self._resize(frame)
 

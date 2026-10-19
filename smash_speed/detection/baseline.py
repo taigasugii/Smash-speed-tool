@@ -12,7 +12,7 @@ TrackNet との比較対象、およびアノテーションの初期値とし�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
@@ -250,36 +250,47 @@ def _drop_subsumed(tracks: list[_Track]) -> list[_Track]:
 
 
 def merge_tracks(tracks: list[_Track], p: BaselineParams) -> list[_Track]:
-    """途切れた軌道をつなぐ：A の終わりから外挿した位置の近くで B が始まっていれば1本にする。"""
+    """途切れた軌道をつなぐ：A の終わりから外挿した位置の近くで B が始まっていれば1本にする。
+
+    B の候補は「A の終わりから max_gap_frames + 1 コマ以内に始まる軌道」だけを見る（全組み合わせを
+    比べると、候補ごとに軌道を始める今の作り方では軌道の数が多く、遅すぎるため）。
+    """
     tracks = sorted(tracks, key=lambda tr: tr.t[0])
-    merged = True
-    while merged:
-        merged = False
-        for a in tracks:
-            for b in tracks:
-                if a is b or b.frames[0] <= a.frames[-1] or b.frames[0] - a.frames[-1] > p.max_gap_frames + 1:
-                    continue
-                step = np.linalg.norm(a.xy[-1] - a.xy[-2]) if len(a.xy) >= 2 else p.gate_px
-                gap = b.frames[0] - a.frames[-1]
-                tol = (p.gate_px + p.gate_step_ratio * step) * gap
-                if len(b.xy) >= 2 and len(a.xy) >= 2:
-                    # つなぎ目の前後で速さが大きく変わるもの（ゆっくり動く人に、シャトルがつながるなど）はつながない
-                    va = np.linalg.norm(a.xy[-1] - a.xy[-2]) / max(a.t[-1] - a.t[-2], 1e-9)
-                    vb = np.linalg.norm(b.xy[1] - b.xy[0]) / max(b.t[1] - b.t[0], 1e-9)
-                    if not 0.4 <= (vb + 1e-9) / (va + 1e-9) <= 2.5:
+    by_start: dict[int, list[_Track]] = {}
+    for tr in tracks:
+        by_start.setdefault(tr.frames[0], []).append(tr)
+    used: set[int] = set()
+    out: list[_Track] = []
+    for a in tracks:
+        if id(a) in used:
+            continue
+        a = _Track(list(a.ids), list(a.frames), list(a.t), list(a.xy), a.misses, a.strength, list(a.strengths))
+        while True:
+            best, best_d = None, np.inf
+            step = np.linalg.norm(a.xy[-1] - a.xy[-2]) if len(a.xy) >= 2 else p.gate_px
+            va = step / max(a.t[-1] - a.t[-2], 1e-9) if len(a.xy) >= 2 else None
+            for gap in range(1, p.max_gap_frames + 2):
+                for b in by_start.get(a.frames[-1] + gap, []):
+                    if id(b) in used:
                         continue
-                if np.linalg.norm(a.predict(b.t[0]) - b.xy[0]) <= tol:
-                    a.ids += b.ids
-                    a.frames += b.frames
-                    a.t += b.t
-                    a.xy += b.xy
-                    a.strengths += b.strengths
-                    tracks.remove(b)
-                    merged = True
-                    break
-            if merged:
+                    if va is not None and len(b.xy) >= 2:
+                        # つなぎ目の前後で速さが大きく変わるもの（ゆっくり動く人に、シャトルがつながるなど）はつながない
+                        vb = np.linalg.norm(b.xy[1] - b.xy[0]) / max(b.t[1] - b.t[0], 1e-9)
+                        if not 0.4 <= (vb + 1e-9) / (va + 1e-9) <= 2.5:
+                            continue
+                    d = float(np.linalg.norm(a.predict(b.t[0]) - b.xy[0]))
+                    if d <= (p.gate_px + p.gate_step_ratio * step) * gap and d < best_d:
+                        best, best_d = b, d
+            if best is None:
                 break
-    return tracks
+            used.add(id(best))
+            a.ids += best.ids
+            a.frames += best.frames
+            a.t += best.t
+            a.xy += best.xy
+            a.strengths += best.strengths
+        out.append(a)
+    return out
 
 
 def _local_resid(t: np.ndarray, xy: np.ndarray, w: int = 5) -> float:
@@ -429,25 +440,37 @@ def detect(meta: VideoMeta, start_s: float | None = None, end_s: float | None = 
     """
     p = params or BaselineParams()
     scale = min(1.0, p.process_width / meta.width)
+    with VideoReader(meta, scale=scale) as reader:
+        gray = ((i, t, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)) for i, t, img in reader.iter_range(start_s, end_s))
+        return detect_frames(gray, scale, p, n_tracks, return_candidates, exclusive)
+
+
+def detect_frames(frames: Iterable[tuple[int, float, np.ndarray]], scale: float, p: BaselineParams,
+                  n_tracks: int = 1, return_candidates: bool = False, exclusive: bool = True
+                  ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+    """縮小済みのグレースケール画像の並び（番号, 実時間 [s], 画像）からシャトルを検出する（``detect`` の本体）。
+
+    ``scale`` は元の解像度に対する縮小率。出力の座標は元の解像度に戻す。動画全体を 1 回だけ読んで
+    複数の区間を検出する一括処理（``batch``）からも使う。
+    """
     roi_mask = None
     rows: list[dict[str, float]] = []
     frames_meta: list[tuple[int, float]] = []
-    with VideoReader(meta, scale=scale) as reader:
-        buf: list[tuple[int, float, np.ndarray]] = []
-        for i, t, img in reader.iter_range(start_s, end_s):
-            g = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-            if roi_mask is None and p.roi is not None:
-                roi_mask = np.zeros_like(g)
-                x0, y0, x1, y1 = (np.array(p.roi) * scale).round().astype(int)
-                roi_mask[y0:y1, x0:x1] = 255
-            buf.append((i, t, g))
-            frames_meta.append((i, t))
-            if len(buf) < 3:
-                continue
-            (_, _, a), (fi, ft, b), (_, _, c) = buf[-3:]
-            for cand in candidates_from_frames(a, b, c, p, roi_mask):
-                rows.append({"frame": fi, "timestamp": ft, **cand})
-            buf = buf[-2:]
+    buf: list[tuple[int, float, np.ndarray]] = []
+    for i, t, g in frames:
+        g = cv2.GaussianBlur(g, (3, 3), 0)
+        if roi_mask is None and p.roi is not None:
+            roi_mask = np.zeros_like(g)
+            x0, y0, x1, y1 = (np.array(p.roi) * scale).round().astype(int)
+            roi_mask[y0:y1, x0:x1] = 255
+        buf.append((i, t, g))
+        frames_meta.append((i, t))
+        if len(buf) < 3:
+            continue
+        (_, _, a), (fi, ft, b), (_, _, c) = buf[-3:]
+        for cand in candidates_from_frames(a, b, c, p, roi_mask):
+            rows.append({"frame": fi, "timestamp": ft, **cand})
+        buf = buf[-2:]
     cands = pd.DataFrame(rows)
     out = pd.DataFrame({"frame": [f for f, _ in frames_meta], "timestamp": [t for _, t in frames_meta]})
     for col, val in (("x_px", np.nan), ("y_px", np.nan), ("visible", 0), ("confidence", 0.0),
