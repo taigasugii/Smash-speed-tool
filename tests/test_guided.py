@@ -50,6 +50,35 @@ def test_shuttle_like_keeps_dots_and_streaks_not_outlines():
     assert w[120, 195] == 0
 
 
+def _streak_frames(bg_split: bool = True):
+    """背景の左半分が暗く右半分が明るい画像の上を、長い残像（x 100〜400、y 200）が通る 3 コマ。"""
+    bg = np.full((400, 600), 150, np.uint8)
+    if bg_split:
+        bg[:, :250] = 60                                  # 暗い所では残像との差が大きい
+    prev, cur, nxt = bg.copy(), bg.copy(), bg.copy()
+    cv2.line(cur, (100, 200), (400, 200), 200, 3)
+    return prev, cur, nxt
+
+
+def test_redetect_joins_streak_fragments_along_motion():
+    prev, cur, nxt = _streak_frames(bg_split=False)
+    cur[:, 230:262] = 150                                 # 残像の途中が雑音で切れて 2 つの塊になる
+    predict = lambda t: np.tile([[255.0, 200.0]], (len(np.atleast_1d(t)), 1)) + \
+        np.c_[(np.atleast_1d(t) - 1.0) * 9000.0, np.zeros(len(np.atleast_1d(t)))]  # noqa: E731
+    frames = [(0, 1.0 - 1 / 30, prev), (1, 1.0, cur), (2, 1.0 + 1 / 30, nxt)]
+    rd = guided.redetect_along(frames, predict, unit_px=3.0)
+    assert len(rd) == 1 and abs(rd.x_px.iloc[0] - 250) < 6
+
+
+def test_evidence_map_keeps_faint_long_streak_next_to_strong_outline():
+    bg = np.full((300, 400), 120, np.uint8)
+    frames = [(i, i / 30, bg.copy()) for i in range(3)]
+    cv2.line(frames[1][2], (40, 100), (180, 80), 135, 2)   # 薄く長い残像（差分 15）
+    cv2.ellipse(frames[1][2], (300, 180), (30, 70), 0, 0, 360, 250, 3)  # 人の輪郭（差分 130）
+    (_, _, e), = guided.evidence_maps(frames)
+    assert e[90, 110] >= 0.5 * 255
+
+
 @pytest.fixture(scope="module")
 def behind_session(tmp_path_factory):
     """打つ人の斜め後ろから撮った、選手・歩く人の写った合成動画（従来の選び方では人の動きを拾ってしまう）。"""

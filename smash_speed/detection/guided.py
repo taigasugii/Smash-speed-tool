@@ -128,7 +128,8 @@ def _integrate_many(p0: np.ndarray, v0: np.ndarray, phys: PhysicsParams, t_max: 
 def _shuttle_like(d: np.ndarray, thr: float, max_minor_px: float, group_px: int = 3) -> np.ndarray:
     """差分の画像 d で、シャトルらしい形（小さな点か、まっすぐな細い残像）の塊の画素を 1 にした画像。
 
-    塊ごとに画素の広がり（共分散）を求め、短い方向の広がり（標準偏差）が ``max_minor_px`` 以下のものを残す。
+    塊ごとに画素の広がり（共分散）を求め、短い方向の広がり（標準偏差）が ``max_minor_px`` 以下のもの、または
+    細長いもの（短い方向が長い方向の 2 割以下で、``3 * max_minor_px`` 以下）を残す。
     人・ラケットの輪郭は輪の形になるので、短い方向にも大きく広がっていて除かれる。
     """
     mask = (d > thr).astype(np.uint8)
@@ -144,21 +145,26 @@ def _shuttle_like(d: np.ndarray, thr: float, max_minor_px: float, group_px: int 
     with np.errstate(invalid="ignore", divide="ignore"):
         mx, my = sx / cnt, sy / cnt
         cxx, cyy, cxy = sxx / cnt - mx**2, syy / cnt - my**2, sxy / cnt - mx * my
-        minor = np.sqrt(np.maximum((cxx + cyy) / 2 - np.sqrt(((cxx - cyy) / 2) ** 2 + cxy**2), 0))
-    good = (cnt >= 1) & (minor <= max_minor_px)
+        common = np.sqrt(((cxx - cyy) / 2) ** 2 + cxy**2)
+        minor = np.sqrt(np.maximum((cxx + cyy) / 2 - common, 0))
+        major = np.sqrt(np.maximum((cxx + cyy) / 2 + common, 0))
+    # カメラのすぐ近くを通るシャトルは残像が太くなる。細長ければ（太さが長さの 2 割以下）太さ 3 倍まで許す
+    good = (cnt >= 1) & ((minor <= max_minor_px) | ((minor <= 3 * max_minor_px) & (minor <= 0.2 * major)))
     good[0] = False
     return good[labels].astype(np.float32) * (mask > 0)
 
 
 def evidence_maps(frames: Iterable[tuple[int, float, np.ndarray]], mask: np.ndarray | None = None,
                   blob_px: float = 1.2, diff_threshold: float = 8.0, max_minor_px: float = 3.0,
-                  other_weight: float = 0.2) -> list[tuple[int, float, np.ndarray]]:
+                  other_weight: float = 0.2, shape_floor: float = 0.6) -> list[tuple[int, float, np.ndarray]]:
     """縮小したグレースケール画像の並びから、コマごとの「シャトルらしさ」の地図を作る。
 
     3 フレーム差分（前後のコマとの差の小さい方）に、小さな点を強める帯域通過フィルタ（ガウスぼかしの差）をかけ、
     さらに形で重みをつける：小さな点・まっすぐな細い残像の塊はそのまま、人・ラケットの輪郭のような
     輪の形の塊は ``other_weight`` 倍に弱める（シャトルが人と重なって 1 つの塊になったコマでも少しは残す）。
     コマの中のいちばん強い反応の 0.8 倍を 1 として 0〜1 に直し（8 bit）、予測位置のずれを許すため 3 px の範囲の最大値をとる。
+    シャトルらしい形の塊の画素は、少なくとも ``shape_floor`` にする（低い位置から撮った速いシャトルは、長く薄い残像に
+    なって差分が人の輪郭よりずっと弱く、明るさで正規化するだけでは地図にほとんど残らないため）。
 
     Returns:
         (番号, 実時間 [s], 地図 uint8) のリスト（最初と最後のコマは差分が作れないので含まない）
@@ -184,7 +190,7 @@ def evidence_maps(frames: Iterable[tuple[int, float, np.ndarray]], mask: np.ndar
         # いちばん強い反応の 0.8 倍を 1 とする（シャトルは白く、人の輪郭より差分がずっと大きいことが多いので、
         # 上位の割合で正規化して飽和させると、その差が消えてしまう）
         top = max(0.8 * float(r.max()), 2.0)
-        e = np.clip(r / top, 0, 1)
+        e = np.maximum(np.clip(r / top, 0, 1), shape_floor * shape_w)
         e = cv2.dilate(e, np.ones((3, 3), np.uint8))
         out.append((fi, ft, (e * 255).astype(np.uint8)))
     return out
@@ -210,9 +216,17 @@ def _hypotheses(hit_X: np.ndarray, plane: FlightPlane, along_m, across_m, height
 
 
 def _score_hypotheses(P: np.ndarray, V: np.ndarray, t_list: list[float], maps, camera: Camera,
-                      scale: float, phys: PhysicsParams, max_flight_s: float, dt_int: float = 0.002
-                      ) -> tuple[np.ndarray, np.ndarray]:
-    """各軌道 × 打点時刻の点数（予測位置での地図の値の和）と、画面内にあったコマの数。(len(t_list), H)"""
+                      scale: float, phys: PhysicsParams, max_flight_s: float, dt_int: float = 0.002,
+                      coarse: list | None = None, steps_px: tuple[float, ...] = (30.0, 80.0),
+                      frame_cost: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
+    """各軌道 × 打点時刻の点数（予測位置での地図の値の和）と、画面内にあったコマの数。(len(t_list), H)
+
+    ``coarse`` に、範囲の最大値をとって広げた地図の並び（``maps`` と同じコマ）を広げ方の小さい順に渡すと、
+    予測位置が 1 コマに ``steps_px`` [地図の px] 以上動くコマでは、広げた地図で点数をつける（カメラのすぐ近くを
+    通るシャトルは、軌道の刻みのわずかな違いで画面上の位置が大きく変わるので、ずれを広く許す）。
+    画面内にあるコマごとに ``frame_cost`` を引く（ゆっくり長く画面に残る軌道が、背景の弱い反応を足し集めて
+    速く画面を出ていく本物の軌道に勝たないように）。
+    """
     traj = _integrate_many(P, V, phys, max_flight_s, dt_int)  # (T, H, 3)
     H = len(P)
     ts = np.array([t for _, t, _ in maps])
@@ -232,12 +246,21 @@ def _score_hypotheses(P: np.ndarray, V: np.ndarray, t_list: list[float], maps, c
         ix = np.where(ok, np.round(np.nan_to_num(uv[:, :, 0], nan=-1)), -1).astype(int)
         iy = np.where(ok, np.round(np.nan_to_num(uv[:, :, 1], nan=-1)), -1).astype(int)
         inside = ok & (ix >= 0) & (ix < mw) & (iy >= 0) & (iy < mh)
+        if coarse:
+            st = np.linalg.norm(np.diff(np.nan_to_num(uv), axis=0), axis=2)          # (F-1, H)
+            st = np.vstack([st, st[-1:]]) if len(st) else np.zeros((len(idx), H))
+            level = np.digitize(st, steps_px[:len(coarse)])                            # 0 = 元の地図
         for j, k in enumerate(idx):
-            m = maps[k][2]
             v = np.zeros(H)
             sel = inside[j]
-            v[sel] = m[iy[j, sel], ix[j, sel]] / 255.0
-            scores[ti] += v
+            if coarse:
+                for lv, src in enumerate([maps] + list(coarse)):
+                    s_ = sel & (level[j] == lv)
+                    if s_.any():
+                        v[s_] = src[k][2][iy[j, s_], ix[j, s_]] / 255.0
+            else:
+                v[sel] = maps[k][2][iy[j, sel], ix[j, sel]] / 255.0
+            scores[ti] += v - frame_cost * sel
         counts[ti] = inside.sum(axis=0)
     return scores, counts
 
@@ -274,8 +297,11 @@ def search_trajectory(maps: list[tuple[int, float, np.ndarray]], camera: Camera,
     P, V = _hypotheses(hit_X, plane, (-0.4, 0.0, 0.4), (-0.4, 0.0, 0.4), (-0.4, 0.0, 0.3), np.arange(-8.0, 9.0, 4.0),
                        np.arange(-40.0, 16.0, 5.0), np.arange(15.0, 116.0, 5.0))
     # 1 段目は刻みが粗く、本当の軌道から数 px ずれるので、地図を広げて（9 px の範囲の最大値）点数をつける
-    wide = [(f, t, cv2.dilate(m, np.ones((9, 9), np.uint8))) for f, t, m in maps]
-    sc, cnt = _score_hypotheses(P, V, t_list, wide, camera, scale, phys, max_flight_s)
+    def grow(src, k):
+        return [(f, t, cv2.dilate(m, np.ones((k, k), np.uint8))) for f, t, m in src]
+
+    wide, wider, widest = grow(maps, 9), grow(maps, 17), grow(maps, 33)
+    sc, cnt = _score_hypotheses(P, V, t_list, wide, camera, scale, phys, max_flight_s, coarse=[wider, widest])
     ti, h = np.unravel_index(int(np.argmax(sc)), sc.shape)
     # 2 段目：いちばんよい軌道のまわりを細かく
     p_best, v_best = P[h], V[h]
@@ -291,10 +317,10 @@ def search_trajectory(maps: list[tuple[int, float, np.ndarray]], camera: Camera,
     P2, V2 = _hypotheses(hit_X, plane, a0 + np.array([-0.2, 0.0, 0.2]), c0 + np.array([-0.2, 0.0, 0.2]),
                          z0 + np.array([-0.15, 0.0, 0.15]),
                          yaw + np.arange(-3.0, 3.1, 1.5), el + np.arange(-3.0, 3.1, 1.5), sp + np.arange(-5.0, 5.1, 1.25))
-    sc2, cnt2 = _score_hypotheses(P2, V2, t2, maps, camera, scale, phys, max_flight_s)
+    sc2, cnt2 = _score_hypotheses(P2, V2, t2, maps, camera, scale, phys, max_flight_s, coarse=[wide, wider])
     ti2, h2 = np.unravel_index(int(np.argmax(sc2)), sc2.shape)
     score, n_in, t_i, p0, v0 = float(sc2[ti2, h2]), int(cnt2[ti2, h2]), t2[ti2], P2[h2], V2[h2]
-    if score < 3.0:
+    if score < 2.0:  # 画面内のコマごとに frame_cost を引いた点数。はっきり重なるコマが 4 つほどあれば通る
         return None
     return TrajectoryHypothesis(t_i, p0, v0, score, n_in, pd.DataFrame(columns=["frame", "timestamp", "x_px", "y_px"]))
 
@@ -340,6 +366,14 @@ class RedetectParams:
     group_px: float = 13.0          # 途切れた残像をまとめる膨張の大きさ（縮小画像の px。ベースライン検出と同じ）
 
 
+def _minor_std(xs: np.ndarray, ys: np.ndarray) -> float:
+    """画素の広がりの短い方向の標準偏差 [px]。"""
+    if len(xs) < 3:
+        return 0.0
+    ev = np.linalg.eigvalsh(np.cov(np.vstack([np.asarray(xs, float).ravel(), np.asarray(ys, float).ravel()])))
+    return float(np.sqrt(max(ev[0], 0.0)))
+
+
 def redetect_along(frames: Iterable[tuple[int, float, np.ndarray]], predict, unit_px: float = 1.0,
                    p: RedetectParams | None = None) -> pd.DataFrame:
     """予測位置のまわりでシャトルを探し直す。
@@ -371,8 +405,10 @@ def redetect_along(frames: Iterable[tuple[int, float, np.ndarray]], predict, uni
         step = speed_img * (tc - ta) / 2  # 1 コマの間の画面上の移動量 [px]
         R = min(unit_px * p.max_radius_px, unit_px * p.radius_px + p.radius_step_ratio * step)
         h, w = b.shape[:2]
-        x0, y0 = int(max(0, np.floor(uv[0] - 2 * R))), int(max(0, np.floor(uv[1] - 2 * R)))
-        x1, y1 = int(min(w, np.ceil(uv[0] + 2 * R) + 1)), int(min(h, np.ceil(uv[1] + 2 * R) + 1))
+        # 探す窓は、1 コマの間に動く長さの残像がまるごと入る大きさにする
+        half = max(2 * R, 0.75 * step + R)
+        x0, y0 = int(max(0, np.floor(uv[0] - half))), int(max(0, np.floor(uv[1] - half)))
+        x1, y1 = int(min(w, np.ceil(uv[0] + half) + 1)), int(min(h, np.ceil(uv[1] + half) + 1))
         if x1 - x0 < 3 or y1 - y0 < 3:
             continue
         d = cv2.min(cv2.absdiff(b[y0:y1, x0:x1], a[y0:y1, x0:x1]), cv2.absdiff(c[y0:y1, x0:x1], b[y0:y1, x0:x1]))
@@ -397,8 +433,11 @@ def redetect_along(frames: Iterable[tuple[int, float, np.ndarray]], predict, uni
             cx, cy = float((wts * xs).sum() / s), float((wts * ys).sum() / s)
             bx, by, bw, bh = stats[j, :4]
             # 探す範囲の外まで広がる塊は、ラケット・腕・人と重なっている。予測位置の近くだけで重心を取る
-            merged = bool(bw > 2 * R or bh > 2 * R or bx == 0 or by == 0
-                          or bx + bw >= x1 - x0 or by + bh >= y1 - y0)
+            touches = bool(bx == 0 or by == 0 or bx + bw >= x1 - x0 or by + bh >= y1 - y0)
+            # 細くまっすぐで、長さが 1 コマの移動量ほどまでの塊は、長くてもシャトルの残像（ほかの物と重なっていない）
+            streak = (not touches and _minor_std(xs[sub], ys[sub]) <= unit_px * 2.0
+                      and max(bw, bh) <= 1.3 * step + 2 * R)
+            merged = bool(not streak and (bw > 2 * R or bh > 2 * R or touches))
             if merged:
                 rl = unit_px * p.local_px + 0.25 * step
                 c_, sw = uv.copy(), 0.0
@@ -416,9 +455,28 @@ def redetect_along(frames: Iterable[tuple[int, float, np.ndarray]], predict, uni
                 continue
             cost = dist / R + (0.5 if merged else 0.0)
             if best is None or cost < best[0]:
-                best = (cost, cx, cy, dist, float(sub.sum()), merged)
+                best = (cost, cx, cy, dist, float(sub.sum()), merged, j)
         if best is not None:
-            _, cx, cy, dist, area, merged = best
+            _, cx, cy, dist, area, merged, j = best
+            if not merged and step > 0 and np.isfinite(nxt).all():
+                # 長い残像は雑音で途中が切れ、別の塊になることがある。予測した動きの向きの直線の上にある
+                # 切れ端（ほかの動く物と重なっていない塊）もまとめて、残像全体の重心を取る
+                ax = (nxt - uv) / max(float(np.linalg.norm(nxt - uv)), 1e-9)
+                band = unit_px * 3.0 + 1.0
+                along = (xs - cx) * ax[0] + (ys - cy) * ax[1]
+                perp = np.abs(-(xs - cx) * ax[1] + (ys - cy) * ax[0])
+                ok_lab = np.zeros(n, bool)
+                for jj in range(1, n):
+                    bx, by, bw, bh = stats[jj, :4]
+                    ok_lab[jj] = max(bw, bh) <= 1.3 * step + 2 * R
+                ok_lab[j] = True
+                on_line = (labels > 0) & ok_lab[labels] & (perp <= band) & (np.abs(along) <= 0.6 * step + R)
+                if on_line.sum() > (labels == j).sum():
+                    wl = df * on_line
+                    cx2, cy2 = float((wl * xs).sum() / wl.sum()), float((wl * ys).sum() / wl.sum())
+                    d2 = float(np.hypot(cx2 - uv[0], cy2 - uv[1]))
+                    if d2 <= R:
+                        cx, cy, dist, area = cx2, cy2, d2, float(on_line.sum())
             rows.append({"frame": fi, "timestamp": ft, "x_px": cx, "y_px": cy, "dist_px": dist,
                          "area_px": area, "merged": merged})
     return pd.DataFrame(rows, columns=["frame", "timestamp", "x_px", "y_px", "dist_px", "area_px", "merged"])
