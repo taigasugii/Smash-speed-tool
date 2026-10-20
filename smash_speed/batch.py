@@ -501,14 +501,36 @@ def analyze_selected(out_dir: Path, cfg: dict[str, Any], ids: list[int] | None =
         if not (c.hitter and c.landing):
             c.result = {"error": "打つ人・着地点がありません"}
             continue
-        o = AnalyzeOptions(video=Path(info["video"]), calib=Path(info["calib"]), out_dir=out_dir / c.label,
-                           capture_fps=info.get("capture_fps"), start_s=c.start_s, end_s=c.end_s,
-                           detections=out_dir / c.detections if c.detections else None,
-                           audio_path=Path(info["audio"]) if info.get("audio") else None,
-                           hitter_xy=(c.hitter["x"], c.hitter["y"]), landing_xy=(c.landing["x"], c.landing["y"]),
-                           overlay=overlay, force=True, name=c.label)
+        def run(detections: Path | None) -> dict[str, Any]:
+            o = AnalyzeOptions(video=Path(info["video"]), calib=Path(info["calib"]), out_dir=out_dir / c.label,
+                               capture_fps=info.get("capture_fps"), start_s=c.start_s, end_s=c.end_s,
+                               detections=detections,
+                               audio_path=Path(info["audio"]) if info.get("audio") else None,
+                               hitter_xy=(c.hitter["x"], c.hitter["y"]), landing_xy=(c.landing["x"], c.landing["y"]),
+                               overlay=overlay, force=True, name=c.label)
+            return analyze(o, cfg)
+
         try:
-            row = analyze(o, cfg)
+            # 1 本ずつの解析と同じく、その区間で検出し直す（打点から出る軌道の探索・漏れたコマの探し直しが働き、
+            # 使えるコマが増える）。うまくいかない・ずれが大きいときだけ、①で見つけた軌道を使う
+            stage1 = out_dir / c.detections if c.detections else None
+            row, first_err = None, None
+            try:
+                row = run(None)
+            except AnalysisError as e:
+                first_err = e
+            if stage1 is not None and (row is None or not np.isfinite(row["rms_px"]) or row["rms_px"] > 5.0):
+                try:
+                    alt = run(stage1)
+                    if row is None or alt["rms_px"] < row["rms_px"]:
+                        row = alt
+                    else:  # 検出し直した方がよかったので、その結果を出力先に書き直す
+                        row = run(None)
+                except AnalysisError:
+                    if row is None:
+                        raise first_err
+            if row is None:
+                raise first_err
             c.result = {"kmh": _num(row["speed_initial_kmh"]), "ci_low_kmh": _num(row["speed_initial_ci_low_kmh"]),
                         "ci_high_kmh": _num(row["speed_initial_ci_high_kmh"]), "rms_px": _num(row["rms_px"]),
                         "n_frames": int(row["n_frames_used"]), "impact_method": row["impact_method"],

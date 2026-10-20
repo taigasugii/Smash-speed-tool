@@ -69,16 +69,25 @@ def audio_onsets(x: np.ndarray, rate: int, highpass_hz: float = 2000.0, smooth_s
     rises = np.flatnonzero(above[1:] & ~above[:-1]) + 1
     out: list[tuple[float, float]] = []
     gap = int(min_interval_s * rate)
-    last = -gap
-    for i in rises:
-        if i - last < gap:
-            continue
+    # 立ち上がりごとの強さ（次の立ち上がりまでの包絡線の最大値。``gap`` より先は見ない）
+    ends = np.minimum(np.r_[rises[1:], len(env)], rises + gap)
+    own = np.array([env[i:max(j, i + 1)].max() for i, j in zip(rises, ends)])
+    k = 0
+    while k < len(rises):
+        # min_interval_s 以内に続く立ち上がりを 1 つにまとめる。時刻は、群の中でいちばん強い音の半分以上の
+        # 強さがある最初の立ち上がりにする（打球音のあとの反響は後ろなので打球音が残り、打つ直前の
+        # 振り・足音などの弱い音が打球音の直前にあっても、その時刻を打点にしない）
+        g = k + 1
+        while g < len(rises) and rises[g] - rises[k] < gap:
+            g += 1
+        grp = np.arange(k, g)
+        peak = own[grp].max()
+        i = rises[grp[np.argmax(own[grp] >= 0.5 * peak)]]
         a, b = env[i - 1], env[i]
         frac = (thr - a) / (b - a) if b != a else 0.0
         t = (i - 1 + frac) / rate
-        peak = env[i:i + gap].max() if i + gap <= len(env) else env[i:].max()
         out.append((float(t), float((peak - med) / mad)))
-        last = i
+        k = g
     return out
 
 

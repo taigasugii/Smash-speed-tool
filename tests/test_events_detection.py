@@ -31,6 +31,24 @@ def test_audio_onset_subframe_accuracy():
     assert events.impact_from_audio(ons, t_first_detection=t_hit + 0.5) is None
 
 
+def test_audio_onset_prefers_hit_over_faint_sound_just_before():
+    """打球音の 0.12 s 前に弱い音（振り・足音）があっても、まとめた立ち上がりの時刻は打球音にする。
+    打球音のあとの反響（弱い音）は、打球音の時刻のまま。"""
+    rate = 48000
+    rng = np.random.default_rng(1)
+    x = rng.normal(0, 0.002, 2 * rate)
+    click = np.exp(-np.arange(300) / 40.0) * rng.normal(0, 1, 300)
+    t_pre, t_hit, t_echo = 0.70, 0.823, 1.60
+    for t, a in ((t_pre, 0.04), (t_hit, 0.6), (t_echo, 0.6), (t_echo + 0.08, 0.1)):
+        i = int(round(t * rate))
+        x[i:i + 300] += a * click
+    ons = events.audio_onsets(x, rate)
+    times = [t for t, _ in ons]
+    assert len(ons) == 2
+    assert times[0] == pytest.approx(t_hit, abs=1e-3)
+    assert times[1] == pytest.approx(t_echo, abs=1e-3)
+
+
 def test_first_frame_uniform_prior():
     imp = events.impact_from_first_frame(1.0, 1 / 30)
     assert imp.t == pytest.approx(1.0 - 1 / 60)
