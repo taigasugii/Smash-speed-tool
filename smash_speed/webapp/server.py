@@ -321,7 +321,7 @@ def open_video():
         S.cache.clear()
     if S.state.get("video") != path:
         stem = Path(path).stem
-        S.state.update(video=path, start=None, end=None, shot="", hitter=None, landing=None, roi=None, draft_points={},
+        S.state.update(video=path, start=None, end=None, shot="", hitter=None, landing=None, roi=None, draft_points={}, draft_auto={},
                        draft_skipped=[], calib_view=None, last_result_ok=False, last_result=None, audio=None,
                        calib=S.state.get("calib") if S.state.get("calib_video") == path else
                        str(out_root() / f"{stem}_calibration.json"))
@@ -403,6 +403,63 @@ def calib_solve():
               warn_px=cfg["calibration"]["reproj_warn_px"])
 
 
+@app.post("/api/calib/snap")
+def calib_snap():
+    """クリックした床の点（4 点以上、おおよそでよい）から、コートのラインに吸い付けて全ランドマークの位置を返す。"""
+    from smash_speed.calibration.snap import CourtSnapper
+
+    if S.meta is None:
+        return err("動画を開いてください")
+    b = body()
+    pts = {k: v for k, v in (b.get("points") or {}).items() if v}
+    i = int(np.clip(int(b.get("frame", 0)), 0, S.meta.n_frames - 1))
+    with S.lock:
+        img = seek_read(S.cap, S.meta, i)
+        S.pos = i if img is not None else -1
+    if img is None:
+        return err("コマを読めませんでした")
+    try:
+        res = CourtSnapper().snap(img, pts, landmark_table(S.cfg()))
+    except ValueError as e:
+        return err(str(e))
+    return ok(points={n: list(p) for n, p in res.points.items()}, status=res.status, lines=res.lines_found,
+              line_rms=None if not np.isfinite(res.line_rms_px) else round(res.line_rms_px, 2), message=res.message)
+
+
+@app.post("/api/calib/oneclick")
+def calib_oneclick():
+    """コートの角を 1 点クリックしただけで、コートのラインに合わせて全ランドマークの位置を返す。
+
+    手順 ① で指定したカメラの位置（上から見た図）を手がかりに使う。
+    """
+    from smash_speed.calibration.oneclick import OneClickCalibrator
+
+    if S.meta is None:
+        return err("動画を開いてください")
+    b = body()
+    name, pt = b.get("name"), b.get("point")
+    if not name or not pt:
+        return err("コートの角を 1 点クリックしてください")
+    i = int(np.clip(int(b.get("frame", 0)), 0, S.meta.n_frames - 1))
+    with S.lock:
+        img = seek_read(S.cap, S.meta, i)
+        S.pos = i if img is not None else -1
+    if img is None:
+        return err("コマを読めませんでした")
+    view = b.get("view") or S.state.get("calib_view") or {}
+    cam = None
+    if view.get("camXY"):
+        # 図は「打つ人が左」の向きで描くので、打つ人が右なら 180° 回して解析の座標にする
+        x, y = view["camXY"]
+        cam = (-x, -y) if view.get("hitter") == "right" else (x, y)
+    try:
+        res = OneClickCalibrator().calibrate(img, name, tuple(pt), landmark_table(S.cfg()), cam_xy=cam)
+    except ValueError as e:
+        return err(str(e))
+    return ok(points={n: list(p) for n, p in res.points.items()}, status=res.status, lines=res.lines_found,
+              line_rms=None if not np.isfinite(res.line_rms_px) else round(res.line_rms_px, 2), message=res.message)
+
+
 @app.post("/api/calib/save")
 def calib_save():
     if S.meta is None:
@@ -423,7 +480,7 @@ def calib_save():
         return err(str(e))
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     save_calibration(res, path, video=S.meta.path, frame_time_s=b.get("time"), extra={"view": b.get("view")})
-    S.state.update(calib=path, calib_video=S.meta.path, draft_points={})
+    S.state.update(calib=path, calib_video=S.meta.path, draft_points={}, draft_auto={})
     S.save()
     return ok(calib=load_camera(), path=path)
 

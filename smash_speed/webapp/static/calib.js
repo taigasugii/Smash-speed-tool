@@ -16,6 +16,7 @@ App.views.calib = {
     this.view = st.calib_view || (App.calib && App.calib.view) || null;
     this.points = { ...(st.draft_points || {}) };
     this.skipped = new Set(st.draft_skipped || []);
+    this.auto = { ...(st.draft_auto || {}) };   // 自動で置いた点（名前 → "snapped"）
     this.autoSkipped = new Set();
     this.solved = null;
     this.extra = false;
@@ -26,7 +27,7 @@ App.views.calib = {
 
   leave() { this.unbindKeys(); this.saveDraft(); },
   unbindKeys() { if (this.keyh) { window.removeEventListener("keydown", this.keyh); this.keyh = null; } },
-  saveDraft() { if (this.points) App.save({ draft_points: this.points, draft_skipped: [...this.skipped], calib_view: this.view }); },
+  saveDraft() { if (this.points) App.save({ draft_points: this.points, draft_skipped: [...this.skipped], draft_auto: this.auto, calib_view: this.view }); },
 
   header(active) {
     const steps = [["view", "カメラの位置"], ["points", "点をクリック"], ["check", "確認して保存"]];
@@ -68,7 +69,7 @@ App.views.calib = {
     $("#use", this.el).onclick = () => go("plane");
     $("#check", this.el).onclick = () => { this.points = { ...c.points }; this.step("check"); };
     $("#edit", this.el).onclick = () => { this.points = { ...c.points }; this.step(this.view ? "points" : "view"); };
-    $("#redo", this.el).onclick = () => { this.points = {}; this.skipped = new Set(); this.step("view"); };
+    $("#redo", this.el).onclick = () => { this.points = {}; this.skipped = new Set(); this.auto = {}; this.step("view"); };
     $("#load", this.el).onclick = async () => {
       const p = await pickPath("file", { label: "キャリブレーション", pattern: "*.json" });
       if (!p) return;
@@ -131,7 +132,7 @@ App.views.calib = {
         const theta = Court.thetaFrom(edge, hitter);
         if (this.view && this.view.theta !== theta && Object.keys(this.points).length) {
           if (!confirm("カメラの位置を変えると、クリック済みの点の名前がずれるため消去します。よろしいですか？")) return;
-          this.points = {}; this.skipped = new Set();
+          this.points = {}; this.skipped = new Set(); this.auto = {};
         }
         this.view = { edge, hitter, theta, camXY };
         this.saveDraft();
@@ -196,7 +197,7 @@ App.views.calib = {
         for (const [n, p] of Object.entries(this.points)) {
           const e = this.solved ? this.solved.errors[n] : undefined;
           const bad = e !== undefined && e > this.solved.warn_px;
-          drawMarker(ctx, f, p[0], p[1], n === this.sel ? "#facc15" : bad ? "#ef4444" : "#22c55e", String(ord.indexOf(n) + 1 || "+"));
+          drawMarker(ctx, f, p[0], p[1], n === this.sel ? "#facc15" : bad ? "#ef4444" : this.auto[n] ? "#06b6d4" : "#22c55e", this.auto[n] ? "自" : String(ord.indexOf(n) + 1 || "+"));
         }
       },
       drawLoupe: (lc, u, v, mag, Lsz) => {
@@ -210,6 +211,7 @@ App.views.calib = {
         const placed = this.cur;
         this.suspect = this.checkClick(placed, u, v);
         this.points[placed] = [+u.toFixed(1), +v.toFixed(1)];
+        delete this.auto[placed];
         this.skipped.delete(placed);
         this.sel = placed;
         this.history.push(["place", placed]);
@@ -221,7 +223,7 @@ App.views.calib = {
     });
     this.history = this.history || [];
     this.fv = fv;
-    const tl = new Timeline(left, { onSeek: (t, i) => fv.show(i), keys: false });
+    const tl = new Timeline(left, { onSeek: (t, i) => { this.frameIdx = i; fv.show(i); }, keys: false });
     left.appendChild(h(`<p class="muted small" style="margin:8px 2px">選手でラインが隠れているときは、下の時間軸で見やすいコマに動かしてください。
       拡大：マウスホイール　移動：右ドラッグ（またはスペース＋ドラッグ）　ルーペで角をよく見てクリック</p>`));
 
@@ -235,6 +237,8 @@ App.views.calib = {
       <div class="row small muted" style="margin-top:6px"><span>● 済み</span><span style="color:#ef4444">● 今の点</span><span>○ これから</span><span style="color:#94a3b8">● とばした</span><span>◇ 高さのある点</span></div>
       <label class="row small" style="margin-top:6px"><input type="checkbox" id="extra"> 内側の交点も使う（より正確に）</label></div>`);
     side.appendChild(dia);
+    const snapCard = h(`<div class="card" style="padding:12px"></div>`);
+    side.appendChild(snapCard);
     const status = h(`<div class="card" style="padding:12px"></div>`);
     side.appendChild(status);
 
@@ -272,6 +276,7 @@ App.views.calib = {
       }
       $("#dia", dia).innerHTML = Court.svg(App.landmarks, { theta: this.view.theta, landmarks: ord.concat(this.extra ? [] : App.landmarks.landmarks.filter((l) => this.points[l.name] && !ord.includes(l))), states, current: this.cur, camera: true });
       $$("#dia .lm", dia).forEach((g) => g.onclick = () => { this.cur = g.dataset.name; this.sel = this.points[this.cur] ? this.cur : null; refresh(); fv.redraw(); });
+      this.renderSnap(snapCard, lmByName, refresh);
       const enough = nDone >= 6;
       const hasHeight = Object.keys(this.points).some((n) => lmByName[n].xyz[2] > 0 || n.startsWith("post_base"));
       status.innerHTML = `<div class="row" style="justify-content:space-between"><b>${nDone} 点クリック済み</b>
@@ -298,6 +303,72 @@ App.views.calib = {
     window.addEventListener("keydown", this.keyh);
     this.solve().then(refresh);
     tl.seek(App.state.start != null ? +App.state.start : 0);
+  },
+
+  /** 自動で合わせる：コートの角を 1 点（または床の点を 4 点）クリックしたら、残りの点をコートのラインに吸い付けて自動で置く。 */
+  renderSnap(card, lmByName, refresh) {
+    const floor = Object.keys(this.points).filter((n) => lmByName[n].xyz[2] === 0);
+    const corners = floor.filter((n) => !n.startsWith("post_base"));   // ラインの交点（支柱の根元はラインの角ではない）
+    const nAuto = Object.keys(this.auto).length;
+    const title = (n) => Court.describe(lmByName[n], this.view.theta).title;
+    const unconf = (this.unconfirmed || []).filter((n) => this.points[n] && !this.auto[n]);
+    let body, btn = null;
+    if (nAuto) {
+      body = `<b>自動で置いた点を確認してください</b>
+        <p class="muted small" style="margin:6px 0"><span style="color:#06b6d4">● 水色の「自」</span>が自動で置いた ${nAuto} 点です。
+        下の「確認へ」で黄色の線が実際のラインに重なっているかを見てください。ずれている点があれば、右下の図でその点を選んでクリックし直します。${
+        unconf.length ? `<br><b>クリックした点のうち「${unconf.map((n) => esc(title(n))).join("」「")}」は、ラインで確かめられませんでした。</b>ルーペで角をよく見て、正確に置き直してください。` : ""}</p>`;
+      btn = ["snap4", "もう一度自動で合わせる", ""];
+    } else if (floor.length >= 4) {
+      body = `<b>残りの点を自動で合わせられます</b>
+        <p class="muted small" style="margin:6px 0">クリックした ${floor.length} 点をもとに、映っているコートのラインを探して、ほかの点を自動で置きます（10 秒ほど）。選手でラインが隠れていないコマで押してください。</p>`;
+      btn = ["snap4", "残りの点を自動で合わせる", "primary"];
+    } else if (corners.length >= 1) {
+      const n = corners[corners.length - 1];
+      body = `<b>この 1 点から自動で合わせられます</b>
+        <p class="muted small" style="margin:6px 0">「${esc(title(n))}」と、手順 ① のカメラの位置から、コートのラインを探して全部の点を自動で置きます（20〜40 秒）。
+        <b>角はルーペで正確に</b>クリックしてください。うまく合わないときは、床の点をあと ${4 - floor.length} 点クリックして 4 点で合わせます。</p>`;
+      btn = ["snap1", "この 1 点から自動で合わせる", "primary"];
+    } else {
+      body = `<b>自動で合わせる：コートの角を 1 点クリック</b>
+        <p class="muted small" style="margin:6px 0 0">右下の図で、はっきり見えるコートの角（ラインの交点）を選んで <b>1 点</b>クリックすると、残りの点はコートのラインに吸い付けて自動で置けます。
+        1 点で合わないときは、床の点を 4 点（だいたいの位置でよい・なるべく離れた 4 点）クリックして合わせます。</p>`;
+    }
+    card.innerHTML = body + (btn ? `<button class="btn ${btn[2]} block" id="snap">${btn[1]}</button>` : "");
+    if (!btn) return;
+    $("#snap", card).onclick = async (e) => {
+      e.target.disabled = true; e.target.textContent = "ラインを探しています…";
+      const frame = this.frameIdx ?? nearestFrame(App.state.start ?? 0);
+      let clicks, r;
+      if (btn[0] === "snap1") {
+        const n = corners[corners.length - 1];
+        clicks = { [n]: this.points[n] };
+        r = await api.post("/api/calib/oneclick", { name: n, point: this.points[n], frame, view: this.view });
+      } else {
+        clicks = { ...this.points };   // 2 回目からは、前に吸い付けた点も手がかりに使う（クリックより正確）
+        r = await api.post("/api/calib/snap", { points: clicks, frame });
+      }
+      if (!r.ok) { toast(r.error, "bad"); refresh(); return; }
+      // 前に自動で置いた点は消して置き直す。測れた点（2 本のラインとも見つかった交点）だけを使い、
+      // 自分でクリックした点も、吸い付けた位置で置き換える（クリックより正確）
+      for (const n of Object.keys(this.auto)) delete this.points[n];
+      this.auto = {};
+      let nNew = 0;
+      for (const [n, st] of Object.entries(r.status)) {
+        if (st !== "snapped" || this.skipped.has(n)) continue;
+        if (!this.points[n]) nNew++;
+        this.points[n] = r.points[n].map((v) => +(+v).toFixed(1));
+        this.auto[n] = st;
+      }
+      // 自分でクリックしたが、ラインで確かめられなかった点（だいたいの位置のまま）
+      this.unconfirmed = Object.keys(clicks).filter((n) => !this.auto[n] && lmByName[n].xyz[2] === 0);
+      this.sel = null;
+      await this.solve();
+      this.cur = this.unconfirmed[0] || this.nextTarget();
+      this.saveDraft();
+      toast(nNew ? `${nNew} 点を自動で置きました。${r.message}` : `新しく置ける点が見つかりませんでした。${r.message}`, nNew ? "ok" : "warn");
+      refresh();
+    };
   },
 
   /** クリックした位置が、ほかの点から予想される位置と大きく違えば理由を返す（違わなければ null）。 */
@@ -330,7 +401,7 @@ App.views.calib = {
     const last = this.history.pop();
     if (!last) return;
     const [kind, name] = last;
-    if (kind === "place") delete this.points[name]; else this.skipped.delete(name);
+    if (kind === "place") { delete this.points[name]; delete this.auto[name]; } else this.skipped.delete(name);
     this.cur = name; this.sel = null;
     await this.solve(); this.saveDraft(); refresh();
   },
@@ -387,7 +458,7 @@ App.views.calib = {
 それでも保存しますか？`)) return;
       const res = await api.post("/api/calib/save", { points: this.points, k1: k1.checked, time: tl.t, view: this.view, path: App.state.calib });
       if (!res.ok) return toast(res.error, "bad");
-      App.calib = res.calib; App.state.calib = res.path; App.state.draft_points = {}; this.points = {};
+      App.calib = res.calib; App.state.calib = res.path; App.state.draft_points = {}; this.points = {}; this.auto = {}; App.save({ draft_auto: {} });
       toast("コートの合わせ込みを保存しました", "ok");
       go("plane");
     };
