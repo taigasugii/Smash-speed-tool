@@ -178,6 +178,11 @@ App.views.calib = {
     this.el.appendChild(ws);
     const left = $(".left", ws), side = $(".side", ws);
     this.cur = this.cur && !this.points[this.cur] ? this.cur : this.nextTarget();
+    if (!Object.keys(this.points).length) {
+      // まだ何もクリックしていなければ、1 点で自動で合わせられるコートの角から始める
+      const corner = this.order().find((l) => l.xyz[2] === 0 && !l.name.startsWith("post_base") && !this.skipped.has(l.name));
+      if (corner) this.cur = corner.name;
+    }
     this.sel = null;   // 微調整する点
     const lmByName = Object.fromEntries(App.landmarks.landmarks.map((l) => [l.name, l]));
     const fv = new FrameView(left, {
@@ -229,6 +234,9 @@ App.views.calib = {
 
     const warn = h(`<div></div>`);
     side.appendChild(warn);
+    // 自動で合わせるカードは、いちばん上（スクロールしなくても見える所）に出す
+    const snapCard = h(`<div class="card" style="padding:12px;border:2px solid #06b6d4"></div>`);
+    side.appendChild(snapCard);
     const target = h(`<div class="target"></div>`);
     side.appendChild(target);
     const ctl = h(`<div class="row"><button class="btn" id="skip">映っていない → とばす <span class="kbd">S</span></button><button class="btn ghost" id="undo">1 つ戻す <span class="kbd">⌫</span></button></div>`);
@@ -237,8 +245,6 @@ App.views.calib = {
       <div class="row small muted" style="margin-top:6px"><span>● 済み</span><span style="color:#ef4444">● 今の点</span><span>○ これから</span><span style="color:#94a3b8">● とばした</span><span>◇ 高さのある点</span></div>
       <label class="row small" style="margin-top:6px"><input type="checkbox" id="extra"> 内側の交点も使う（より正確に）</label></div>`);
     side.appendChild(dia);
-    const snapCard = h(`<div class="card" style="padding:12px"></div>`);
-    side.appendChild(snapCard);
     const status = h(`<div class="card" style="padding:12px"></div>`);
     side.appendChild(status);
 
