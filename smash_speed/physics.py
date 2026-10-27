@@ -28,6 +28,7 @@ from smash_speed.camera import Camera
 from smash_speed.geometry import FlightPlane, intersect_plane, triangulate
 
 MPS_TO_KMH = 3.6
+MAX_SIM_SPEED_MPS = 1000.0  # これより速い初速は積分しない（最速のスマッシュの約 6 倍。最適化の途中の極端な値）
 
 
 # =============================================================================
@@ -83,6 +84,11 @@ def simulate(p0: np.ndarray, v0: np.ndarray, t_ref: float, times: np.ndarray,
     """
     times = np.asarray(times, float)
     out = np.empty((len(times), 6))
+    if not np.linalg.norm(v0) <= MAX_SIM_SPEED_MPS:
+        # 雑音の多い観測では、最適化が極端な初速（数十万 m/s）を試すことがある。空気抵抗が大きすぎて
+        # 積分の刻みが極端に細かくなり、1 回の当てはめが何十分もかかるので、積分せずに NaN（罰則）にする
+        out[:] = np.nan
+        return out[:, :3], out[:, 3:]
     y0 = np.concatenate([p0, v0])
     args = (phys.g, phys.k)
     for mask, sign in ((times >= t_ref, 1.0), (times < t_ref, -1.0)):
@@ -357,7 +363,8 @@ def _residuals_3d(theta: np.ndarray, model: _Model, t: np.ndarray, X: np.ndarray
     p0, v0, vt = model.unpack(theta)
     phys = PhysicsParams(base.g, vt, base.method, base.rtol, base.atol)
     pos, _ = simulate(p0, v0, t_ref, t, phys)
-    return (pos - X).ravel()
+    r = (pos - X).ravel()
+    return np.where(np.isfinite(r), r, 1e3)  # 積分できなかった場合の罰則 [m]
 
 
 def _speed_gradient(theta: np.ndarray, model: _Model) -> np.ndarray:
