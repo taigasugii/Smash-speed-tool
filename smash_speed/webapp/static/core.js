@@ -48,6 +48,7 @@ const NAV = [
   { id: "fastest", num: "★", label: "いちばん速いスマッシュ", sub: "動画の中をまとめて解析" },
   { id: "list", num: "≡", label: "結果の一覧", sub: "これまでの解析" },
   { id: "tools", num: "⚗", label: "研究ツール", sub: "ラベル付け・検証など" },
+  { id: "agent", num: "🤖", label: "開発エージェント", sub: "自動で機能を増やす" },
   { id: "settings", num: "⚙", label: "設定", sub: "出力先・詳細設定" },
 ];
 

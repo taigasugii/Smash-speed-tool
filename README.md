@@ -105,6 +105,15 @@ ffmpeg が PATH にない場合も、winget の既定のインストール先は
 `python -m smash_speed.webapp --set-passphrase`（ログイン済みの端末はすべてログアウトされる）。
 同じ端末から 10 分の間に 5 回まちがえると、10 分ほど受け付けない。
 
+## 自律開発エージェント（Badminton Analytics への拡張）
+
+デスクトップで Claude Code を無人で動かし、`agent/ROADMAP.md` の課題を 1 つずつ実装していきます。
+課題は、すべてのショットの速度と種類、ラリーの統計、選手の動き、フォーム・姿勢の解析などです。
+
+- 毎晩 0:00〜12:00 は自動で動きます。それ以外の時間は、GUI の「開発エージェント」から 1 回ずつ動かせます。
+- 変更は品質チェックを通ったものだけが `agent/dev` ブランチに入り、main への PR にまとまります。マージは人が行います。
+- 準備と使い方は [agent/README.md](agent/README.md) にあります。
+
 ## 使い方
 
 ### 0. まず合成データで通しで動かす
@@ -397,6 +406,7 @@ smash_speed/
   synth.py              合成データ・合成動画
   cli.py                コマンドライン
   webapp/               GUI（ローカル Web アプリ。smash-speed-gui.bat から起動）
+agent/                  自律開発エージェント（ロードマップ・1 回分の指示・品質チェック・繰り返し起動するスクリプト）
 notebooks/              Colab でのファインチューニング
 tests/                  合成データによるテスト
 data/, outputs/         動画・ラベル・出力（Git 管理外）

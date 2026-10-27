@@ -30,6 +30,7 @@ from smash_speed.config import PROJECT_ROOT, load_config
 from smash_speed.court import court_segments
 from smash_speed.geometry import floor_point
 from smash_speed.video_io import VideoMeta, probe, seek_read
+from smash_speed.webapp import agent
 from smash_speed.webapp.remote import REMOTE
 
 APP_ID = "smash-speed-web"
@@ -40,6 +41,7 @@ DEFAULT_PORT = 8765
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 ** 3        # スマホから送る動画（240fps の長い動画は数 GB になる）
 REMOTE.install(app)
+agent.install(app)
 UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi"}
 

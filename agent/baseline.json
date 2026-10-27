@@ -1,0 +1,20 @@
+{
+ "synthetic_mape": {
+  "physics/audio/30fps": 3.688,
+  "physics/audio/30fps/n": 30,
+  "physics/audio/240fps": 4.193,
+  "physics/audio/240fps/n": 30,
+  "physics/hitter_position/30fps": 6.955,
+  "physics/hitter_position/30fps/n": 30,
+  "physics/hitter_position/240fps": 6.059,
+  "physics/hitter_position/240fps/n": 30
+ },
+ "conditions": {
+  "n_shots": 30,
+  "fps": [
+   30,
+   240
+  ],
+  "seed": 0
+ }
+}
