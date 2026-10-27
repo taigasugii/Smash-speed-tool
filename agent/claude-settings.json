@@ -71,17 +71,18 @@
       "Bash(rm -r:*)",
       "Bash(curl:*)",
       "Bash(wget:*)",
-      "Read(./outputs/remote_access.json)",
+      "Read(//**/remote_access.json)",
+      "Edit(//**/remote_access.json)",
       "Edit(./agent/run.ps1)",
       "Edit(./agent/setup.ps1)",
       "Edit(./agent/claude-settings.json)",
       "Edit(./agent/eval_gate.py)",
       "Edit(./agent/baseline.json)",
-      "Write(./agent/run.ps1)",
-      "Write(./agent/setup.ps1)",
-      "Write(./agent/claude-settings.json)",
-      "Write(./agent/eval_gate.py)",
-      "Write(./agent/baseline.json)"
+      "Edit(./.agent/config.json)",
+      "Edit(./.agent/gate.json)",
+      "Edit(./.agent/status.json)",
+      "Edit(./.agent/PAUSE)",
+      "Edit(./.agent/STOP)"
     ]
   }
 }

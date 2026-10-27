@@ -14,8 +14,8 @@
 任意で ``skipped``（動画がないなどで調べなかった）と ``metrics``。``ctx`` は ``root``（リポジトリ）と
 ``config``（``.agent/config.json`` の中身。``main_repo``・``videos_dir`` など）。
 
-結果は ``.agent/gate.json`` に書く。``tree`` は調べた時点の作業ツリーの中身のハッシュで、
-コミット後の ``HEAD^{tree}`` と同じなら、``run.ps1`` は同じチェックをやり直さない。
+結果は ``.agent/gate.json`` に書く。``tree`` は調べた時点の作業ツリーの中身のハッシュ。
+``run.ps1`` はこのファイルを信じず、回の終わりに自分でもう一度このチェックを実行する。
 """
 
 from __future__ import annotations
