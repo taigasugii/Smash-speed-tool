@@ -384,6 +384,28 @@ smash-speed validate --dataset data/validation/index.csv --out outputs/validatio
 
 横から撮った動画では従来とほぼ同じで、後ろから撮った動画で人の動きを拾ってしまう失敗がなくなった。
 
+### すべての種類のショットと、1 ラリー分の合成データ
+
+`smash_speed/synth_rally.py` で、スマッシュ以外のショット（クリア・ドロップ・ドライブ・ロブ・ネット・プッシュ・サーブ）と、
+サーブから始まる 1 ラリー分の連続したショットを作れる（ショットの見つけ方・種類の判定・初速の正解に使う）。
+
+- 種類ごとに「打点の高さ・打つ位置の深さ・狙う着地点の深さ・初速・打ち出し角」の範囲（`SHOT_PROFILES`）を決め、
+  初速か打ち出し角の片方を引いて、もう片方は狙った着地点に落ちるように求める。ネットを越えないものは作り直す。
+- ラリーは、前のショットが相手側で下りてきて「次のショットの打点の高さ」にある間に打ち返してつなぐ。
+  返し方は前のショットで変わる（スマッシュ → ロブ・ドライブ・ネット など。`NEXT_TYPES`）。
+- 正解は `shots.csv`・`rallies.csv` の形（`SyntheticRally.to_shots`・`to_rally`）。打ち返されたショットの着地点は
+  「誰も打たなかったら落ちた所」。
+- 作った範囲の目安（各 10 本）：スマッシュ 150〜360 km/h・−18〜−5°、クリア 85〜190 km/h・15〜47°、ドロップ 40〜85 km/h、
+  ドライブ 80〜160 km/h、ロブ 90〜260 km/h・36〜65°、ネット 20〜40 km/h、プッシュ 30〜70 km/h、
+  サーブ（ショート 35〜55 km/h、ロング 70〜160 km/h）。シャトルは減速が大きいので、奥まで上げるロブ・クリアの初速は高めになる。
+
+```powershell
+# 合成ラリーの動画（rally.mp4・打球音 rally.wav）と正解（shots.csv・rallies.csv・各コマの truth_frames.csv）
+python -m smash_speed.synth_rally outputs/synth_rally --seed 0 --shots 10 --fps 120
+```
+
+カメラは設定の `synthetic.rally_camera`（コートの横・遠く。高いロブも画面に入る）。
+
 ## 実動画（iPhone 17, 4K 30fps）で試した結果
 
 | 動画 | カメラ | 結果 |
@@ -447,6 +469,7 @@ smash_speed/
   report.py             CSV・グラフ・オーバーレイ動画
   shots.py              ショットとラリーのデータ形式（shots.csv・rallies.csv）
   synth.py              合成データ・合成動画
+  synth_rally.py        すべての種類のショットと、1 ラリー分の合成データ
   cli.py                コマンドライン
   webapp/               GUI（ローカル Web アプリ。smash-speed-gui.bat から起動）
 agent/                  自律開発エージェント（ロードマップ・1 回分の指示・品質チェック・繰り返し起動するスクリプト）
