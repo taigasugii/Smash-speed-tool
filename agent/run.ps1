@@ -9,7 +9,8 @@
 #
 # 変更は agent/dev ブランチにためて push し、main への PR を 1 つ開いておく（人が見てマージする）。
 # 品質チェック（agent/eval_gate.py）が通らない変更は取り消し、.agent/failed にパッチとして残す。
-# PR へのコメントは、次の回の指示として Claude に渡す。
+# PR へのコメントと、自分が立てた Issue は、次の回の指示として Claude に渡す（他人の書き込みは読まない）。
+# 対応した Issue には返事をし、済んだものは閉じる。
 param(
     [switch]$Once,
     [switch]$OnRequest,
@@ -50,6 +51,12 @@ function Log([string]$msg) {
     [IO.File]::AppendAllText((Join-Path $Logs ("run-{0}.log" -f (Get-Date -Format "yyyyMMdd"))), $line + "`r`n", $Utf8)
 }
 function Save-Json($path, $obj) { [IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Depth 8), $Utf8) }
+# JSON の配列を 1 件ずつの配列にする（PowerShell 5.1 の ConvertFrom-Json は配列をまとめて 1 つで返すため）
+function From-JsonList([string]$j) {
+    if (-not $j) { return @() }
+    $x = $j | ConvertFrom-Json
+    return @($x | ForEach-Object { $_ })
+}
 function Read-Json($path) {
     if (Test-Path $path) { try { return ([IO.File]::ReadAllText($path, $Utf8) | ConvertFrom-Json) } catch { } }
     return $null
@@ -130,7 +137,7 @@ function Get-PR {
     if (-not $script:HasGh) { return $null }
     $j = X gh pr list --head $Branch --state open --json "number,url"
     if ($script:Code -ne 0 -or -not $j) { return $null }
-    $prs = @($j | ConvertFrom-Json)
+    $prs = @(From-JsonList $j)
     if ($prs.Count -eq 0) { return $null }
     return $prs[0]
 }
@@ -143,19 +150,66 @@ function Get-Feedback {
     $st = Read-Json $StateFile
     $since = if ($st -and $st.feedback_since) { [datetime]$st.feedback_since } else { [datetime]"2000-01-01" }
     $items = @()
+    # 自分（gh でログインしている人）の書き込みだけを読む。公開リポジトリで他人の書き込みを指示として扱わないため
     $v = X gh pr view $pr.number --json "comments,reviews"
     if ($script:Code -eq 0 -and $v) {
         $v = $v | ConvertFrom-Json
-        foreach ($c in $v.comments) { if ([datetime]$c.createdAt -gt $since) { $items += "- コメント：" + $c.body } }
-        foreach ($r in $v.reviews) { if ($r.body -and [datetime]$r.submittedAt -gt $since) { $items += "- レビュー（" + $r.state + "）：" + $r.body } }
+        foreach ($c in $v.comments) { if ($c.author.login -eq $script:Me -and [datetime]$c.createdAt -gt $since) { $items += "- コメント：" + $c.body } }
+        foreach ($r in $v.reviews) { if ($r.author.login -eq $script:Me -and $r.body -and [datetime]$r.submittedAt -gt $since) { $items += "- レビュー（" + $r.state + "）：" + $r.body } }
     }
     $ic = X gh api "repos/{owner}/{repo}/pulls/$($pr.number)/comments"
     if ($script:Code -eq 0 -and $ic) {
-        foreach ($c in @($ic | ConvertFrom-Json)) {
-            if ([datetime]$c.created_at -gt $since) { $items += "- " + $c.path + " の " + $c.line + " 行目へのコメント：" + $c.body }
+        foreach ($c in (From-JsonList $ic)) {
+            if ($c.user.login -eq $script:Me -and [datetime]$c.created_at -gt $since) { $items += "- " + $c.path + " の " + $c.line + " 行目へのコメント：" + $c.body }
         }
     }
     return ($items -join "`n")
+}
+
+# ---------------------------------------------------------------- Issue
+# 自分が立てた、開いている Issue（古い順）。エージェントの質問への答え待ちのものは飛ばす
+$AgentMark = "🤖 エージェント"
+$QuestionMark = "🤖 エージェント（質問）"
+function Clip([string]$s, [int]$n) { if (-not $s) { return "" }; if ($s.Length -gt $n) { return $s.Substring(0, $n) + "…" }; return $s }
+
+function Get-Issues {
+    $script:IssueNums = @()
+    if (-not $script:HasGh -or -not $script:Me) { return "" }
+    $j = X gh issue list --state open --author $script:Me --json "number,title,body,author,comments,createdAt" --limit 20
+    if ($script:Code -ne 0 -or -not $j) { return "" }
+    $items = @()
+    foreach ($i in ((From-JsonList $j) | Where-Object { $_.author.login -eq $script:Me } | Sort-Object createdAt)) {
+        $mine = @($i.comments | Where-Object { $_.author.login -eq $script:Me })
+        if ($mine.Count -gt 0 -and ([string]$mine[-1].body).StartsWith($QuestionMark)) { continue }
+        $script:IssueNums += [int]$i.number
+        $lines = @(("#{0} {1}" -f $i.number, $i.title), (Clip $i.body 3000))
+        foreach ($c in $mine) {
+            $who = if (([string]$c.body).StartsWith($AgentMark)) { "エージェントの返事" } else { "あなたのコメント" }
+            $lines += "- {0}：{1}" -f $who, (Clip $c.body 1500)
+        }
+        $items += ($lines -join "`n")
+    }
+    return ($items -join "`n`n")
+}
+
+# Claude が対応した Issue に返事をし、済んだものは閉じる（返事の中身は .agent/issue_reply.md）
+function Send-IssueReply($info, [string]$text, [bool]$pushed) {
+    $f = Join-Path $St "issue_reply.md"
+    if ($text -notmatch '(?m)^ISSUE:\s*#?(\d+)') { if (Test-Path $f) { Remove-Item $f }; return }
+    $n = [int]$Matches[1]
+    if ($script:IssueNums -notcontains $n) { Log "ignored reply to issue #$n (not in this run's list)"; if (Test-Path $f) { Remove-Item $f }; return }
+    $st = if ($text -match '(?m)^ISSUE_STATUS:\s*(\w+)') { $Matches[1] } else { "partial" }
+    $reply = if (Test-Path $f) { [IO.File]::ReadAllText($f, $Utf8).Trim() } else { $info.summary }
+    $head = switch ($st) { "done" { "$AgentMark（対応しました）" } "question" { $QuestionMark } default { "$AgentMark（途中）" } }
+    $body = "$head`n`n$reply"
+    if ($pushed -and $script:Status.pr_url) { $body += "`n`n変更は $($script:Status.pr_url) に入っています（マージすると main に入ります）。" }
+    [IO.File]::WriteAllText($f, $body, $Utf8)
+    $out = X gh issue comment $n --body-file $f
+    if ($script:Code -ne 0) { Log "issue comment failed: $out" }
+    elseif ($st -eq "done") { X gh issue close $n | Out-Null }
+    Remove-Item $f
+    $info.issue = $n
+    Log "replied to issue #$n ($st)"
 }
 
 function Section([string]$path, [string]$start, [string]$end, [int]$maxLines) {
@@ -206,7 +260,7 @@ $journal
 }
 
 # ---------------------------------------------------------------- 1 回分の指示
-function Build-Prompt([string]$feedback) {
+function Build-Prompt([string]$feedback, [string]$issues) {
     $base = [IO.File]::ReadAllText((Join-Path $Root "agent\prompt.md"), $Utf8)
     $left = [int]($script:Deadline - (Get-Date)).TotalMinutes
     $how = if ($Once) { "手動で 1 回だけ" } else { "夜間の連続運転（終わるとすぐ次の回が始まる）" }
@@ -216,6 +270,7 @@ function Build-Prompt([string]$feedback) {
         ("- 動かし方：{0}" -f $how))
     if ($script:MergeNote) { $ctx += "- " + $script:MergeNote }
     if ($feedback) { $ctx += @("", "### あなたへのコメント（PR に付いた新しいもの。最優先）", $feedback) }
+    if ($issues) { $ctx += @("", "### Issue での頼みごと（古い順。PR へのコメントの次に優先し、1 回に 1 つ）", $issues) }
     if (Test-Path $FailureFile) {
         $ctx += @("", "### 前の回で品質チェックが通らず取り消した変更", [IO.File]::ReadAllText($FailureFile, $Utf8))
     }
@@ -234,8 +289,11 @@ function Invoke-Iteration {
     Prepare-Branch
     $before = X git rev-parse HEAD
     $feedback = Get-Feedback
+    $issues = Get-Issues
+    $replyFile = Join-Path $St "issue_reply.md"
+    if (Test-Path $replyFile) { Remove-Item $replyFile }
     $pf = Join-Path $St "prompt-current.md"
-    [IO.File]::WriteAllText($pf, (Build-Prompt $feedback), $Utf8)
+    [IO.File]::WriteAllText($pf, (Build-Prompt $feedback $issues), $Utf8)
     Set-Status @{ state = "running"; iteration = $script:Iter; task = ""; message = "Claude が作業しています"; log = $log }
     Log "iteration $($script:Iter): claude started (log $log)"
 
@@ -288,6 +346,8 @@ function Invoke-Iteration {
     if (X git status --porcelain) { Save-Leftover $(if ($killed) { $killed } else { "uncommitted" }) }
     $after = X git rev-parse HEAD
     if ($after -eq $before) {
+        # 質問への答えなど、コードを変えずに済む頼みごともある
+        if (-not $killed -and $info.result -notin @("error", "limit")) { Send-IssueReply $info $text $false }
         Log "iteration $($script:Iter): no commits ($($info.result))"
         Add-History $info
         return $info
@@ -307,7 +367,7 @@ function Invoke-Iteration {
     }
     if ($gateOk) {
         $out = X git push --force-with-lease origin "${Branch}:${Branch}"
-        if ($script:Code -eq 0) { $info.pushed = $true; Update-PR } else { Log "push failed: $out" }
+        if ($script:Code -eq 0) { $info.pushed = $true; Update-PR; Send-IssueReply $info $text $true } else { Log "push failed: $out" }
         if (Test-Path $FailureFile) { Remove-Item $FailureFile }
         Save-Json $StateFile @{ feedback_since = (Get-Date).ToUniversalTime().ToString("o") }
         Notify ("[Badminton Analytics] {0}：{1}" -f $task, $summary)
@@ -355,6 +415,8 @@ try {
     $script:Claude = @(Get-Command claude.exe, claude.cmd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)[0]
     if (-not $script:Claude -and (Test-Path "$env:USERPROFILE\.local\bin\claude.exe")) { $script:Claude = "$env:USERPROFILE\.local\bin\claude.exe" }
     $script:HasGh = [bool](Get-Command gh -ErrorAction SilentlyContinue)
+    $script:Me = if ($script:HasGh) { (X gh api user --jq .login).Trim() } else { "" }
+    if ($script:HasGh -and $script:Code -ne 0) { Log "gh is not logged in; PR comments and issues are skipped"; $script:Me = "" }
     if (-not $script:Claude) { throw "claude が見つかりません（agent/README.md の準備を見てください）" }
     if (-not (Test-Path $Py)) { throw ".venv がありません（agent/README.md の準備を見てください）" }
     Set-Status @{ state = "running"; message = "準備しています" }

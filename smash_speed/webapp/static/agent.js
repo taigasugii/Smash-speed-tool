@@ -48,7 +48,7 @@ App.views.agent = {
         <div class="row"><button class="btn primary" id="req" ${r.running || r.requested ? "disabled" : ""}>${r.requested ? "まもなく始まります…" : "課題を 1 つ進める"}</button>
           <button class="btn danger" id="stop" ${r.running && !r.stop_requested ? "" : "disabled"}>${r.stop_requested ? "止めています…" : "止める"}</button></div></div>
       <p class="muted small" style="margin:10px 0 0">毎晩 0:00〜12:00 は自動で動き続けます。それ以外の時間は「課題を 1 つ進める」を押すと、5 分以内に始まります（1 回は 3 時間が目安）。止める時刻を過ぎた作業は、区切りのいい所まで終えてから止まります。
-        作業の結果は GitHub の PR にまとまります。${s.pr_url ? `<a href="${esc(s.pr_url)}" target="_blank" rel="noopener">PR を開く</a>（直してほしい所はコメントすると、次の回に反映します）` : ""}</p></div>`);
+        頼みごとは GitHub に Issue を立てると、次の回で対応して返事をします（済んだら閉じます）。作業の結果は GitHub の PR にまとまります。${s.pr_url ? `<a href="${esc(s.pr_url)}" target="_blank" rel="noopener">PR を開く</a>（直してほしい所はコメントすると、次の回に反映します）` : ""}</p></div>`);
     el.appendChild(head);
     $("#req", head).onclick = async () => {
       const x = await api.post("/api/agent/request");
