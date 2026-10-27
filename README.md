@@ -153,6 +153,30 @@ smash-speed analyze-smashes --batch out/IMG_4397_smashes
   カメラが打つ人の後ろ（視線が打点に向かって急な角度）なら、打つ人の推定は実際の足元から 0.5 m 前後に収まった。
   カメラが横・低い位置（視線が浅い）だと奥行きがずれやすいので、②の確認が欠かせない。
 - 隣のコートの音・打点がコートの外になるもの・ありえない速さになるものは候補から外す（一覧の「すべての打球音」で理由を見られる）。
+- ③では `ranking.csv` と同じ結果を、ショットの形（`shots.csv`、下の「ショットとラリーのデータ形式」）でも書き出す。
+  前に解析した出力先からは `python -m smash_speed.shots out/IMG_4397_smashes` で書き出せる。
+
+#### ショットとラリーのデータ形式（`shots.csv`・`rallies.csv`）
+
+すべてのショット・ラリーの解析（ROADMAP の B・C）はこの形で結果を出す（`smash_speed/shots.py`）。
+1 行 1 本、分からない値は空欄、文字コードは BOM 付き UTF-8（Excel でそのまま開ける）。
+
+| `shots.csv` の列 | 中身 |
+|---|---|
+| `t_hit_s` | 打った時刻（映像の時刻）[s] |
+| `side` | 打った側。`h` = x < 0 の側、`o` = x > 0 の側（座標系とランドマークの名前と同じ） |
+| `shot_type` | `smash` `clear` `drop` `drive` `lob` `net` `push` `serve` `unknown` |
+| `speed_kmh`, `speed_ci_low_kmh`, `speed_ci_high_kmh` | 初速と 95% 信頼区間 [km/h] |
+| `hit_x_m`, `hit_y_m`, `hit_z_m` | 打点 [m] |
+| `land_x_m`, `land_y_m`, `t_land_s` | 着地点 [m] と着地した時刻 [s] |
+| `v0_x_mps`, `v0_y_mps`, `v0_z_mps`, `terminal_velocity_mps` | 打点での速度と終端速度。軌道はこれと打点から描き直す（`Shot.trajectory`） |
+| `confidence` | 信頼度 0〜1。いまは「1 −（初速の信頼区間の幅 ÷ 初速）」 |
+| `rally_id`, `index_in_rally` | 属するラリーと、その中で何本目か |
+| `source`, `ref`, `note` | どの解析から来たか、元の結果の場所、メモ |
+
+`rallies.csv` は `rally_id`・`t_start_s`・`t_end_s`・`n_shots`・`winner_side`（得点した側）・
+`end_reason`（`in` `out` `net` `fault`）・`score_h`・`score_o`（ラリーの後の得点）・`note`。
+知らない列は読み飛ばすので、表計算ソフトで列を足しても読み込める。
 
 ### 2. キャリブレーション（カメラごとに1回）
 
@@ -421,6 +445,7 @@ smash_speed/
   train/                疑似低 fps・学習データ・ファインチューニング・検出の評価
   validate.py           精度検証（合成・実データ）、Bland–Altman、補正
   report.py             CSV・グラフ・オーバーレイ動画
+  shots.py              ショットとラリーのデータ形式（shots.csv・rallies.csv）
   synth.py              合成データ・合成動画
   cli.py                コマンドライン
   webapp/               GUI（ローカル Web アプリ。smash-speed-gui.bat から起動）

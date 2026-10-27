@@ -26,7 +26,7 @@ ShuttleSet / CoachAI（ショットの種類の分類体系と、ラリー単位
   完了の条件：どれを使うか決まり、`smash_speed/accel.py` で「GPU があれば使う・なければ CPU」に切り替えられる。
   - [x] **A2a 推論**：onnxruntime-directml を入れて CPU と比べた（約 70〜90 倍速い）。推論はこれに決め、`accel.py` を作った。
   - [?] **A2b 学習用の PyTorch**：torch-directml か ROCm 版 PyTorch（どちらも大きい）。F1 の前に、`QUESTIONS.md` の答えを待って試す。
-- [ ] **A3 ショットとラリーのデータ形式**
+- [x] **A3 ショットとラリーのデータ形式**
   1 本のショット（打った時刻・打った側・種類・初速・打点・着地点・軌道・信頼度）と、ラリー（ショットの並び・得点）を
   表す `smash_speed/shots.py` を作り、`shots.csv`・`rallies.csv` の読み書きを決める。今のスマッシュの結果もこの形で出せるようにする。
 
