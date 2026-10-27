@@ -21,6 +21,12 @@ dependencies = [
 [project.optional-dependencies]
 # Phase 6 で導入（CPU 版で可）
 dl = ["torch>=2.2", "torchvision>=0.17"]
+# ONNX のモデルの推論（Windows は DirectML で GPU を使う。smash_speed/accel.py・docs/gpu.md）
+gpu = [
+    "onnxruntime-directml>=1.17; sys_platform == 'win32'",
+    "onnxruntime>=1.17; sys_platform != 'win32'",
+    "onnx>=1.15",
+]
 # 打点推定の補助（任意）
 pose = ["mediapipe>=0.10"]
 dev = ["pytest>=8.0"]

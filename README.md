@@ -68,6 +68,10 @@ python -m pip install -e ".[dev]"
 python -m pip install -e ".[dl]"
 python -m pip install -e ".[pose]"
 
+# 任意：GPU での推論（onnxruntime-directml。約 33 MB）。速さの確かめ方は docs/gpu.md
+python -m pip install -e ".[gpu]"
+python -m smash_speed.accel --bench
+
 # テスト（合成データで全モジュールを確認。1 分ほど）
 pytest
 ```

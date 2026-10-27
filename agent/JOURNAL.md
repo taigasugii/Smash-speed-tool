@@ -14,6 +14,21 @@
 
 ---
 
+## 2026-10-28 00:30 A2 GPU の使い方を調べる（済み。A2b の PyTorch は確認待ち）
+- やったこと：
+  - `onnxruntime-directml` 1.24.4（約 25 MB、MIT）と `onnx`（約 8 MB、Apache-2.0）を入れた。pyproject に `gpu` の追加の依存として足した。
+    DirectML で RX 7900 XT（メモリ 20 GB）が見えることを確かめた。
+  - `smash_speed/accel.py` を作った：`choose_providers`（auto / gpu / cpu、環境変数 `SMASH_SPEED_DEVICE` が優先）、
+    `make_session`（GPU で読み込めなければ警告を出して CPU で作り直す）、`device_info`（装置の名前とメモリ）、
+    `python -m smash_speed.accel --bench`（TrackNet に似た U-Net 形のモデルで GPU と CPU を比べる）。
+  - `docs/gpu.md` に結果と候補ごとのまとめ。README のセットアップに入れ方を足した。テスト `tests/test_accel.py`（7 件）。
+  - 学習用の PyTorch（torch-directml / ROCm 版）は大きいので入れず、ROADMAP に A2b（`[?]`）として分け、QUESTIONS.md で確認した。
+- 結果（数字）：288×512・9 チャンネル 1 枚で CPU 553 ms → GPU 6.2 ms（約 89 倍）、8 枚まとめて 3980 → 55 ms（約 72 倍）、
+  576×1024 で 2136 → 24 ms（約 90 倍）。CPU と GPU の出力の差は最大 6×10⁻⁷。セッション作成 約 0.2 秒、初回推論 約 50 ms。
+- 品質チェック：通った（pytest 通過 305 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、
+  hitter_position 30fps 6.955% / 240fps 6.059%（基準と同じ）、実動画 15 本の最大のずれ 0.00%）。
+- 次にやること：A3（ショットとラリーのデータ形式）。A2b は答え待ち。
+
 ## 2026-10-27 22:16 A1 実動画の回帰チェック（済み）
 - やったこと：
   - `agent/checks/check_real_videos.py` を作った。本体の `outputs/*_smashes/ranking.csv` に載ったスマッシュ（4 本の動画・15 本）の
