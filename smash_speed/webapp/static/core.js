@@ -24,6 +24,7 @@ const App = {
   landmarks: null,   // ランドマークとコートの線分
   current: "home",
   views: {},
+  remote: false,     // この PC 以外の端末（スマホなど）から使っている
   async save(patch) { Object.assign(this.state, patch); await api.post("/api/state", patch); refreshNav(); },
 };
 
@@ -160,10 +161,90 @@ $("#btn-quit").onclick = async () => {
   document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif">終了しました。このタブは閉じて構いません。</div>';
 };
 
-// ファイル選択（この PC のダイアログを開く）
+// ファイル選択（この PC のダイアログを開く。離れた端末からは、ブラウザの中にデスクトップのフォルダを出す）
 async function pickPath(kind, opts = {}) {
+  if (App.remote) return remotePick(kind, opts);
   const r = await api.post("/api/pick", { kind, ...opts });
   return r.ok ? r.path : "";
+}
+
+/** 離れた端末用のファイル選択：デスクトップのフォルダをたどって選ぶ。 */
+function remotePick(kind, opts = {}) {
+  const exts = kind === "video" ? ".mp4,.mov,.m4v,.avi" : (opts.pattern || "").replace(/\*/g, "").replace(/\s+/g, ",");
+  const title = { video: "動画を選ぶ", dir: "フォルダを選ぶ", save: "保存先を選ぶ" }[kind] || opts.title || "ファイルを選ぶ";
+  return new Promise((resolve) => {
+    const ov = h(`<div class="modal-back"><div class="modal card"><div class="row" style="justify-content:space-between"><b>${esc(title)}</b>
+      <button class="btn sm ghost" id="x">閉じる</button></div>
+      <div class="muted small" id="cur" style="word-break:break-all;margin:6px 0"></div>
+      <div class="pointlist" id="list" style="max-height:55vh;overflow:auto"></div>
+      <div class="row" id="foot" style="margin-top:10px"></div></div></div>`);
+    document.body.appendChild(ov);
+    const done = (v) => { ov.remove(); resolve(v || ""); };
+    $("#x", ov).onclick = () => done("");
+    const show = async (dir) => {
+      const r = await api.get(`/api/browse?dir=${encodeURIComponent(dir)}&ext=${encodeURIComponent(kind === "dir" ? "" : exts)}`);
+      if (!r.ok) return toast(r.error, "bad");
+      $("#cur", ov).textContent = r.dir || "よく使う場所";
+      const list = $("#list", ov);
+      list.innerHTML = "";
+      if (r.dir) {
+        const up = h(`<div class="p"><span>📁</span><span style="flex:1">..（ひとつ上へ）</span></div>`);
+        up.onclick = () => show(r.parent || "");
+        list.appendChild(up);
+      }
+      for (const e of r.entries) {
+        if (!e.dir && kind === "dir") continue;
+        const size = e.size != null ? `<span class="muted small">${(e.size / 1024 / 1024).toFixed(1)} MB</span>` : "";
+        const row = h(`<div class="p"><span>${e.dir ? "📁" : "🎬"}</span><span style="flex:1;word-break:break-all">${esc(e.name)}</span>${size}</div>`);
+        row.onclick = () => (e.dir ? show(e.path) : done(e.path));
+        list.appendChild(row);
+      }
+      const foot = $("#foot", ov);
+      foot.innerHTML = "";
+      if (r.dir && kind === "dir") {
+        const b = h(`<button class="btn primary block">このフォルダにする</button>`);
+        b.onclick = () => done(r.dir);
+        foot.appendChild(b);
+      }
+      if (r.dir && kind === "save") {
+        const f = h(`<div class="row" style="width:100%"><input class="input" style="flex:1" value="${esc(opts.name || "")}"><button class="btn primary">ここに保存</button></div>`);
+        $("button", f).onclick = () => { const n = $("input", f).value.trim(); if (n) done(r.dir.replace(/[\\/]$/, "") + "\\" + n); };
+        foot.appendChild(f);
+      }
+    };
+    const start = opts.initial || (kind === "save" && App.state.out_root) || "";
+    show(start);
+  });
+}
+
+/** 離れた端末（スマホなど）から動画をデスクトップへ送る。送り終えたら保存先のパスを返す。 */
+function uploadVideo() {
+  return new Promise((resolve) => {
+    const inp = h(`<input type="file" accept="video/*,.mov,.mp4" style="display:none">`);
+    document.body.appendChild(inp);
+    inp.onchange = () => {
+      const f = inp.files[0];
+      inp.remove();
+      if (!f) return resolve("");
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      const xhr = new XMLHttpRequest();
+      const bar = h(`<div class="toast">動画を送っています… <b id="pct">0</b>%</div>`);
+      document.body.appendChild(bar);
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) $("#pct", bar).textContent = Math.round(100 * e.loaded / e.total); };
+      xhr.onload = () => {
+        bar.remove();
+        let r = {};
+        try { r = JSON.parse(xhr.responseText); } catch (e) { r = { ok: false, error: "送れませんでした" }; }
+        if (!r.ok) { toast(r.error || "送れませんでした", "bad"); return resolve(""); }
+        resolve(r.path);
+      };
+      xhr.onerror = () => { bar.remove(); toast("送れませんでした（通信が切れました）", "bad"); resolve(""); };
+      xhr.open("POST", "/api/upload");
+      xhr.send(fd);
+    };
+    inp.click();
+  });
 }
 
 function pathField(label, key, kind = "file", opts = {}) {

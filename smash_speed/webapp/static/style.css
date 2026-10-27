@@ -238,3 +238,29 @@ video.figure { background: #000; }
   .kpis { grid-template-columns: 1fr 1fr; }
   .steps-intro { grid-template-columns: 1fr 1fr; }
 }
+
+/* ---------------- 離れた端末のファイル選択 ---------------- */
+.modal-back { position: fixed; inset: 0; background: rgba(15, 23, 42, .45); display: grid; place-items: center; z-index: 50; padding: 12px; }
+.modal { width: 100%; max-width: 560px; max-height: 90vh; overflow: hidden; }
+
+/* ---------------- スマホなど狭い画面 ---------------- */
+@media (max-width: 760px) {
+  body { font-size: 15px; }
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
+  .sidebar, .main { min-width: 0; }
+  .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { padding: 10px 14px; }
+  .brand p { display: none; }
+  .nav { display: flex; overflow-x: auto; padding: 6px; gap: 4px; flex: none; }
+  .nav .group, .nav .sub { display: none; }
+  .nav button { width: auto; flex: none; white-space: nowrap; padding: 6px 10px; }
+  .sidebar .foot { display: flex; gap: 10px; align-items: center; padding: 6px 14px; }
+  .topbar { height: auto; min-height: 48px; padding: 8px 14px; flex-wrap: wrap; }
+  .content { padding: 12px; overflow: visible; }
+  .workspace, .grid2, .grid3, .hero { grid-template-columns: minmax(0, 1fr); }
+  .kpis { grid-template-columns: 1fr 1fr; }
+  .steps-intro { grid-template-columns: 1fr; }
+  .row { flex-wrap: wrap; }
+  .dropzone { padding: 22px 12px; }
+  .btn.big { height: auto; min-height: 46px; white-space: normal; padding: 8px 16px; }
+}

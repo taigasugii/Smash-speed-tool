@@ -42,9 +42,13 @@ App.views.home = {
     } else {
       box.appendChild(h(`<div class="dropzone"><div class="icon">🎬</div>
         <p style="font-weight:700;margin:6px 0">解析する動画を選んでください</p>
-        <p class="muted small" style="margin:0 0 14px">スマホ・カメラで撮った mp4 / mov。動画はこの PC から外には送られません。</p>
-        <button class="btn primary big" id="pick">動画を選ぶ…</button></div>`));
+        <p class="muted small" style="margin:0 0 14px">${App.remote
+          ? "デスクトップにある動画を選ぶか、この端末（スマホなど）の動画をデスクトップへ送ってください。動画は自分の端末の間だけで送られます。"
+          : "スマホ・カメラで撮った mp4 / mov。動画はこの PC から外には送られません。"}</p>
+        <div class="row" style="justify-content:center"><button class="btn primary big" id="pick">${App.remote ? "デスクトップの動画を選ぶ…" : "動画を選ぶ…"}</button>
+        ${App.remote ? '<button class="btn big" id="up">この端末の動画を送る…</button>' : ""}</div></div>`));
       $("#pick", box).onclick = () => chooseVideo();
+      if (App.remote) $("#up", box).onclick = () => sendVideo();
     }
     const slow = h(`<div class="card"><h2>スロー動画の場合</h2>
       <p class="desc">240fps などで撮ったスロー動画は、書き出すと 30fps として記録されることがあります。その場合は実際の撮影 fps を入れてください（普通の動画は空欄のまま）。</p>
@@ -63,6 +67,13 @@ App.views.home = {
     $("#demo", demo).onclick = () => makeDemo();
   },
 };
+
+async function sendVideo() {
+  const p = await uploadVideo();
+  if (!p) return;
+  toast("デスクトップに送りました");
+  if (await openVideo(p, null)) { toast("動画を開きました"); go("clip"); }
+}
 
 async function chooseVideo() {
   const p = await pickPath("video", { initial: App.state.video ? App.state.video.replace(/[\\/][^\\/]*$/, "") : "" });

@@ -30,6 +30,7 @@ from smash_speed.config import PROJECT_ROOT, load_config
 from smash_speed.court import court_segments
 from smash_speed.geometry import floor_point
 from smash_speed.video_io import VideoMeta, probe, seek_read
+from smash_speed.webapp.remote import REMOTE
 
 APP_ID = "smash-speed-web"
 STATIC = Path(__file__).parent / "static"
@@ -37,6 +38,10 @@ STATE_FILE = PROJECT_ROOT / "outputs" / "web_state.json"
 DEFAULT_PORT = 8765
 
 app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 ** 3        # スマホから送る動画（240fps の長い動画は数 GB になる）
+REMOTE.install(app)
+UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi"}
 
 
 # =============================================================================
@@ -239,6 +244,8 @@ def ping():
 
 @app.post("/api/shutdown")
 def shutdown():
+    if REMOTE.is_remote_client():
+        return err("離れた端末からは終了できません（終了するとここから起動し直せないため）。デスクトップで終了してください。")
     for t in TASKS.values():
         t.cancel()
     threading.Timer(0.5, lambda: os._exit(0)).start()
@@ -250,7 +257,8 @@ def shutdown():
 # =============================================================================
 @app.get("/api/state")
 def get_state():
-    return ok(state=S.state, project_root=str(PROJECT_ROOT))
+    # remote：この PC 以外の端末から使っている（ファイル選択の画面などを、ブラウザの中に出す）
+    return ok(state=S.state, project_root=str(PROJECT_ROOT), remote=REMOTE.is_remote_client())
 
 
 @app.post("/api/state")
@@ -265,6 +273,8 @@ def pick():
     """この PC のファイル選択ダイアログを開く（ブラウザからは実際のパスが分からないため）。"""
     b = body()
     kind = b.get("kind", "file")
+    if REMOTE.is_remote_client():
+        return err("離れた端末からは、デスクトップのファイル選択の画面は開けません")
     import tkinter as tk
     from tkinter import filedialog
 
@@ -289,10 +299,67 @@ def pick():
     return ok(path=p or "")
 
 
+@app.get("/api/browse")
+def browse():
+    """フォルダの中身（離れた端末のファイル選択の画面用）。``dir`` を省略すると、よく使う場所の一覧。"""
+    d = request.args.get("dir", "")
+    exts = {e.lower() for e in request.args.get("ext", "").split(",") if e}
+    if not d:
+        home = Path.home()
+        places = [("スマホから送った動画", UPLOAD_DIR), ("ダウンロード", home / "Downloads"), ("ビデオ", home / "Videos"),
+                  ("出力フォルダ", out_root()), ("プロジェクト", PROJECT_ROOT)]
+        if S.state.get("video"):
+            places.insert(0, ("今の動画のフォルダ", Path(S.state["video"]).parent))
+        drives = [Path(f"{c}:/") for c in "CDEFGH" if Path(f"{c}:/").exists()] if os.name == "nt" else [Path("/")]
+        entries = [{"name": n, "path": str(q), "dir": True} for n, q in places if q.exists()]
+        entries += [{"name": str(q), "path": str(q), "dir": True} for q in drives]
+        return ok(dir="", parent=None, entries=entries)
+    p = Path(d)
+    if not p.is_dir():
+        return err("フォルダが見つかりません")
+    entries = []
+    try:
+        for q in sorted(p.iterdir(), key=lambda q: (not q.is_dir(), q.name.lower())):
+            if q.name.startswith((".", "$")):
+                continue
+            try:
+                isdir = q.is_dir()
+                if not isdir and exts and q.suffix.lower() not in exts:
+                    continue
+                entries.append({"name": q.name, "path": str(q), "dir": isdir,
+                                "size": None if isdir else q.stat().st_size})
+            except OSError:
+                continue
+    except OSError as e:
+        return err(f"開けませんでした：{e}")
+    return ok(dir=str(p), parent=str(p.parent) if p.parent != p else "", entries=entries[:2000])
+
+
+@app.post("/api/upload")
+def upload():
+    """離れた端末（スマホなど）から動画を送り、デスクトップの ``data/uploads`` に保存する。"""
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        return err("動画が送られていません")
+    name = Path(f.filename).name
+    if Path(name).suffix.lower() not in VIDEO_EXT:
+        return err("mp4 / mov などの動画を選んでください")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dst = UPLOAD_DIR / name
+    stem, n = dst.stem, 1
+    while dst.exists():
+        dst = UPLOAD_DIR / f"{stem}_{n}{dst.suffix}"
+        n += 1
+    f.save(dst)
+    return ok(path=str(dst))
+
+
 @app.post("/api/open")
 def open_path():
     """ファイル・フォルダを Windows の既定のアプリで開く。"""
     p = Path(body().get("path", ""))
+    if REMOTE.is_remote_client():
+        return err("フォルダやファイルを開くのは、デスクトップの画面でだけできます")
     if not p.exists():
         return err("見つかりません")
     os.startfile(str(p))  # noqa: S606
@@ -831,19 +898,34 @@ def _watchdog() -> None:
             os._exit(0)
 
 
-def main(open_browser: bool = True, port: int = DEFAULT_PORT) -> None:
+def main(open_browser: bool = True, port: int = DEFAULT_PORT, remote: bool = False) -> None:
+    """アプリを起動する。
+
+    Args:
+        remote: 離れた端末（Tailscale でつないだスマホ・PC）からも使えるようにする。合言葉が必要で、
+            ブラウザを閉じても自動では終了しない（いつでも離れた端末から使えるように）
+    """
     url = f"http://127.0.0.1:{port}/"
     if _port_in_use(port):
         # すでに起動している場合は、ブラウザで開くだけ
         if open_browser:
             webbrowser.open(url)
         return
-    threading.Thread(target=_watchdog, daemon=True).start()
+    if remote:
+        from smash_speed.webapp.remote import load
+
+        if load() is None:
+            raise SystemExit("合言葉が決まっていません。先に python -m smash_speed.webapp --set-passphrase を実行してください")
+        REMOTE.enabled = True
+    else:
+        threading.Thread(target=_watchdog, daemon=True).start()
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    app.run(host="127.0.0.1", port=port, threaded=True, debug=False, use_reloader=False)
+    # remote のときは全部のネットワークで待ち受け、入口（REMOTE）で Tailscale の端末以外を断る
+    app.run(host="0.0.0.0" if remote else "127.0.0.1", port=port, threaded=True, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
     main(open_browser="--no-browser" not in sys.argv,
-         port=int(next((a.split("=")[1] for a in sys.argv if a.startswith("--port=")), DEFAULT_PORT)))
+         port=int(next((a.split("=")[1] for a in sys.argv if a.startswith("--port=")), DEFAULT_PORT)),
+         remote="--remote" in sys.argv)

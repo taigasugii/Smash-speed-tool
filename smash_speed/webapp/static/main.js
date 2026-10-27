@@ -4,6 +4,14 @@
 (async () => {
   const s = await api.get("/api/state");
   App.state = s.state;
+  App.remote = !!s.remote;
+  if (App.remote) {
+    // 離れた端末からは終了しない（ここから起動し直せないため）。代わりにログアウトを出す
+    const q = $("#btn-quit");
+    q.textContent = "ログアウト";
+    q.onclick = async () => { await fetch("/logout", { method: "POST" }); location.href = "/login"; };
+    document.body.classList.add("remote");
+  }
   App.landmarks = await api.get("/api/landmarks");
   if (App.state.video) {
     const r = await api.post("/api/video", { path: App.state.video, capture_fps: App.state.capture_fps });
