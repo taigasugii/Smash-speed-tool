@@ -398,7 +398,10 @@ function Invoke-Iteration {
     # Claude の最後の報告
     $res = $null
     if (Test-Path $log) {
-        foreach ($l in [IO.File]::ReadAllLines($log, $Utf8)) { if ($l -match '^\{\s*"type"\s*:\s*"result"') { try { $res = $l | ConvertFrom-Json } catch { } } }
+        # 結果の行で "type" が先頭に来るとは限らない（Claude Code の版による）ので、読んでから確かめる
+        foreach ($l in [IO.File]::ReadAllLines($log, $Utf8)) {
+            if ($l.StartsWith("{") -and $l.Contains('"result"')) { try { $o = $l | ConvertFrom-Json; if ($o.type -eq "result") { $res = $o } } catch { } }
+        }
     }
     $text = if ($res) { [string]$res.result } else { "" }
     $task = if ($text -match '(?m)^TASK:\s*(.+?)\s*$') { $Matches[1] } else { "" }
