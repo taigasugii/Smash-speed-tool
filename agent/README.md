@@ -27,7 +27,9 @@
 
 - エージェントは本体（`C:\Users\Public\Claude\smash-speed`）とは別のコピー `C:\Users\Public\Claude\smash-speed-agent` で作業する。本体のファイルには触らない。
 - push と PR の作成は `run.ps1` だけが行う。Claude には `git push`・`gh`・ブランチの切り替え・`git reset` を許していない（`claude-settings.json`）。
-- `run.ps1`・`claude-settings.json`・`eval_gate.py`・`baseline.json` は Claude が書き換えられない。
+- `run.ps1`・`claude-settings.json`・`eval_gate.py`・`baseline.json` は Claude が書き換えられない。python などから書き換えた場合に備えて、`run.ps1` が回の終わりに中身を確かめ、変わっていたらその回の変更をすべて取り消す（`.agent/failed/` にパッチとして残す）。
+- 品質チェックは、Claude が通したと言っても、`run.ps1` が回の終わりに必ずやり直す。
+- 合言葉のファイル（`remote_access.json`）は、どこにあっても Claude の読み書きを禁じている。ただし Claude と GUI は同じ Windows のユーザーで動くので、python などから読むことまでは止められない。完全に分けるには、エージェントを別の Windows ユーザーで動かす。
 - main には直接入らない。必ず PR を人がマージする。
 - GUI のボタンは合図のファイル（`.agent/REQUEST`・`.agent/STOP`・`.agent/PAUSE`）を置くだけで、プログラムは起動しない。
 

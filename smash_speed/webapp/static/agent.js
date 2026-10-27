@@ -8,7 +8,7 @@ const AGENT_STATE = {
 };
 const AGENT_RESULT = {
   done: ["済み", "ok"], partial: ["途中まで", "warn"], failed: ["できなかった", "bad"], no_task: ["課題なし", ""],
-  gate_failed: ["品質チェック NG・取り消し", "bad"], limit: ["利用枠の上限", "warn"], error: ["エラー", "bad"],
+  gate_failed: ["品質チェック NG・取り消し", "bad"], protected: ["触れないファイルを変更・取り消し", "bad"], limit: ["利用枠の上限", "warn"], error: ["エラー", "bad"],
 };
 
 App.views.agent = {

@@ -185,6 +185,20 @@ function Prepare-Branch {
     }
 }
 
+# 人だけが直すファイル。claude-settings.json で書き換えを禁じているが、python などからは書けてしまうので、
+# 回の終わりに確かめる。前の回の中身か、main の中身（main から取り込んだだけ）と同じなら構わない
+$Protected = @("agent/run.ps1", "agent/setup.ps1", "agent/claude-settings.json", "agent/eval_gate.py", "agent/baseline.json")
+function Get-ProtectedChanges([string]$before) {
+    $bad = @()
+    foreach ($f in $Protected) {
+        $now = X git rev-parse --verify --quiet "HEAD:$f"
+        if ($now -eq (X git rev-parse --verify --quiet "${before}:$f")) { continue }
+        if ($now -eq (X git rev-parse --verify --quiet "origin/main:$f")) { continue }
+        $bad += $f
+    }
+    return $bad
+}
+
 # ---------------------------------------------------------------- PR
 function Get-PR {
     if (-not $script:HasGh) { return $null }
@@ -416,18 +430,26 @@ function Invoke-Iteration {
         return $info
     }
 
-    # 品質チェック（Claude が最後の状態で通していれば、やり直さない）
-    Set-Status @{ state = "gate"; task = $task; message = "品質チェックをしています" }
-    $gate = Read-Json (Join-Path $St "gate.json")
-    $tree = X git rev-parse "HEAD^{tree}"
-    $gout = ""
-    if ($gate -and $gate.ok -and $gate.tree -eq $tree) {
-        $gateOk = $true
-    } else {
-        $gout = X $Py "agent\eval_gate.py"
-        $gateOk = ($script:Code -eq 0)
-        [IO.File]::WriteAllText((Join-Path $Logs "gate-$ts.log"), $gout, $Utf8)
+    # 守るファイルが書き換えられていたら、この回の変更は入れない
+    $touched = @(Get-ProtectedChanges $before)
+    if ($touched.Count -gt 0) {
+        $dir = Join-Path $Failed "$ts-protected"
+        X git format-patch -q "$before..HEAD" -o $dir | Out-Null
+        X git reset -q --hard $before | Out-Null
+        $info.result = "protected"
+        $info.summary = "書き換えてはいけないファイル（{0}）が変わっていたので、取り消しました" -f ($touched -join "、")
+        [IO.File]::WriteAllText($FailureFile, "課題：$task`nパッチ：$dir`n`n$($info.summary)。これらのファイルは人だけが直します。`n", $Utf8)
+        Log "iteration $($script:Iter): protected files changed ($($touched -join ', ')); changes saved to $dir"
+        Notify ("[Badminton Analytics] {0}：{1}" -f $task, $info.summary)
+        Add-History $info
+        return $info
     }
+
+    # 品質チェックは毎回ここでやり直す（.agent/gate.json は Claude の側からも書けるので、その結果は使わない）
+    Set-Status @{ state = "gate"; task = $task; message = "品質チェックをしています" }
+    $gout = X $Py "agent\eval_gate.py"
+    $gateOk = ($script:Code -eq 0)
+    [IO.File]::WriteAllText((Join-Path $Logs "gate-$ts.log"), $gout, $Utf8)
     if ($gateOk) {
         $out = X git push --force-with-lease origin "${Branch}:${Branch}"
         if ($script:Code -eq 0) { $info.pushed = $true; Update-PR; Send-IssueReply $info $text $true } else { Log "push failed: $out" }
