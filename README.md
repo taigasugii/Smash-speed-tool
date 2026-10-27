@@ -263,6 +263,20 @@ smash-speed validate --dataset data/validation/index.csv --out outputs/validatio
 出力：`results.csv`（1本・1条件ごと）、`summary.csv`（MAE・MAPE・バイアス・一致限界・CI の被覆率）、`mape_vs_fps.png`、
 `bland_altman.png`、`correction.csv`（線形補正の前後）。
 
+#### 実動画の回帰チェック
+
+```powershell
+.venv\Scripts\python.exe agent\checks\check_real_videos.py
+```
+
+実動画 4 本（IMG_3391・IMG_4397・IMG_4521・IMG_5096）の順位表に載ったスマッシュ 15 本を、GUI の「詳しく解析する」と同じ手順で
+解析し直し、初速が基準（`agent/checks/real_videos_baseline.json`）から 3% 以上ずれたら失敗にする。
+基準には、キャリブレーション・打つ人と着地点・候補探しで検出したシャトルの位置・基準を作った時点のコードでの初速を
+固めて入れてあるので、`outputs/` を作り直しても基準は変わらない。動画は `.agent/config.json` の `videos_dir` から探し、
+ない PC では飛ばす。品質チェック（`agent/eval_gate.py`）からも呼ばれる。
+所要時間はデスクトップで約 4 分（動画ごとに別のプロセスで並べて解析する。1 本ずつだと約 12 分）。
+基準を作り直すとき（解析を意図して変えたときなど、人が決めたときだけ）は `--make-baseline` を付ける。
+
 ---
 
 ## 座標系
