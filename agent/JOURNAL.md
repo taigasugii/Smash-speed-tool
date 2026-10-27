@@ -14,6 +14,35 @@
 
 ---
 
+## 2026-10-28 06:30 B4 ショットの種類の判定（ルール）（済み）
+- やったこと：
+  - `smash_speed/shot_types.py` を作った。`features_from_trajectory`：打点と初速度から軌道を床まで延ばし、初速・打ち出し角・
+    打点の高さ・打つ位置の深さ・軌道のいちばん高い所・ネットの真上を通る高さ・着地点の深さ（相手側のネットから）を出す
+    （`ShotFeatures`）。`shot_features` は `Shot` から（`index_in_rally == 1` をラリーの最初とする）。
+  - `classify_features`（しきい値は `RuleThresholds`）：最初のショット → サーブ。打点 1.95 m 以上なら、下向き・36 m/s 以上 →
+    スマッシュ、着地 3.8 m より深い → クリア、ほか → ドロップ。それより低い打点なら、着地 1.75 m 以内 → ネット、
+    4 m より深く 28° 以上か 3 m 以上上がる → ロブ、ほかは 20 m/s 以上 → ドライブ、遅い → プッシュ。
+  - `classify_shots`（決まった種類はそのまま）、`confusion_matrix`・`scores`・`mistakes`、`truth_benchmark`（正解の軌道）、
+    `synthetic_benchmark`（観測 → `find_hits` → `fit_shots` → 判定。最初のショットは見つけた最初の打球）、
+    `python -m smash_speed.shot_types shots.csv`（`shots_typed.csv` に書き出す）と `--bench`。
+  - `shot_fit.synthetic_benchmark` に `keep_shots`（推定した `Shot` を行に残す）を足した（既定は今までどおり）。
+  - テスト `tests/test_shot_types.py`（21 件・約 50 秒）、品質チェックに `agent/checks/check_shot_types.py`
+    （正解の軌道 40 ラリーで 0.97 以上、横の 30 fps・音ありの当てはめ 5 ラリーで 0.85 以上、3 本以上ある種類の再現率 0.6 以上。約 2 分）。
+    README に説明と表。設定の既定値は変えていない。
+- 結果（数字）：最初の案（深く飛ぶ低いショットを「最高点 3.5 m」でロブ／ドライブに分ける）は正解の軌道で 0.969
+  （ロブ → ドライブ 24 本、プッシュ → ドライブ 13 本）。ロブを打ち出し角でも見る・深いプッシュも速さでドライブと分ける、に直して
+  正解の軌道 150 ラリー 1257 本で 0.998。当てはめた軌道（横、音あり）は 12 ラリー 106 本で 30 fps 0.981・120 fps 0.991、
+  別の 8 ラリーで 30・120 fps とも 1.000。残る間違いはプッシュ（打点が 1.9 m 前後で頭の上のショットと区別しにくい）だけ。
+  角・低いカメラ（4 ラリー、音あり）は 30 fps 0.971（34 本、サーブ 1 本が当てはめられず unknown）・120 fps 1.000（35 本）。
+  （8 ラリーで測る最初の試みは、品質チェックと同時に動かして 30 分で止まった）
+  注意：しきい値は合成の種類ごとの範囲（`SHOT_PROFILES`）から決めたので、合成では種類がほとんど重ならず、数字は高く出る。
+  実動画の精度は分からない（B6 の正解ラベルで測る）。
+- 品質チェック：通った（pytest 通過 262 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、
+  hitter_position 30fps 6.955% / 240fps 6.059%（基準と同じ）、check_hits 0.988 以上、実動画 15 本の最大のずれ 0.00%、
+  check_shot_speeds 30fps 2.47%・120fps 1.76%、check_shot_types 正解の軌道 1.000・30fps の当てはめ 1.000）。
+- 次にやること：B5（GUI：ショットの一覧）。`find_hits` → `fit_shots` → `shot_fits_to_shots` → `classify_shots` を実動画の全コマの
+  検出につなぐ。ROADMAP の提案に「合成ショットの種類の範囲を重ねる」を足した。
+
 ## 2026-10-28 04:25 B3 ショットごとの軌道と初速（済み）
 - やったこと：
   - `smash_speed/shot_fit.py` を作った。`split_observations`：打球の時刻で検出結果を飛行ごとに分ける（打球の前後 10 ms は使わない）。

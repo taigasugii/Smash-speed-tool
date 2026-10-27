@@ -329,13 +329,15 @@ def shot_fits_to_shots(fits: list[ShotFit], phys: PhysicsParams, source: str = "
 # =============================================================================
 def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, hits: str = "true",
                         noise_px: float = 1.5, dropout: float = 0.1, camera: Camera | None = None,
-                        cfg: dict[str, Any] | None = None, verbose: bool = False) -> dict[str, Any]:
+                        cfg: dict[str, Any] | None = None, verbose: bool = False,
+                        keep_shots: bool = False) -> dict[str, Any]:
     """合成ラリーで、ショットの種類ごとの初速の誤差を測る。
 
     Args:
         hits: 打球の時刻と打った側の決め方。"true" は正解、"track" は ``find_hits``（軌道だけ）、
             "audio" は ``find_hits``（打つたびの打球音の時刻を、カメラまでの音の遅れつきで渡す）。
             見つからなかった打球・正解のない打球は数えない（打球の見つけ方の精度は ``hits.synthetic_benchmark``）
+        keep_shots: ``rows`` に、推定したショット（``Shot``。``index_in_rally`` は見つけた打球の順）の列 ``shot`` を足す
 
     Returns:
         ``rows``（1 ショット 1 行の DataFrame：種類・正解と推定の初速・誤差 [%]）と、
@@ -373,16 +375,20 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                 if d[j] <= 0.05 and j not in pairs:
                     pairs[i] = j
         fits = fit_shots(det, t_hits, camera, phys, sides, opts)
-        for sf, j in zip(fits, pairs):
+        shots = shot_fits_to_shots(fits, phys) if keep_shots else [None] * len(fits)
+        for i, (sf, j) in enumerate(zip(fits, pairs)):
             if j is None:
                 continue
             s = segs[j]
+            if shots[i] is not None:
+                shots[i].rally_id, shots[i].index_in_rally = r, i + 1
             est = sf.speed_kmh
             true = s.speed0 * MPS_TO_KMH
             rows.append({"rally": r, "index": j, "profile": s.profile, "shot_type": SHOT_PROFILES[s.profile].shot_type,
                          "true_kmh": true, "est_kmh": est, "n_obs": sf.n_obs,
                          "dt_hit_ms": 1000 * (sf.t_hit - s.t_hit),
-                         "err_pct": None if est is None else 100 * (est / true - 1)})
+                         "err_pct": None if est is None else 100 * (est / true - 1),
+                         **({"shot": shots[i]} if keep_shots else {})})
             if verbose and (est is None or abs(est / true - 1) > 0.1):
                 print(f"ラリー {r} の {j + 1} 本目 {s.profile}：正解 {true:.1f} km/h、推定 "
                       f"{'-' if est is None else f'{est:.1f}'} km/h（{sf.n_obs} コマ）{sf.message}")
