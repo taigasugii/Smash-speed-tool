@@ -77,6 +77,44 @@ def test_request_and_stop_only_write_flag_files(adir):
     assert (adir / ".agent" / "STOP").exists()
 
 
+def test_pause_and_resume(adir):
+    c = app.test_client()
+    st = adir / ".agent"
+    assert c.get("/api/agent").get_json()["paused"] is False
+    assert c.post("/api/agent/pause").get_json()["ok"] is True             # 動いていなくても、夜間の分を止めておける
+    assert (st / "PAUSE").exists() and c.get("/api/agent").get_json()["paused"] is True
+    assert c.post("/api/agent/resume").get_json()["ok"] is True
+    assert not (st / "PAUSE").exists()
+    assert c.post("/api/agent/resume").get_json()["ok"] is True            # 2 回押しても困らない
+    _w(st / "lock.json", {"pid": os.getpid()})
+    _w(st / "status.json", {"state": "running", "mode": "once"})
+    r = c.post("/api/agent/pause").get_json()                                # 「1 つ進める」の回は止めない
+    assert r["ok"] is False and not (st / "PAUSE").exists()
+    _w(st / "status.json", {"state": "running", "mode": "window"})
+    assert c.post("/api/agent/pause").get_json()["ok"] is True
+
+
+def test_paused_state_of_dead_process_shows_stopped(adir):
+    _w(adir / ".agent" / "status.json", {"state": "paused"})
+    _w(adir / ".agent" / "lock.json", {"pid": 999999})
+    assert app.test_client().get("/api/agent").get_json()["status"]["state"] == "stopped"
+
+
+def test_auto_pause_switch_keeps_other_settings(adir):
+    c = app.test_client()
+    cfg = adir / ".agent" / "config.json"
+    r = c.get("/api/agent").get_json()
+    assert r["auto_pause"] is True and r["auto_pause_idle_minutes"] == agent.RESUME_MINUTES   # 既定はオン
+    _w(cfg, {"main_repo": "C:\\本体", "notify_url": "", "auto_pause_idle_minutes": 20})
+    assert c.post("/api/agent/auto_pause", json={"enabled": False}).get_json()["auto_pause"] is False
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved == {"main_repo": "C:\\本体", "notify_url": "", "auto_pause_idle_minutes": 20, "auto_pause": False}
+    r = c.get("/api/agent").get_json()
+    assert r["auto_pause"] is False and r["auto_pause_idle_minutes"] == 20
+    c.post("/api/agent/auto_pause", json={"enabled": True})
+    assert c.get("/api/agent").get_json()["auto_pause"] is True
+
+
 def test_alive():
     assert agent.alive(os.getpid())
     assert not agent.alive(None) and not agent.alive(0) and not agent.alive("x")

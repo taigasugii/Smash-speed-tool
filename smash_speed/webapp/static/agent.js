@@ -1,9 +1,9 @@
-// 開発エージェント：自動で機能を足していく Claude の様子を見る・1 つ進めてもらう・止める
+// 開発エージェント：自動で機能を足していく Claude の様子を見る・1 つ進めてもらう・一時停止する・止める
 "use strict";
 
 const AGENT_STATE = {
   running: ["作業中", "ok"], gate: ["品質チェック中", "ok"], starting: ["準備中", "ok"], wrapping: ["区切りまで作業中", "warn"],
-  waiting_limit: ["利用枠の回復待ち", "warn"], idle: ["止まっています", ""], stopped: ["途中で止まりました", "warn"],
+  waiting_limit: ["利用枠の回復待ち", "warn"], paused: ["一時停止中", "warn"], idle: ["止まっています", ""], stopped: ["途中で止まりました", "warn"],
   error: ["エラーで止まりました", "bad"],
 };
 const AGENT_RESULT = {
@@ -36,20 +36,44 @@ App.views.agent = {
     this.renderBody(el, r);
   },
 
-  // ---- いまの状態と、1 つ進める・止めるボタン
+  // ---- いまの状態と、1 つ進める・一時停止・止めるボタン
   renderHead(el, r) {
     const s = r.status || {};
     const [label, kind] = AGENT_STATE[s.state] || ["まだ動いたことがありません", ""];
     const until = s.deadline ? new Date(s.deadline).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "";
+    const once = r.running && s.mode === "once";        // 「1 つ進める」の回は一時停止しない
+    const pauseNote = r.paused && !r.running ? `<div class="small" style="margin-top:6px">⏸ 一時停止中：「再開」を押すまで、夜間の作業を始めません。</div>` : "";
     const head = h(`<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
         <div><h2 style="margin:0 0 6px">いまの状態 <span class="badge ${kind}">${label}</span></h2>
           <div class="muted small">${esc(s.message || "")}${r.running && until ? `（${until} に止まります）` : ""}</div>
-          ${s.task ? `<div style="margin-top:6px">課題：<b>${esc(s.task)}</b></div>` : ""}</div>
+          ${s.task ? `<div style="margin-top:6px">課題：<b>${esc(s.task)}</b></div>` : ""}${pauseNote}</div>
         <div class="row"><button class="btn primary" id="req" ${r.running || r.requested ? "disabled" : ""}>${r.requested ? "まもなく始まります…" : "課題を 1 つ進める"}</button>
+          ${r.paused ? `<button class="btn primary" id="resume">再開</button>`
+                     : `<button class="btn" id="pause" ${once ? "disabled" : ""}>一時停止</button>`}
           <button class="btn danger" id="stop" ${r.running && !r.stop_requested ? "" : "disabled"}>${r.stop_requested ? "止めています…" : "止める"}</button></div></div>
-      <p class="muted small" style="margin:10px 0 0">毎晩 0:00〜12:00 は自動で動き続けます。それ以外の時間は「課題を 1 つ進める」を押すと、5 分以内に始まります（1 回は 3 時間が目安）。止める時刻を過ぎた作業は、区切りのいい所まで終えてから止まります。
+      <label class="row small" style="margin:10px 0 0;gap:6px;align-items:center"><input type="checkbox" id="auto" ${r.auto_pause ? "checked" : ""}>
+        この PC を使っているあいだは、夜間の作業を一時停止する（${esc(r.auto_pause_idle_minutes)} 分操作がなければ再開）</label>
+      <p class="muted small" style="margin:10px 0 0">毎晩 0:00〜12:00 は自動で動き続けます。それ以外の時間は「課題を 1 つ進める」を押すと、5 分以内に始まります（1 回は 3 時間が目安）。止める時刻を過ぎた作業や一時停止した作業は、区切りのいい所まで終えてから止まります。
         頼みごとは GitHub に Issue を立てると、次の回で対応して返事をします（済んだら閉じます）。作業の結果は GitHub の PR にまとまります。${s.pr_url ? `<a href="${esc(s.pr_url)}" target="_blank" rel="noopener">PR を開く</a>（直してほしい所はコメントすると、次の回に反映します）` : ""}</p></div>`);
     el.appendChild(head);
+    const pause = $("#pause", head), resume = $("#resume", head);
+    if (pause) pause.onclick = async () => {
+      const x = await api.post("/api/agent/pause");
+      if (!x.ok) return toast(x.error, "bad");
+      toast(r.running ? "一時停止します。いまの作業は区切りのいい所まで終えてから止まります" : "一時停止しました。「再開」を押すまで夜間の作業を始めません");
+      this.refresh();
+    };
+    if (resume) resume.onclick = async () => {
+      await api.post("/api/agent/resume");
+      toast(r.auto_pause ? "再開します（この PC を使っているあいだは、使い終わるまで待ちます）" : "再開します");
+      this.refresh();
+    };
+    $("#auto", head).onchange = async (e) => {
+      const x = await api.post("/api/agent/auto_pause", { enabled: e.target.checked });
+      if (!x.ok) return toast(x.error, "bad");
+      toast(x.auto_pause ? "この PC を使っているあいだは一時停止します" : "この PC を使っていても止めずに作業します");
+      this.refresh();
+    };
     $("#req", head).onclick = async () => {
       const x = await api.post("/api/agent/request");
       if (!x.ok) return toast(x.error, "bad");

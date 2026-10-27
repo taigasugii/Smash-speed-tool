@@ -7,6 +7,9 @@
 # それでも終わらないときは、止める時刻 + GraceMinutes で打ち切る（午後の利用枠を使いすぎないため）。
 #   run.ps1 -OnRequest     .agent/REQUEST（GUI の「1 つ進める」）があるときだけ -Once で動く。5 分おきに起動される
 #
+# 夜間の連続運転は、.agent/PAUSE（GUI の「一時停止」）があるあいだと、PC がキーボードやマウスで使われているあいだは
+# 一時停止する。作業中の回には区切りのいい所まで終えてもらい、再開したら次の回から続ける。
+#
 # 変更は agent/dev ブランチにためて push し、main への PR を 1 つ開いておく（人が見てマージする）。
 # 品質チェック（agent/eval_gate.py）が通らない変更は取り消し、.agent/failed にパッチとして残す。
 # PR へのコメントと、自分が立てた Issue は、次の回の指示として Claude に渡す（他人の書き込みは読まない）。
@@ -38,6 +41,7 @@ $Utf8 = New-Object System.Text.UTF8Encoding $false
 $StopFile = Join-Path $St "STOP"
 $WrapFile = Join-Path $St "WRAPUP"
 $RequestFile = Join-Path $St "REQUEST"
+$PauseFile = Join-Path $St "PAUSE"
 $LockFile = Join-Path $St "lock.json"
 $StatusFile = Join-Path $St "status.json"
 $HistoryFile = Join-Path $St "history.jsonl"
@@ -87,6 +91,55 @@ function Notify([string]$text) {
     $cfg = Read-Json (Join-Path $St "config.json")
     if (-not $cfg -or -not $cfg.notify_url) { return }
     try { Invoke-RestMethod -Method Post -Uri $cfg.notify_url -Body ([Text.Encoding]::UTF8.GetBytes($text)) -TimeoutSec 20 | Out-Null } catch { Log "notify failed: $_" }
+}
+
+# ---------------------------------------------------------------- 一時停止
+# 手動：.agent/PAUSE があるあいだ。
+# 自動：.agent/config.json の auto_pause（既定はオン）。3 分ほど続けて操作されたら「使っている」とみなし、
+#       auto_pause_idle_minutes 分（既定 10 分）操作がなければ再開する。猫がマウスに触れた程度では止めない。
+# -Once（「1 つ進める」）は人が頼んだものなので、どちらでも止めない。
+$script:BusySince = $null
+$script:AutoPaused = $false
+$script:ResumeMinutes = 10
+function Get-PauseReason {
+    if ($Once) { return "" }
+    if (Test-Path $PauseFile) { return "manual" }
+    $cfg = Read-Json (Join-Path $St "config.json")
+    if ($cfg -and $cfg.auto_pause -eq $false) { $script:BusySince = $null; $script:AutoPaused = $false; return "" }
+    $script:ResumeMinutes = if ($cfg -and $cfg.auto_pause_idle_minutes -gt 0) { [double]$cfg.auto_pause_idle_minutes } else { 10 }
+    $idleSec = [Win32.Input]::IdleMs() / 1000.0
+    $now = Get-Date
+    if ($idleSec -lt 120) {
+        if (-not $script:BusySince) { $script:BusySince = $now.AddSeconds(-$idleSec) }
+    } else {
+        $script:BusySince = $null
+    }
+    if ($script:AutoPaused) {
+        if ($idleSec -ge $script:ResumeMinutes * 60) { $script:AutoPaused = $false; $script:BusySince = $null }
+    } elseif ($script:BusySince -and ($now - $script:BusySince).TotalMinutes -ge 3) {
+        $script:AutoPaused = $true
+    }
+    if ($script:AutoPaused) { return "active" }
+    return ""
+}
+
+# 一時停止のあいだ待つ。止める・時刻切れのときは $false
+function Wait-WhilePaused {
+    $reason = Get-PauseReason
+    if (-not $reason) { return $true }
+    Log "paused ($reason)"
+    while ($reason) {
+        $msg = if ($reason -eq "manual") { "一時停止しています（「再開」を押すと続きから始めます）" } else {
+            "PC が使われているので待っています（{0} 分操作がなければ再開します）" -f $script:ResumeMinutes }
+        Set-Status @{ state = "paused"; paused = $reason; message = $msg; task = "" }
+        if (Test-Path $StopFile) { return $false }
+        if ((Get-Date) -ge $script:Deadline.AddMinutes(-30)) { Log "still paused with less than 30 minutes left"; return $false }
+        Start-Sleep -Seconds 30
+        $reason = Get-PauseReason
+    }
+    Log "resumed"
+    Set-Status @{ state = "running"; paused = ""; message = "再開しました" }
+    return $true
 }
 
 # ---------------------------------------------------------------- Git
@@ -304,6 +357,7 @@ function Invoke-Iteration {
         -RedirectStandardInput $pf -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     $null = $p.Handle
     $killed = ""
+    $pausedWrap = $false
     while (-not $p.HasExited) {
         $now = Get-Date
         if (Test-Path $StopFile) { $killed = "stop" } elseif ($now -ge $script:Deadline.AddMinutes($GraceMinutes)) { $killed = "deadline" }
@@ -312,6 +366,15 @@ function Invoke-Iteration {
             [IO.File]::WriteAllText($WrapFile, "止める時刻を過ぎました。区切りのいい所まで終えてコミットしてください。`n", $Utf8)
             Set-Status @{ state = "wrapping"; message = ("止める時刻を過ぎたので、区切りのいい所で終えてもらっています（遅くとも {0}）" -f $script:Deadline.AddMinutes($GraceMinutes).ToString("HH:mm")) }
             Log "iteration $($script:Iter): deadline reached; asked claude to wrap up"
+        }
+        if (-not (Test-Path $WrapFile)) {
+            $reason = Get-PauseReason
+            if ($reason) {
+                [IO.File]::WriteAllText($WrapFile, "一時停止します（PC が使われ始めた、または「一時停止」が押された）。区切りのいい所まで終えてコミットしてください。`n", $Utf8)
+                $pausedWrap = $true
+                Set-Status @{ state = "wrapping"; paused = $reason; message = "一時停止のため、区切りのいい所で終えてもらっています" }
+                Log "iteration $($script:Iter): pause ($reason); asked claude to wrap up"
+            }
         }
         Start-Sleep -Seconds 10
     }
@@ -328,7 +391,7 @@ function Invoke-Iteration {
     $result = if ($text -match '(?m)^RESULT:\s*(\w+)') { $Matches[1] } else { "" }
     $summary = if ($text -match '(?m)^SUMMARY:\s*(.+?)\s*$') { $Matches[1] } else { "" }
     $info = @{ start = $ts; task = $task; result = $result; summary = $summary; log = $log
-        turns = $(if ($res) { $res.num_turns } else { $null }); killed = $killed; pushed = $false }
+        turns = $(if ($res) { $res.num_turns } else { $null }); killed = $killed; pushed = $false; paused = $pausedWrap }
 
     # 利用枠の上限・起動の失敗
     if (-not $killed -and (-not $res -or $res.is_error)) {
@@ -404,12 +467,22 @@ Save-Json $LockFile @{ pid = $PID; started = (Get-Date -Format s) }
 foreach ($f in @($StopFile, $WrapFile)) { if (Test-Path $f) { Remove-Item $f } }
 $script:Status = [ordered]@{
     state = "starting"; mode = $Mode; pid = $PID; started = (Get-Date -Format s); deadline = $script:Deadline.ToString("s")
-    iteration = 0; task = ""; message = ""; log = ""; pr_url = ""; updated = ""
+    iteration = 0; task = ""; message = ""; log = ""; pr_url = ""; paused = ""; updated = ""
 }
 
 # 動いている間はスリープしない
 Add-Type -Namespace Win32 -Name Power -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'
 [Win32.Power]::SetThreadExecutionState([uint32]2147483649) | Out-Null
+# 最後にキーボードやマウスが操作されてからの時間（ミリ秒）
+Add-Type -Namespace Win32 -Name Input -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+[DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+public static uint IdleMs() {
+    var li = new LASTINPUTINFO(); li.cbSize = (uint)Marshal.SizeOf(li);
+    if (!GetLastInputInfo(ref li)) return uint.MaxValue;
+    return (uint)Environment.TickCount - li.dwTime;
+}
+'@
 
 try {
     $script:Claude = @(Get-Command claude.exe, claude.cmd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)[0]
@@ -425,6 +498,7 @@ try {
     $script:Iter = 0; $idle = 0; $errors = 0
     while ($true) {
         if (Test-Path $StopFile) { Log "stop requested"; break }
+        if (-not (Wait-WhilePaused)) { break }
         if ($script:Iter -gt 0 -and (Get-Date) -ge $script:Deadline.AddMinutes(-30)) { Log "less than 30 minutes left"; break }
         $script:Iter++
         $info = Invoke-Iteration
@@ -440,7 +514,7 @@ try {
                 }
             }
             "error" { $errors++; if ($errors -ge 3) { Log "3 errors in a row"; $idle = $IdleLimit } elseif (-not $Once) { Start-Sleep -Seconds 300 } }
-            default { $errors = 0; if ($info.pushed) { $idle = 0 } else { $idle++ } }
+            default { $errors = 0; if ($info.pushed) { $idle = 0 } elseif (-not $info.paused) { $idle++ } }
         }
         if ($Once -or $idle -ge $IdleLimit) { break }
     }

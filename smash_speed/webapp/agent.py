@@ -4,6 +4,8 @@
 環境変数 ``SMASH_AGENT_DIR`` で変えられる）で動き、状態を ``.agent/`` に書く。ここではそれを読むだけで、
 プロセスは起動しない。「1 つ進める」は ``.agent/REQUEST`` を置き、タスク スケジューラ（5 分おきの
 ``run.ps1 -OnRequest``）がそれを見て動かす。「止める」は ``.agent/STOP`` を置く。
+「一時停止」は ``.agent/PAUSE`` を置き、「再開」はそれを消す。PC を使っているあいだの自動の一時停止は
+``.agent/config.json`` の ``auto_pause`` で切り替える。
 """
 
 from __future__ import annotations
@@ -14,11 +16,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from smash_speed.config import PROJECT_ROOT
 
 TAIL_BYTES = 400_000      # 作業の様子を出すときに読む、ログの末尾の大きさ
+RESUME_MINUTES = 10       # 自動の一時停止から再開するまでの、操作のない時間（run.ps1 の既定と同じ）
 
 
 def agent_dir() -> Path:
@@ -102,7 +105,7 @@ def status() -> dict[str, Any]:
     st = d / ".agent"
     s = _read_json(st / "status.json") or {}
     running = alive((_read_json(st / "lock.json") or {}).get("pid"))
-    if s.get("state") in ("running", "gate", "waiting_limit", "starting", "wrapping") and not running:
+    if s.get("state") in ("running", "gate", "waiting_limit", "starting", "wrapping", "paused") and not running:
         s["state"] = "stopped"                      # 途中で PC が止まった・プロセスが落ちた
     hist = []
     try:
@@ -120,9 +123,12 @@ def status() -> dict[str, Any]:
     except OSError:
         pass
     log = Path(s["log"]) if s.get("log") else None
+    cfg = _read_json(st / "config.json") or {}
     return {
         "dir": str(d), "installed": (d / "agent" / "run.ps1").exists(), "running": running, "status": s,
         "requested": (st / "REQUEST").exists(), "stop_requested": (st / "STOP").exists(),
+        "paused": (st / "PAUSE").exists(), "auto_pause": cfg.get("auto_pause", True) is not False,
+        "auto_pause_idle_minutes": cfg.get("auto_pause_idle_minutes") or RESUME_MINUTES,
         "history": hist[::-1], "journal": journal, "questions": questions,
         "activity": activity(log) if log and running else [],
     }
@@ -155,3 +161,29 @@ def install(app: Flask) -> None:
             return jsonify(ok=False, error="いまは動いていません。")
         _flag("STOP")
         return jsonify(ok=True)
+
+    @app.post("/api/agent/pause")
+    def agent_pause():
+        s = status()
+        if not s["installed"]:
+            return jsonify(ok=False, error=f"エージェントの作業フォルダが見つかりません（{s['dir']}）。")
+        if s["running"] and s["status"].get("mode") == "once":
+            return jsonify(ok=False, error="「課題を 1 つ進める」の回は一時停止できません。やめるときは「止める」を押してください。")
+        _flag("PAUSE")
+        return jsonify(ok=True)
+
+    @app.post("/api/agent/resume")
+    def agent_resume():
+        (agent_dir() / ".agent" / "PAUSE").unlink(missing_ok=True)
+        return jsonify(ok=True)
+
+    @app.post("/api/agent/auto_pause")
+    def agent_auto_pause():
+        # config.json のほかの項目（main_repo など）はそのまま残す
+        p = agent_dir() / ".agent" / "config.json"
+        if not p.parent.exists():
+            return jsonify(ok=False, error="エージェントの作業フォルダが見つかりません。")
+        cfg = _read_json(p) or {}
+        cfg["auto_pause"] = bool((request.get_json(silent=True) or {}).get("enabled"))
+        p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return jsonify(ok=True, auto_pause=cfg["auto_pause"])
