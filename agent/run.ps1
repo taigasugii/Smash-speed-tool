@@ -1,7 +1,10 @@
 ﻿# Badminton Analytics の自律エージェント：Claude Code を繰り返し起動して、agent/ROADMAP.md の課題を 1 つずつ進める。
 #
-#   run.ps1 -Until 12:00   毎晩 0:00 にタスク スケジューラから。12:00 になったら途中でも止める
-#   run.ps1 -Once          課題を 1 つだけ進める（午後に手で動かすとき。既定は 3 時間で打ち切り）
+#   run.ps1 -Until 12:00   毎晩 0:00 にタスク スケジューラから。12:00 を過ぎたら次の回は始めない
+#   run.ps1 -Once          課題を 1 つだけ進める（午後に手で動かすとき。既定は 3 時間が目安）
+#
+# 止める時刻になったら .agent/WRAPUP を置き、Claude には今の作業を区切りのいい所まで終えてコミットしてもらう。
+# それでも終わらないときは、止める時刻 + GraceMinutes で打ち切る（午後の利用枠を使いすぎないため）。
 #   run.ps1 -OnRequest     .agent/REQUEST（GUI の「1 つ進める」）があるときだけ -Once で動く。5 分おきに起動される
 #
 # 変更は agent/dev ブランチにためて push し、main への PR を 1 つ開いておく（人が見てマージする）。
@@ -12,6 +15,7 @@ param(
     [switch]$OnRequest,
     [string]$Until = "",
     [int]$Hours = 3,
+    [int]$GraceMinutes = 60,
     [int]$MaxTurns = 300,
     [string]$Model = "",
     [int]$IdleLimit = 3
@@ -31,6 +35,7 @@ $Settings = Join-Path $Root "agent\claude-settings.json"
 $Branch = "agent/dev"
 $Utf8 = New-Object System.Text.UTF8Encoding $false
 $StopFile = Join-Path $St "STOP"
+$WrapFile = Join-Path $St "WRAPUP"
 $RequestFile = Join-Path $St "REQUEST"
 $LockFile = Join-Path $St "lock.json"
 $StatusFile = Join-Path $St "status.json"
@@ -206,7 +211,8 @@ function Build-Prompt([string]$feedback) {
     $left = [int]($script:Deadline - (Get-Date)).TotalMinutes
     $how = if ($Once) { "手動で 1 回だけ" } else { "夜間の連続運転（終わるとすぐ次の回が始まる）" }
     $ctx = @("", "## 今回の状況", "",
-        ("- 今：{0}。止める時刻：{1}（あと約 {2} 分）。この時刻を過ぎると途中でも止められ、コミットしていない変更は消えます。早めに区切ってコミットしてください。" -f (Get-Date -Format "yyyy-MM-dd HH:mm"), $script:Deadline.ToString("HH:mm"), $left),
+        ("- 今：{0}。止める時刻：{1}（あと約 {2} 分）。" -f (Get-Date -Format "yyyy-MM-dd HH:mm"), $script:Deadline.ToString("HH:mm"), $left),
+        ("- 止める時刻を過ぎたら（作業の区切りごとに ``date`` と ``ls .agent/WRAPUP`` で確かめる）、新しいことは始めず、今の作業を区切りのいい所まで終えて、品質チェック → 記録 → コミットして終わってください。課題が途中なら ROADMAP を ``[~]`` にし、JOURNAL に続きの手順を書きます。{0} を過ぎると強制的に止められ、コミットしていない変更は消えます。" -f $script:Deadline.AddMinutes($GraceMinutes).ToString("HH:mm")),
         ("- 動かし方：{0}" -f $how))
     if ($script:MergeNote) { $ctx += "- " + $script:MergeNote }
     if ($feedback) { $ctx += @("", "### あなたへのコメント（PR に付いた新しいもの。最優先）", $feedback) }
@@ -241,10 +247,17 @@ function Invoke-Iteration {
     $null = $p.Handle
     $killed = ""
     while (-not $p.HasExited) {
-        if (Test-Path $StopFile) { $killed = "stop" } elseif ((Get-Date) -ge $script:Deadline) { $killed = "deadline" }
+        $now = Get-Date
+        if (Test-Path $StopFile) { $killed = "stop" } elseif ($now -ge $script:Deadline.AddMinutes($GraceMinutes)) { $killed = "deadline" }
         if ($killed) { & taskkill /PID $p.Id /T /F 2>&1 | Out-Null; break }
+        if ($now -ge $script:Deadline -and -not (Test-Path $WrapFile)) {
+            [IO.File]::WriteAllText($WrapFile, "止める時刻を過ぎました。区切りのいい所まで終えてコミットしてください。`n", $Utf8)
+            Set-Status @{ state = "wrapping"; message = ("止める時刻を過ぎたので、区切りのいい所で終えてもらっています（遅くとも {0}）" -f $script:Deadline.AddMinutes($GraceMinutes).ToString("HH:mm")) }
+            Log "iteration $($script:Iter): deadline reached; asked claude to wrap up"
+        }
         Start-Sleep -Seconds 10
     }
+    if (Test-Path $WrapFile) { Remove-Item $WrapFile }
     $p.WaitForExit()
 
     # Claude の最後の報告
@@ -328,7 +341,7 @@ if ($Until) {
     $script:Deadline = $now.AddHours($Hours)
 }
 Save-Json $LockFile @{ pid = $PID; started = (Get-Date -Format s) }
-if (Test-Path $StopFile) { Remove-Item $StopFile }
+foreach ($f in @($StopFile, $WrapFile)) { if (Test-Path $f) { Remove-Item $f } }
 $script:Status = [ordered]@{
     state = "starting"; mode = $Mode; pid = $PID; started = (Get-Date -Format s); deadline = $script:Deadline.ToString("s")
     iteration = 0; task = ""; message = ""; log = ""; pr_url = ""; updated = ""
@@ -350,7 +363,7 @@ try {
     $script:Iter = 0; $idle = 0; $errors = 0
     while ($true) {
         if (Test-Path $StopFile) { Log "stop requested"; break }
-        if ((Get-Date) -ge $script:Deadline.AddMinutes(-15)) { Log "less than 15 minutes left"; break }
+        if ($script:Iter -gt 0 -and (Get-Date) -ge $script:Deadline.AddMinutes(-30)) { Log "less than 30 minutes left"; break }
         $script:Iter++
         $info = Invoke-Iteration
         if ($info.killed) { break }

@@ -47,6 +47,8 @@
       "Bash(awk:*)",
       "Bash(echo:*)",
       "Bash(pwd)",
+      "Bash(date:*)",
+      "Bash(date)",
       "Bash(which:*)",
       "Bash(time:*)",
       "Bash(ffprobe:*)",

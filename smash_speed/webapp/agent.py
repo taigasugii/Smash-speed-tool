@@ -102,7 +102,7 @@ def status() -> dict[str, Any]:
     st = d / ".agent"
     s = _read_json(st / "status.json") or {}
     running = alive((_read_json(st / "lock.json") or {}).get("pid"))
-    if s.get("state") in ("running", "gate", "waiting_limit", "starting") and not running:
+    if s.get("state") in ("running", "gate", "waiting_limit", "starting", "wrapping") and not running:
         s["state"] = "stopped"                      # 途中で PC が止まった・プロセスが落ちた
     hist = []
     try:
