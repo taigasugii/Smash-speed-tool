@@ -13,6 +13,7 @@
 - ``detections.csv``：全コマのシャトルの検出（GUI で場面に軌道を重ねる・解析し直すのに使う）
 - ``shot_list.json``：動画・キャリブレーション・打球の見つけ方・種類ごとの本数と速さなど（GUI が読む）
 - ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
+- ``report.html``：統計をまとめた 1 枚のページ（``rally_report``。スマホでも見られる）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -37,6 +38,7 @@ from smash_speed.errors import AnalysisError
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
 from smash_speed.rallies import RallyOptions, split_rallies
+from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.shot_fit import fit_shots, shot_fits_to_shots
@@ -318,6 +320,14 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
     return classify_shots(shots, phys)
 
 
+def recorded_at(meta: VideoMeta) -> str | None:
+    """動画を撮った日時（ISO 8601。動画のタグ ``creation_time`` など。なければ None）。日付ごとの記録（``history``）に使う。"""
+    for k in ("com.apple.quicktime.creationdate", "creation_time"):
+        if meta.tags.get(k):
+            return str(meta.tags[k])
+    return None
+
+
 def summarize(shots: list[Shot]) -> dict[str, Any]:
     """種類ごとの本数・平均と最高の初速 [km/h]。"""
     out: dict[str, Any] = {}
@@ -376,7 +386,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     info = {
         "video": str(Path(o.video).resolve()), "calib": str(Path(o.calib).resolve()),
         "capture_fps": o.capture_fps, "fps": meta.capture_fps, "width": meta.width, "height": meta.height,
-        "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi,
+        "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi, "recorded_at": recorded_at(meta),
         "audio": str(Path(o.audio).resolve()) if o.audio else None,
         "used_audio": onsets is not None, "n_onsets": None if onsets is None else len(onsets),
         "n_frames": len(det), "n_visible": n_vis,
@@ -390,6 +400,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     }
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     write_stats(out, shots, rallies, cfg.get("court"))
+    write_report(out, cfg.get("court"), shots, rallies)
     progress(f"[進行] 完了：{len(shots)} 本（{len(rallies)} ラリー）、{info['elapsed_s']:.0f} 秒")
     return info
 

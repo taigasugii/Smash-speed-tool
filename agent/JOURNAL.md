@@ -14,6 +14,26 @@
 
 ---
 
+## 2026-10-28 16:55 C3 1 本の動画のレポート（済み。クラウドのセッション）
+- やったこと：
+  - `smash_speed/rally_report.py`：`build_report`・`write_report`（`report.html`）、`python -m smash_speed.rally_report <出力先>`。
+    1 つのファイルで完結する HTML（外のファイル・ネットを使わない）。上から、動画の名前・撮った日時・区間、大きな数字 4 つ、
+    種類の割合（横の棒）、種類ごとの初速（棒と表、打った側ごとの表は畳む）、ラリーの長さの分布、着地点の分布図（種類ごと）、
+    速いショット 10 本、ラリーの一覧。明るい・暗い画面の色、印刷用の見た目（PDF はブラウザの印刷から）。
+  - 棒は HTML で描いた（SVG だとスマホの幅で文字が小さくなりすぎた）。着地点の図は種類ごとに 1 面ずつにして、画面の幅で並べ方が変わる。
+  - 打った側は「h の側・o の側」と書いた（手前・奥はカメラの位置で変わるため）。
+  - `shot_list.analyze_video` の最後に `report.html` を書く。`shot_list.json` に撮った日時 `recorded_at`
+    （動画のタグ `com.apple.quicktime.creationdate`・`creation_time`。C4 の日付に使う）を足した。
+  - テスト `tests/test_rally_report.py`（4 件。タグの釣り合い・外のファイルを読まない・中身）、`test_shot_list.py` に確認を足した。README に節を足した。
+- 結果（数字）：合成のセッション（5 ラリー・36 本）のレポートを Chromium で、スマホの幅（390 px）・明るい画面と、
+  広い幅（760 px）・暗い画面で開いて見た目を確かめた（文字の大きさ・はみ出し・色）。表は横にはみ出す分を横に送れる。
+- 品質チェック：通った（pytest 通過 694 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% /
+  240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、
+  check_shot_types 1.000、実動画は飛ばした）。
+- デスクトップで確かめてほしいこと：実動画のレポートの見た目（Windows の Edge・スマホの Safari / Chrome）、印刷から PDF にしたときの見た目、
+  iPhone の動画で `recorded_at` が入るか。GUI からレポートを開くつなぎ（B5c2 のあとに足すとよい）。
+- 次にやること：C4（セッションをまたいだ記録）。
+
 ## 2026-10-28 16:20 C2 ラリーの統計（済み。クラウドのセッション）
 - やったこと：
   - `smash_speed/rally_stats.py`：`rally_stats`（ラリーの本数・秒の平均・中央値・最長、本数の分布、終わり方・得点した側ごとの数、

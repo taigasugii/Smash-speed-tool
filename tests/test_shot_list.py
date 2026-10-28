@@ -235,6 +235,9 @@ def test_analyze_video_writes_the_shot_list(rally_video, tmp_path):
     assert stats["n_shots"] == len(shots) and stats["n_rallies"] == 1
     assert stats["rally_shots"]["max"] == len(shots)
     assert (out / "landing.svg").read_text(encoding="utf-8").startswith("<svg")
+    # 1 枚のレポート（C3）
+    assert "<h2>ラリーの一覧</h2>" in (out / "report.html").read_text(encoding="utf-8")
+    assert "recorded_at" in saved
 
 
 def test_cli_without_audio(rally_video, tmp_path, capsys):
