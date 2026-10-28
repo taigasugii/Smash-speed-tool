@@ -50,6 +50,7 @@ class Hit:
         audio_strength: 打球音の強さ（雑音比。音がなければ 0）
         confidence: 信頼度 0〜1
         t_track: 軌道から求めた時刻 [s]（なければ None）
+        t_audio: 打球音の時刻 [s]（映像の時刻。音が届くまでの遅れを引く前。打球音を使っていなければ None）
     """
 
     t: float
@@ -59,6 +60,7 @@ class Hit:
     audio_strength: float = 0.0
     confidence: float = 0.0
     t_track: float | None = None
+    t_audio: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -303,7 +305,8 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
             used.add(i)
             ta, s = audio[i]
             conf = 0.95 if b.kind in ("track", "track_gap") else 0.8
-            hits.append(Hit(ta, method="audio+track", score=b.score, audio_strength=s, confidence=conf, t_track=b.t))
+            hits.append(Hit(ta, method="audio+track", score=b.score, audio_strength=s, confidence=conf, t_track=b.t,
+                            t_audio=ta))
             continue
         if b.kind == "track_edge":
             continue  # 画面の端から出入りしただけかもしれないので、音で確かめられたときだけ
@@ -330,7 +333,7 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
             if near:
                 b = max(near, key=lambda b: b.score)
                 hits.append(Hit(ta, method="audio+track", score=b.score * weak_scale, audio_strength=s,
-                                confidence=0.8, t_track=b.t))
+                                confidence=0.8, t_track=b.t, t_audio=ta))
                 continue
             # 前後でシャトルが見えていたのに向きが変わっていない → 打球ではない
             seen_before = np.any((t_vis >= ta - quiet_window_s) & (t_vis < ta - 0.02))
@@ -343,7 +346,7 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
                 continue
         if s < min_audio_strength:
             continue
-        hits.append(Hit(ta, method="audio", audio_strength=s, confidence=0.4 if det is not None else 0.6))
+        hits.append(Hit(ta, method="audio", audio_strength=s, confidence=0.4 if det is not None else 0.6, t_audio=ta))
     # 音はシャトルからカメラ（マイク）まで届くのに遅れる（15 m で約 44 ms）。音と軌道の両方がある打球の
     # 時刻の差の中央値を遅れとして、音から決めた時刻から引く
     pairs = [h.t - h.t_track for h in hits if h.method == "audio+track" and h.t_track is not None
@@ -355,7 +358,7 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
                 h.t -= lag
             # 音の時刻が軌道の時刻と合わない（打球の直前の別の音とまとめて拾った、など）なら軌道の時刻にする
             if h.method == "audio+track" and h.score >= 1.0 and abs(h.t - h.t_track) > lag_tol_s:
-                h.t, h.method = h.t_track, "track"
+                h.t, h.method, h.t_audio = h.t_track, "track", None
     hits.sort(key=lambda h: h.t)
     if camera is not None and det is not None:
         assign_sides(hits, det, camera, rally_gap_s)

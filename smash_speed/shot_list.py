@@ -118,6 +118,12 @@ class TrackFilter:
                                       # 軌道を落とす（人の歩き・手足の動き。飛んでいるシャトルは頂点の近くでも 3 m/s 以上）
     margin_m: tuple[float, float] = (2.0, 1.5)  # コートの空間の、長さ方向・幅方向の広げ幅 [m]
     max_height_m: float = 12.0
+    # 残った軌道どうしが同じ時間に重なったら（隣のコートのシャトルなど）、重ならない組で点の数の合計が
+    # 最も多いものを選ぶ（``select_tracks``）
+    max_overlap_s: float = 0.07       # これまでの重なりは、同じシャトルの続きとして許す [s]
+    edge_margin: float = 0.02         # 画面の左右の端とみなす幅 [画像の幅]
+    edge_start_weight: float = 0.5    # 画面の左右の端から始まった軌道の点の重み（ラリーのシャトルは打点か画面の上から
+                                      # 入ってくる。左右の端から入ってくるのは、ほとんど隣のコートのシャトル）
 
 
 def court_depth_range(camera: Camera, uv: np.ndarray, cfg: dict[str, Any], flt: TrackFilter
@@ -154,15 +160,46 @@ def track_table(det: pd.DataFrame, camera: Camera, cfg: dict[str, Any], flt: Tra
             if inside.any():
                 # 隣り合う 2 点のどちらかがコートの空間にあれば、その奥の端までの距離で角速度を速さにする
                 v_max = float(np.nanmedian(step / f * np.fmax(far[1:], far[:-1])))
-        rows.append({"track_id": int(tid), "n": len(t), "duration_s": float(t[-1] - t[0]), "image_speed": speed,
+        u0 = float(uv[0, 0]) / W
+        rows.append({"track_id": int(tid), "n": len(t), "t_start": float(t[0]), "t_end": float(t[-1]),
+                     "duration_s": float(t[-1] - t[0]), "image_speed": speed,
                      "extent": float(np.linalg.norm(uv.max(0) - uv.min(0))) / W, "inside": float(inside.mean()),
-                     "speed_max_mps": v_max})
-    tab = pd.DataFrame(rows, columns=["track_id", "n", "duration_s", "image_speed", "extent", "inside",
-                                      "speed_max_mps"])
+                     "speed_max_mps": v_max, "edge_start": bool(min(u0, 1.0 - u0) < flt.edge_margin)})
+    tab = pd.DataFrame(rows, columns=["track_id", "n", "t_start", "t_end", "duration_s", "image_speed", "extent",
+                                      "inside", "speed_max_mps", "edge_start"])
     tab["keep"] = ((tab.n >= flt.min_points) & (tab.duration_s >= flt.min_duration_s)
                    & (tab.image_speed <= flt.max_image_speed) & (tab.extent >= flt.min_extent)
                    & (tab.inside >= flt.min_inside) & (tab.speed_max_mps >= flt.min_speed_mps))
     return tab
+
+
+def select_tracks(tab: pd.DataFrame, flt: TrackFilter | None = None) -> pd.Series:
+    """``keep`` の軌道から、同じ時間に重ならない組で、点の数（左右の端から始まった軌道は軽くする）の合計が
+    最も多いものを選ぶ（重み付きの区間スケジューリング）。``tab`` と同じ並びの真偽の列を返す。
+
+    確からしさの高い方を 1 コマずつ選ぶと、隣のコートのシャトルの軌道が、打球の前後のラリーのシャトルの点を
+    数コマだけ奪い、打球の時刻と打った側を間違える（IMG_4397 の 82.1・94.9 s のスマッシュ）。
+    """
+    flt = flt or TrackFilter()
+    out = pd.Series(False, index=tab.index)
+    k = tab[tab.keep].sort_values(["t_end", "t_start"], kind="stable")
+    if k.empty:
+        return out
+    t0, t1 = k.t_start.to_numpy(float), k.t_end.to_numpy(float)
+    w = k.n.to_numpy(float) * np.where(k.edge_start.to_numpy(bool), flt.edge_start_weight, 1.0)
+    # prev[j]：j の前に置ける（終わりが j の始まり + 許す重なり 以下の）最後の軌道の番号 + 1
+    prev = np.searchsorted(t1, t0 + flt.max_overlap_s + 1e-9, side="right")
+    best = np.zeros(len(k) + 1)
+    for j in range(len(k)):
+        best[j + 1] = max(best[j], w[j] + best[min(prev[j], j)])
+    j = len(k)
+    while j > 0:
+        if best[j] == best[j - 1]:
+            j -= 1
+            continue
+        out[k.index[j - 1]] = True
+        j = min(prev[j - 1], j - 1)
+    return out
 
 
 def one_per_frame(det: pd.DataFrame, keep: pd.Series | None = None) -> pd.DataFrame:
@@ -182,13 +219,15 @@ def one_per_frame(det: pd.DataFrame, keep: pd.Series | None = None) -> pd.DataFr
 
 def shuttle_tracks(det: pd.DataFrame, camera: Camera, cfg: dict[str, Any], flt: TrackFilter | None = None
                    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """重なった軌道を含む検出から、シャトルらしい軌道だけを残して 1 コマ 1 点にする。
+    """重なった軌道を含む検出から、シャトルらしい軌道だけを残し（``track_table``）、同じ時間に重なったものから
+    選んで（``select_tracks``）1 コマ 1 点にする。
 
     Returns:
-        (絞り込んだ検出, ``track_table`` の表)
+        (絞り込んだ検出, ``track_table`` の表。列 ``selected`` は選んだ軌道)
     """
     tab = track_table(det, camera, cfg, flt)
-    return one_per_frame(det, det.track_id.isin(tab.track_id[tab.keep])), tab
+    tab["selected"] = select_tracks(tab, flt)
+    return one_per_frame(det, det.track_id.isin(tab.track_id[tab.selected])), tab
 
 
 def hit_onsets(meta: VideoMeta, cfg: dict[str, Any], out_dir: Path, audio: Path | None = None,
@@ -250,7 +289,8 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
             hi = min(hi, hits[groups[g + 1][0]].t - 0.05)
         part = det[(vis_t >= lo) & (vis_t <= hi)]
         fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
-                         max_rms_px=max_rms_frac * camera.width)
+                         max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
+                         speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0))
         rally_shots = shot_fits_to_shots(fits, phys, source="shot_list")
         for s, h, sf in zip(rally_shots, hs, fits):
             # ありえない速さ・画像の上で軌道が検出と合わない（別の物の検出が混ざった軌道など）ものは、
@@ -310,7 +350,8 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     tracks = None
     if o.filter_tracks:
         det, tracks = shuttle_tracks(det, camera, cfg)
-        progress(f"[進行] シャトルらしい軌道 {int(tracks.keep.sum())} / {len(tracks)} 本")
+        progress(f"[進行] シャトルらしい軌道 {int(tracks.selected.sum())} / {len(tracks)} 本"
+                 f"（重なりを除く前 {int(tracks.keep.sum())} 本）")
     else:
         det = one_per_frame(det)
     det.to_csv(out / DETECTIONS_FILE, index=False)
@@ -337,6 +378,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "n_frames": len(det), "n_visible": n_vis,
         "n_tracks": None if tracks is None else len(tracks),
         "n_tracks_kept": None if tracks is None else int(tracks.keep.sum()),
+        "n_tracks_selected": None if tracks is None else int(tracks.selected.sum()),
         "n_hits": len(hits), "n_rallies": len(rallies),
         "hit_methods": pd.Series([h.method for h in hits], dtype=object).value_counts().to_dict(),
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),

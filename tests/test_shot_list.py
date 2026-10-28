@@ -11,7 +11,7 @@ from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import PhysicsParams
 from smash_speed.shot_list import (DETECTIONS_FILE, SHOT_LIST_FILE, ShotListOptions, TrackFilter, analyze_hits,
                                    analyze_video, court_depth_range, main, one_per_frame, rally_groups,
-                                   shuttle_tracks, summarize, track_table)
+                                   select_tracks, shuttle_tracks, summarize, track_table)
 from smash_speed.shots import RALLIES_FILE, SHOTS_FILE, Shot, read_rallies, read_shots
 from smash_speed.synth_rally import make_rally, observe_rally, rally_camera, render_rally_video
 
@@ -141,6 +141,46 @@ def test_shuttle_tracks_keep_the_rally_and_drop_clutter():
     # 1 コマ 1 点で、シャトルの点はすべて残る（ほかの物の確からしさの方が高くても）
     assert out.frame.is_unique and set(out.track_id[out.visible == 1]) == {0}
     assert int(out.visible.sum()) == len(shuttle)
+
+
+def _tab(rows):
+    """``track_table`` の形の表（track_id, n, t_start, t_end, edge_start。すべて keep）。"""
+    tab = pd.DataFrame(rows, columns=["track_id", "n", "t_start", "t_end", "edge_start"])
+    tab["keep"] = True
+    return tab
+
+
+def test_select_tracks_drops_a_track_overlapping_the_rally():
+    """同じ時間に重なった軌道からは、重ならない組で点の数の合計が多いもの（ラリーの続き）を選ぶ。"""
+    # 0・1 はラリーのシャトル（打球の前と後）。2 は両方に重なる隣のコートのシャトル。3 は少しだけ重なる続き。
+    # 4 はほかと重ならない（短くても残す）
+    tab = _tab([(0, 13, 0.0, 0.40, False), (1, 12, 0.47, 0.83, False), (2, 11, 0.17, 0.53, False),
+                (3, 10, 0.80, 1.10, False), (4, 5, 2.0, 2.15, False)])
+    assert list(select_tracks(tab)) == [True, True, False, True, True]
+    # 画面の左右の端から始まった軌道は軽い（点が多くても、重なったラリーの軌道に負ける）
+    tab = _tab([(0, 9, 0.0, 0.27, False), (1, 12, 0.03, 0.40, True)])
+    assert list(select_tracks(tab)) == [True, False]
+    tab = _tab([(0, 9, 0.0, 0.27, False), (1, 12, 0.03, 0.40, False)])
+    assert list(select_tracks(tab)) == [False, True]
+    # keep でない軌道は選ばない
+    tab.loc[1, "keep"] = False
+    assert list(select_tracks(tab)) == [True, False]
+
+
+def test_shuttle_tracks_skip_a_neighbor_track_with_higher_confidence():
+    """確からしさの高い隣のコートの軌道が打球の所に重なっても、ラリーの軌道の点が 1 コマ 1 点に残る。"""
+    t = np.arange(0, 24) / 30.0
+    before = _track(0, t[:12], CAM.project(np.c_[np.linspace(4, -4, 12), np.zeros(12), np.linspace(5, 2.5, 12)]))
+    after = _track(1, t[13:], CAM.project(np.c_[np.linspace(-4, 3, 11), np.zeros(11), np.linspace(2.5, 0.5, 11)]))
+    W = CAM.width
+    left = CAM.project(np.array([[-6.0, -1.0, 2.0]]))[0]
+    side = _track(2, t[6:18], np.c_[np.linspace(0.005 * W, 0.12 * W, 12), np.full(12, left[1])], conf=0.99)
+    det = pd.concat([before, after, side], ignore_index=True)
+    # 合成のカメラでは画面の端がコートの空間の外なので、その条件は外して選び方だけを確かめる
+    out, tab = shuttle_tracks(det, CAM, CFG, TrackFilter(min_inside=0.0, min_speed_mps=0.0))
+    tab = tab.set_index("track_id")
+    assert tab.keep.all() and bool(tab.loc[2, "edge_start"]) and not tab.loc[2, "selected"]
+    assert set(out.track_id[out.visible == 1]) == {0, 1} and int(out.visible.sum()) == 23
 
 
 def test_one_per_frame_prefers_the_more_confident_track():

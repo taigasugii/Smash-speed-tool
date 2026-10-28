@@ -74,6 +74,12 @@ def test_audio_sets_the_time_and_drops_clicks_without_a_hit(cam, tmp_path):
     # 音が届くまでの遅れ（約 45 ms）を引いて、打った時刻に 10 ms 以内で合う
     assert m["mean_abs_dt_s"] < 0.01
     assert sum(h.method == "audio+track" for h in hits) >= len(segs) - 1
+    # 打球音の時刻（遅れを引く前）は、音を使った打球だけに残る（shot_fit が打点からの距離で遅れを引き直す）
+    for h in hits:
+        if h.method.startswith("audio"):
+            assert h.t_audio is not None and 0.0 < h.t_audio - h.t < 0.1
+        else:
+            assert h.t_audio is None
 
 
 def test_audio_only_without_detections(tmp_path, cam):

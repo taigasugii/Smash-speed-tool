@@ -223,6 +223,35 @@ def refine_hit_times(fits: list[ShotFit], camera: Camera, phys: PhysicsParams, m
     return out
 
 
+def audio_hit_times(fits: list[ShotFit], t_audio: list[float | None], camera: Camera, phys: PhysicsParams,
+                    times: list[float], speed_of_sound_mps: float = 343.0, tol_s: float = 0.004) -> list[float]:
+    """打球音のあるショットの打点の時刻を「打球音の時刻 − 打点からカメラ（マイク）までの距離 ÷ 音速」にする
+    （スマッシュの解析 ``pipeline`` と同じ）。
+
+    ``times``（前後の軌道が交わる時刻）がこれと ``tol_s`` 以内なら ``times`` のまま（当てはめた軌道どうしで
+    矛盾がなく、合成ラリーではこの方が初速が合う）。それより離れていたら、交わる時刻の方が外れている
+    （実動画の 30 fps では、打球の瞬間はラケット・体に隠れ、ぶれて検出が抜けるので、交わりが 5〜11 ms ずれる。
+    打点の位置の 1 m の誤差は音の時刻で 3 ms）。
+
+    打点の位置は、つないだ打点（なければ当てはめた軌道の始まり）。コートから遠すぎる打点（当てはめの失敗）なら
+    ``times`` のまま。
+    """
+    out = list(times)
+    for i, (sf, ta) in enumerate(zip(fits, t_audio)):
+        if ta is None or sf.fit is None:
+            continue
+        p = sf.hit_point
+        if p is None:
+            st = _state_at(sf.fit, sf.t_hit, phys)
+            p = None if st is None else st[0]
+        if p is None or abs(p[0]) > 9.0 or abs(p[1]) > 6.0:
+            continue
+        t = float(ta) - float(np.linalg.norm(camera.center - p)) / speed_of_sound_mps
+        if abs(times[i] - t) > tol_s:
+            out[i] = t
+    return out
+
+
 def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: int) -> list[Any]:
     """``fn(*a)`` を ``args`` の順に計算する。``workers`` が 2 以上なら別々のプロセスで並べて計算する（結果は同じ）。
 
@@ -255,7 +284,9 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               sides: list[str] | None = None, opts: FitOptions | None = None, n_rounds: int = 2,
               min_obs: int = 5, margin_s: float = 0.01, hit_sigma_m: tuple[float, float] = (0.5, 0.5),
               t_last: float | None = None, refine_times: bool = True, workers: int = 1,
-              max_rms_px: float = np.inf) -> list[ShotFit]:
+              max_rms_px: float = np.inf, t_audio: list[float | None] | None = None,
+              speed_of_sound_mps: float = 343.0, max_kmh: float = np.inf,
+              bad_max_nfev_per_param: int = 30) -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -271,6 +302,15 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         max_rms_px: 打点をつないだ後も画像の上のずれ（RMS）がこれを超えるショットは、信頼区間つきの当てはめ直しを
             しない（実動画で、別の物の検出が混ざった飛行。失敗として捨てるので、時間をかけない）[px]
         workers: ショットごとの当てはめ（それぞれの段階の中では互いに関係しない）を、この数のプロセスで並べて動かす
+        t_audio: ショットごとの打球音の時刻（``Hit.t_audio``。音が届くまでの遅れを引く前。なければ None）。
+            あるショットは、打点の時刻を前後の軌道が交わる時刻ではなく、打点からの音の遅れを引いた時刻にする
+            （``audio_hit_times``）
+        speed_of_sound_mps: 音速 [m/s]
+        max_kmh: これより速い初速は、当てはめに失敗したとみなす（``bad_max_nfev_per_param``）[km/h]
+        bad_max_nfev_per_param: ずれが ``max_rms_px`` を超えた・初速が ``max_kmh`` を超えたショットの当てはめ直しの、
+            最適化の評価の回数の上限
+            （パラメータ 1 個あたり。ふつうは 200）。打点をつなぐと救われるショットもあるので飛ばさないが、
+            救われないショットは積分が重く、実動画で 1 本の当てはめ直しに 20〜50 秒かかっていた
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
@@ -300,9 +340,13 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         if f is None:
             fits[i].message = "軌道を当てはめられませんでした"
 
+    t_audio = list(t_audio) if t_audio is not None else [None] * len(t_hits)
     for _ in range(n_rounds):
-        if refine_times:
-            split(refine_hit_times(fits, camera, phys))
+        times = refine_hit_times(fits, camera, phys) if refine_times else [sf.t_hit for sf in fits]
+        if any(t is not None for t in t_audio):
+            times = audio_hit_times(fits, t_audio, camera, phys, times, speed_of_sound_mps)
+        if refine_times or any(t is not None for t in t_audio):
+            split(times)
         pts = joint_hit_points(fits, phys)
         jobs, args = [], []
         for i, sf in enumerate(fits):
@@ -312,7 +356,10 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                 continue
             fo = FitOptions(**{**opts.__dict__, "p0_prior_m": a, "p0_prior_sigma_m": hit_sigma_m,
                                "refine_plane": opts.refine_plane and sf.n_obs > 5,
-                               "init_state": _state_at(sf.fit, sf.t_hit, phys), "ci_method": "none"})
+                               "init_state": _state_at(sf.fit, sf.t_hit, phys), "ci_method": "none",
+                               **({"max_nfev_per_param": bad_max_nfev_per_param}
+                                  if not (sf.fit.rms_px <= max_rms_px and sf.fit.speed0 * MPS_TO_KMH <= max_kmh)
+                                  else {})})
             jobs.append((i, a))
             args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys, fo, None))
         for (i, a), f in zip(jobs, _parallel_map(_try_fit, args, workers)):
@@ -397,19 +444,20 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
         segs = rally.segments
         if hits == "true":
             t_hits, sides, pairs = [s.t_hit for s in segs], [s.side for s in segs], list(range(len(segs)))
+            t_audio = None
         else:
             onsets = None
             if hits == "audio":
                 onsets = [(s.t_hit + float(np.linalg.norm(camera.center - s.p0)) / 343.0, 30.0) for s in segs]
             found = find_hits(det, fps, onsets, camera=camera)
-            t_hits, sides = [h.t for h in found], [h.side for h in found]
+            t_hits, sides, t_audio = [h.t for h in found], [h.side for h in found], [h.t_audio for h in found]
             pairs = [None] * len(found)  # 見つけた打球ごとの正解のショットの番号（50 ms 以内。なければ数えない）
             for i, h in enumerate(found):
                 d = [abs(h.t - s.t_hit) for s in segs]
                 j = int(np.argmin(d))
                 if d[j] <= 0.05 and j not in pairs:
                     pairs[i] = j
-        fits = fit_shots(det, t_hits, camera, phys, sides, opts)
+        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio)
         shots = shot_fits_to_shots(fits, phys) if keep_shots else [None] * len(fits)
         for i, (sf, j) in enumerate(zip(fits, pairs)):
             if j is None:
