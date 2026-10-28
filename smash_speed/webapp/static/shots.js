@@ -78,7 +78,10 @@ App.views.shots = {
         カードを押すと、その種類だけを下の表に出します。</p>
       <div class="row" id="tiles" style="flex-wrap:wrap;gap:10px"></div>
       <div class="callout" style="margin-top:12px">種類は、初速・打ち出しの角度・打った高さ・落ちた所から<b>決まりに沿って</b>分けています。
-        実際の試合の動画ではまだ確かめきれていないので、<b>目安</b>として見てください。</div></div>`);
+        実際の試合の動画ではまだ確かめきれていないので、<b>目安</b>として見てください。</div>
+      <div class="row small" style="margin-top:10px;gap:8px;flex-wrap:wrap"><span class="muted">スマッシュの初速をもっと正確に測るなら、打つ人の足元と落ちた所を確かめてから解析する</span>
+        <button class="btn sm" id="tofast">★ いちばん速いスマッシュ へ</button></div></div>`);
+    $("#tofast", card).onclick = () => go("fastest");
     const tiles = $("#tiles", card);
     for (const [k, v] of Object.entries(by)) {
       const t = h(`<button class="card" style="padding:10px 14px;min-width:130px;text-align:left;cursor:pointer;margin:0;${this.filter === k ? "outline:2px solid var(--primary)" : ""}">
@@ -118,32 +121,37 @@ App.views.shots = {
       const tr = tb.appendChild(h(`<tr class="click"${s.id === this.sel ? ' style="outline:2px solid var(--primary)"' : ""}><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}</td>
         <td>${s.shot_type === "unknown" ? `<span class="muted">${esc(s.label)}</span>` : `<span class="badge info">${esc(s.label)}</span>`}</td>
         <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td></tr>`));
-      tr.onclick = () => { this.sel = s.id; go("shots"); };
+      tr.dataset.id = s.id;
+      // 行を選んだら、画面を作り直さずに詳しい所だけ入れ替えて、そこへ移る
+      tr.onclick = () => {
+        this.sel = s.id;
+        $$("tr.click", tb).forEach((x) => { x.style.outline = +x.dataset.id === s.id ? "2px solid var(--primary)" : ""; });
+        this.renderDetail(host, s, true);
+      };
     }
     el.appendChild(card);
-    if (this.sel != null && shots.some((s) => s.id === this.sel)) this.renderDetail(el, shots.find((s) => s.id === this.sel));
+    const host = el.appendChild(h(`<div></div>`));
+    if (this.sel != null && shots.some((s) => s.id === this.sel)) this.renderDetail(host, shots.find((s) => s.id === this.sel), false);
   },
 
+  leave() { this.unbindKeys(); },
+  unbindKeys() { if (this.keyh) { window.removeEventListener("keydown", this.keyh); this.keyh = null; } },
+
   // ---- 選んだ 1 本の場面と、コートを上から見た軌道（ROADMAP B5c）
-  async renderDetail(el, s) {
+  async renderDetail(host, s, scroll) {
     const v = await api.get(`/api/shot_view?i=${s.id}`);
-    if (!v.ok) return;
+    if (!v.ok || this.sel !== s.id) return;  // 待っている間に別の行が選ばれたら描かない
+    this.unbindKeys();
+    host.innerHTML = "";
     const card = h(`<div class="card"><h2>${fmt(s.t_hit_s, 2)} 秒の${esc(s.label)}${s.speed_kmh != null ? `（${fmt(s.speed_kmh, 0)} km/h）` : ""}</h2>
-      <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">●</span> は見つけたシャトル、<span style="color:#2563eb">線</span> は計算した飛び方です。
+      <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">○</span> は見つけたシャトル（<span style="color:#ea580c">●</span> がこのコマ）、<span style="color:#2563eb">線</span> は計算した飛び方
+        （<span style="color:#2563eb">●</span> がこのコマの時刻の位置）です。下のボタンか、キーボードの ← → でコマを前後に送れます。
         右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所です。
         ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}</p>
       <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
-        <div id="scene" style="position:relative;flex:2;min-width:320px"></div>
+        <div style="flex:2;min-width:320px"><div id="scene" style="position:relative"></div><div id="step"></div></div>
         <div id="top" style="flex:1;min-width:240px"></div></div></div>`);
-    // 場面：コマの画像に、元の画像の大きさの座標で SVG を重ねる
-    if (v.frame != null && v.image_size) {
-      const [W, H] = v.image_size;
-      const line = v.path_px.filter((p) => p).map((p) => p.join(",")).join(" ");
-      $("#scene", card).innerHTML = `<img src="/api/frame?i=${v.frame}&w=1280" style="width:100%;display:block;border-radius:6px">
-        <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%">
-          ${line ? `<polyline points="${line}" fill="none" stroke="#2563eb" stroke-width="${W / 300}" opacity=".9"/>` : ""}
-          ${v.detections.map(([, x, y]) => `<circle cx="${x}" cy="${y}" r="${W / 250}" fill="none" stroke="#ea580c" stroke-width="${W / 600}"/>`).join("")}</svg>`;
-    }
+    if (v.frame != null && v.image_size) this.renderScene(card, v, s);
     // 上から見た図：コートの座標 [m]（x が長い方向）。少し余白をとる
     const xs = v.court.flat().map((p) => Math.abs(p[0])), ys = v.court.flat().map((p) => Math.abs(p[1]));
     const X = Math.max(...xs) + 0.6, Y = Math.max(...ys) + 0.6, sw = 0.05;
@@ -155,6 +163,70 @@ App.views.shots = {
       ${v.hit ? `<circle cx="${v.hit[0]}" cy="${-v.hit[1]}" r="0.18" fill="#16a34a"/>` : ""}
       ${v.land ? `<path d="M${v.land[0] - 0.18},${-v.land[1] - 0.18}l0.36,0.36m0,-0.36l-0.36,0.36" stroke="#dc2626" stroke-width="${sw * 1.6}"/>` : ""}</svg>
       ${v.hit ? `<p class="small muted" style="margin:6px 0 0">打った高さ ${fmt(v.hit[2], 2)} m${v.land ? `・ネットから落ちた所まで ${fmt(Math.abs(v.land[0]), 1)} m` : ""}</p>` : ""}`;
-    el.appendChild(card);
+    host.appendChild(card);
+    if (scroll) card.scrollIntoView({ behavior: "smooth", block: "start" });
+  },
+
+  // 場面：コマの画像に、元の画像の大きさの座標で SVG を重ねる。コマは前後に送れる
+  renderScene(card, v, s) {
+    const [W, H] = v.image_size;
+    const frames = v.frames && v.frames.length ? v.frames : [[v.frame, null, null, null]];
+    let k = Math.max(0, frames.findIndex((f) => f[0] === v.frame));
+    const line = v.path_px.filter((p) => p).map((p) => p.join(",")).join(" ");
+    const scene = $("#scene", card);
+    scene.innerHTML = `<img style="width:100%;display:block;border-radius:6px;background:#0f172a;aspect-ratio:${W}/${H}">
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%">
+        ${line ? `<polyline points="${line}" fill="none" stroke="#2563eb" stroke-width="${W / 300}" opacity=".9"/>` : ""}
+        ${v.detections.map(([, x, y]) => `<circle cx="${x}" cy="${y}" r="${W / 250}" fill="none" stroke="#ea580c" stroke-width="${W / 600}"/>`).join("")}
+        <circle id="now-det" r="${W / 200}" fill="#ea580c" stroke="#fff" stroke-width="${W / 800}" class="hidden"/>
+        <circle id="now-fit" r="${W / 260}" fill="#2563eb" stroke="#fff" stroke-width="${W / 800}" class="hidden"/></svg>`;
+    const step = $("#step", card);
+    step.innerHTML = `<div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn sm" id="prev">◀ 前のコマ</button><button class="btn sm" id="next">次のコマ ▶</button>
+        <button class="btn sm ghost" id="hit">打った瞬間へ</button>
+        <input type="range" id="sl" min="0" max="${frames.length - 1}" value="${k}" style="flex:1;min-width:120px">
+        <span class="small muted" id="when" style="min-width:150px"></span></div>`;
+    const img = $("img", scene), sl = $("#sl", step);
+    // 計算した飛び方の、その時刻の画像の上の位置（path_t の間を直線でつなぐ）
+    const fitAt = (t) => {
+      const T = v.path_t || [];
+      if (t == null || T.length < 2 || t < T[0] || t > T[T.length - 1]) return null;
+      let j = 1;
+      while (j < T.length - 1 && T[j] < t) j++;
+      const a = v.path_px[j - 1], b = v.path_px[j];
+      if (!a || !b) return null;
+      const r = T[j] > T[j - 1] ? (t - T[j - 1]) / (T[j] - T[j - 1]) : 0;
+      return [a[0] + r * (b[0] - a[0]), a[1] + r * (b[1] - a[1])];
+    };
+    const put = (el, p) => { el.classList.toggle("hidden", !p); if (p) { el.setAttribute("cx", p[0]); el.setAttribute("cy", p[1]); } };
+    const show = (i) => {
+      k = Math.min(frames.length - 1, Math.max(0, i));
+      const [f, t, x, y] = frames[k];
+      img.src = `/api/frame?i=${f}&w=1280`;
+      sl.value = k;
+      put($("#now-det", scene), x != null ? [x, y] : null);
+      put($("#now-fit", scene), fitAt(t));
+      const dt = t != null ? t - s.t_hit_s : null;
+      $("#when", step).textContent = t == null ? `コマ ${f}`
+        : `${fmt(t, 2)} 秒（${dt < -0.0005 ? `打つ ${fmt(-dt, 2)} 秒前` : `打ってから ${fmt(dt, 2)} 秒`}）${x == null ? "・シャトルは見つからず" : ""}`;
+      $("#prev", step).disabled = k === 0;
+      $("#next", step).disabled = k === frames.length - 1;
+    };
+    $("#prev", step).onclick = () => show(k - 1);
+    $("#next", step).onclick = () => show(k + 1);
+    sl.oninput = () => show(+sl.value);
+    $("#hit", step).onclick = () => {
+      let best = 0;
+      frames.forEach((f, i) => { if (f[1] != null && Math.abs(f[1] - s.t_hit_s) < Math.abs((frames[best][1] ?? 1e9) - s.t_hit_s)) best = i; });
+      show(best);
+    };
+    this.keyh = (e) => {
+      // 入力欄（スライダーも）の上では、その欄の動きに任せる
+      if (!scene.isConnected || ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) return;
+      if (e.key === "ArrowLeft") { show(k - 1); e.preventDefault(); }
+      if (e.key === "ArrowRight") { show(k + 1); e.preventDefault(); }
+    };
+    window.addEventListener("keydown", this.keyh);
+    show(k);
   },
 };

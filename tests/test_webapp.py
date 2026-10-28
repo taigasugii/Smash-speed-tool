@@ -182,9 +182,16 @@ def test_shot_list_flow(client, tmp_path):
         v = client.get("/api/shot_view", query_string={"i": k}).get_json()
         assert v["ok"] and v["court"] and v["image_size"]
         assert v["t_hit_s"] < v["t_end_s"] and v["frame"] >= 0
+        # 場面を前後に送れるコマ（B5c2）：打つ少し前から次の打球まで、時刻の順。見えたコマは検出と同じ点
+        fr = v["frames"]
+        assert v["frame"] in [f[0] for f in fr] and np.all(np.diff([f[1] for f in fr]) > 0)
+        assert fr[0][1] < v["t_hit_s"] and fr[0][1] >= v["t_hit_s"] - 0.2 - 1e-6 and fr[-1][1] <= v["t_end_s"] + 0.05 + 1e-6
+        seen = {f[1]: (f[2], f[3]) for f in fr if f[2] is not None}
+        assert all(seen[t] == (x, y) for t, x, y in v["detections"])
         if s["speed_kmh"] is None:
             continue
-        assert v["path"][0] == pytest.approx(v["hit"], abs=1e-3) and len(v["path"]) == len(v["path_px"])
+        assert v["path"][0] == pytest.approx(v["hit"], abs=1e-3) and len(v["path"]) == len(v["path_px"]) == len(v["path_t"])
+        assert v["path_t"][0] == pytest.approx(v["t_hit_s"], abs=1e-3) and np.all(np.diff(v["path_t"]) >= 0)
         if k + 1 < len(g["shots"]):
             assert v["t_end_s"] <= g["shots"][k + 1]["t_hit_s"] + 1e-6
         assert len(v["detections"]) >= 3
