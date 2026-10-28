@@ -60,11 +60,13 @@
    - 「スリープを解除して実行」と「開始時刻を過ぎていたらすぐ実行」をオンにする。
    - すでに動いているときは、新しく起動しない。
 
-   それぞれの起動の時刻と操作は次のとおり。
+   それぞれの起動の時刻と操作は次のとおり。プログラムは `conhost.exe`、引数はその後ろの部分にする。
+   `powershell.exe` を直接起動すると、`-WindowStyle Hidden` でも画面が一瞬出て消える（Windows 11 では Windows ターミナルが開くため）。
+   `conhost.exe --headless` を通すと、画面を作らずに動く。
    - 毎日 0:00（実行時間の上限 14 時間）
-     `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\Public\Claude\smash-speed-agent\agent\run.ps1" -Until 12:00`
+     `conhost.exe --headless powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\Public\Claude\smash-speed-agent\agent\run.ps1" -Until 12:00`
    - 5 分おき（上限 5 時間）
-     `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\Public\Claude\smash-speed-agent\agent\run.ps1" -OnRequest`
+     `conhost.exe --headless powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\Public\Claude\smash-speed-agent\agent\run.ps1" -OnRequest`
 6. PC は夜もサインインしたままにする（画面のロックは構わない）。スリープさせる場合は、電源オプションで「スリープ解除タイマーの許可」を有効にする。動いている間は `run.ps1` がスリープを止める。
 7. GUI（`smash-speed-remote.bat`）を起動し直すと、メニューに「開発エージェント」が出る。
 
