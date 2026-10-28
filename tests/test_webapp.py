@@ -176,6 +176,21 @@ def test_shot_list_flow(client, tmp_path):
         if t.shot_type != "serve":
             assert s["speed_kmh"] == pytest.approx(t.speed_kmh, rel=0.12)
     assert client.get("/file", query_string={"path": g["files"]["shots"]}).status_code == 200
+    # 1 本の場面と軌道（B5c）：軌道は打点から始まり、画像の上の点はシャトルの検出の近くを通る
+    assert not client.get("/api/shot_view", query_string={"i": 99}).get_json()["ok"]
+    for k, s in enumerate(g["shots"]):
+        v = client.get("/api/shot_view", query_string={"i": k}).get_json()
+        assert v["ok"] and v["court"] and v["image_size"]
+        assert v["t_hit_s"] < v["t_end_s"] and v["frame"] >= 0
+        if s["speed_kmh"] is None:
+            continue
+        assert v["path"][0] == pytest.approx(v["hit"], abs=1e-3) and len(v["path"]) == len(v["path_px"])
+        if k + 1 < len(g["shots"]):
+            assert v["t_end_s"] <= g["shots"][k + 1]["t_hit_s"] + 1e-6
+        assert len(v["detections"]) >= 3
+        px = np.array([p for p in v["path_px"] if p is not None])
+        near = [np.min(np.hypot(px[:, 0] - x, px[:, 1] - y)) for _, x, y in v["detections"]]
+        assert np.median(near) < 15
     # 区間を決めて解析し直す（最初の 2 本の後から）
     t0 = (truth[1].t_hit_s + truth[2].t_hit_s) / 2
     r = client.post("/api/run/shots", json={"start": t0, "end": 100.0}).get_json()

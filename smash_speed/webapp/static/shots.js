@@ -115,10 +115,46 @@ App.views.shots = {
       const c = s.speed_kmh == null ? null : s.confidence;  // 初速が出なかったショットの確かさは出さない
       const conf = c == null ? '<span class="badge">—</span>' : c >= 0.7 ? '<span class="badge ok">高い</span>' : c >= 0.4 ? '<span class="badge warn">ふつう</span>' : '<span class="badge bad">低い</span>';
       const rally = s.rally_id != null ? `${s.rally_id}${s.index_in_rally != null ? `<span class="muted small">（${s.index_in_rally} 本目）</span>` : ""}` : "—";
-      tb.appendChild(h(`<tr><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}</td>
+      const tr = tb.appendChild(h(`<tr class="click"${s.id === this.sel ? ' style="outline:2px solid var(--primary)"' : ""}><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}</td>
         <td>${s.shot_type === "unknown" ? `<span class="muted">${esc(s.label)}</span>` : `<span class="badge info">${esc(s.label)}</span>`}</td>
         <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td></tr>`));
+      tr.onclick = () => { this.sel = s.id; go("shots"); };
     }
+    el.appendChild(card);
+    if (this.sel != null && shots.some((s) => s.id === this.sel)) this.renderDetail(el, shots.find((s) => s.id === this.sel));
+  },
+
+  // ---- 選んだ 1 本の場面と、コートを上から見た軌道（ROADMAP B5c）
+  async renderDetail(el, s) {
+    const v = await api.get(`/api/shot_view?i=${s.id}`);
+    if (!v.ok) return;
+    const card = h(`<div class="card"><h2>${fmt(s.t_hit_s, 2)} 秒の${esc(s.label)}${s.speed_kmh != null ? `（${fmt(s.speed_kmh, 0)} km/h）` : ""}</h2>
+      <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">●</span> は見つけたシャトル、<span style="color:#2563eb">線</span> は計算した飛び方です。
+        右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所です。
+        ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}</p>
+      <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
+        <div id="scene" style="position:relative;flex:2;min-width:320px"></div>
+        <div id="top" style="flex:1;min-width:240px"></div></div></div>`);
+    // 場面：コマの画像に、元の画像の大きさの座標で SVG を重ねる
+    if (v.frame != null && v.image_size) {
+      const [W, H] = v.image_size;
+      const line = v.path_px.filter((p) => p).map((p) => p.join(",")).join(" ");
+      $("#scene", card).innerHTML = `<img src="/api/frame?i=${v.frame}&w=1280" style="width:100%;display:block;border-radius:6px">
+        <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%">
+          ${line ? `<polyline points="${line}" fill="none" stroke="#2563eb" stroke-width="${W / 300}" opacity=".9"/>` : ""}
+          ${v.detections.map(([, x, y]) => `<circle cx="${x}" cy="${y}" r="${W / 250}" fill="none" stroke="#ea580c" stroke-width="${W / 600}"/>`).join("")}</svg>`;
+    }
+    // 上から見た図：コートの座標 [m]（x が長い方向）。少し余白をとる
+    const xs = v.court.flat().map((p) => Math.abs(p[0])), ys = v.court.flat().map((p) => Math.abs(p[1]));
+    const X = Math.max(...xs) + 0.6, Y = Math.max(...ys) + 0.6, sw = 0.05;
+    const pathTop = v.path.map((p) => `${p[0]},${-p[1]}`).join(" ");
+    $("#top", card).innerHTML = `<svg viewBox="${-X} ${-Y} ${2 * X} ${2 * Y}" style="width:100%;background:#e8f3ea;border-radius:6px">
+      ${v.court.map(([a, b]) => `<line x1="${a[0]}" y1="${-a[1]}" x2="${b[0]}" y2="${-b[1]}" stroke="#fff" stroke-width="${sw}"/>`).join("")}
+      <line x1="0" y1="${-Y + 0.3}" x2="0" y2="${Y - 0.3}" stroke="#334155" stroke-width="${sw * 1.5}" stroke-dasharray="0.15 0.1"/>
+      ${pathTop ? `<polyline points="${pathTop}" fill="none" stroke="#2563eb" stroke-width="${sw * 1.6}"/>` : ""}
+      ${v.hit ? `<circle cx="${v.hit[0]}" cy="${-v.hit[1]}" r="0.18" fill="#16a34a"/>` : ""}
+      ${v.land ? `<path d="M${v.land[0] - 0.18},${-v.land[1] - 0.18}l0.36,0.36m0,-0.36l-0.36,0.36" stroke="#dc2626" stroke-width="${sw * 1.6}"/>` : ""}</svg>
+      ${v.hit ? `<p class="small muted" style="margin:6px 0 0">打った高さ ${fmt(v.hit[2], 2)} m${v.land ? `・ネットから落ちた所まで ${fmt(Math.abs(v.land[0]), 1)} m` : ""}</p>` : ""}`;
     el.appendChild(card);
   },
 };
