@@ -14,6 +14,25 @@
 
 ---
 
+## 2026-10-28 17:30 C4 セッションをまたいだ記録（済み。C 章はこれで終わり。クラウドのセッション）
+- やったこと：
+  - `smash_speed/history.py`：`find_sessions`（出力の場所の下の `shot_list.json`＋`shots.csv` をすべて集める。スマッシュの一括解析の出力先は入れない）、
+    撮った日（`recorded_at` → 動画のファイルの更新日時 → `shot_list.json` の更新日時）ごとにまとめる `history_rows`、
+    `history.csv`（1 行 1 日：動画・ショット・ラリーの数、スマッシュの本数と平均・最高、全体の最高とその種類、ラリーの平均の長さ、種類ごとの割合）、
+    `history.html`（スマッシュの初速の最高・平均の折れ線、日ごとの種類の割合の積み上げの棒、日ごとの表）、`python -m smash_speed.history <出力の場所>`。
+  - 折れ線はスマホの幅では狭い図を別に作って切り替える（文字が小さくなりすぎないように）。種類の色はいつも同じ順（分類の色 8 つ）で、凡例つき。
+  - テスト `tests/test_history.py`（6 件）。README に節を足した。ROADMAP の C 章の注記を消した。
+  - 提案（ROADMAP の下）：GUI からレポート・記録を開く（B5c2 の後）、区切りに選手の動きを足す（D1・D2 の後）、合成ラリーに外・ネットで終わるラリーを足す。
+  - 質問（QUESTIONS）：入・出をシングルス・ダブルスのどちらの線で決めるか。
+- 結果（数字）：作った 9 日分のデータで、日ごとの数字が `shots.csv` から計算した値と合う（テスト）。ページは Chromium で広い幅・明るい画面と、
+  スマホの幅・暗い画面で見た目を確かめた。
+- 品質チェック：通った（pytest 通過 717 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% /
+  240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、
+  check_shot_types 1.000、実動画は飛ばした）。
+- デスクトップで確かめてほしいこと：実際の出力の場所（`outputs`）で `python -m smash_speed.history outputs` を動かし、日付の分け方が合うか
+  （前に解析した出力先には `recorded_at` がなく、動画のファイルの日時になる）。
+- 次にやること：C 章は終わり。上の提案（GUI からレポート・記録を開く）は B5c2 の後。
+
 ## 2026-10-28 16:55 C3 1 本の動画のレポート（済み。クラウドのセッション）
 - やったこと：
   - `smash_speed/rally_report.py`：`build_report`・`write_report`（`report.html`）、`python -m smash_speed.rally_report <出力先>`。
