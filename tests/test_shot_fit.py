@@ -100,3 +100,19 @@ def test_split_observations_and_too_few_frames(cam):
     fits = fit_shots(det, [0.0, 0.95], cam, PHYS, min_obs=5, n_rounds=0, opts=FitOptions(ci_method="none"))
     assert fits[1].fit is None and "コマ" in fits[1].message
     assert shot_fits_to_shots(fits[1:], PHYS)[0].speed_kmh is None
+
+
+def test_parallel_fits_give_the_same_result(cam):
+    """ショットごとの当てはめを別々のプロセスで並べても、1 つずつ計算したときと同じ結果になる。"""
+    rally = make_rally(np.random.default_rng(4), PHYS, n_shots=3)
+    det = observe_rally(rally, cam, 30.0, PHYS, np.random.default_rng(0))
+    t_hits = [s.t_hit for s in rally.segments]
+    sides = [s.side for s in rally.segments]
+    opts = FitOptions(refine_plane=True)
+    one = fit_shots(det, t_hits, cam, PHYS, sides, opts)
+    two = fit_shots(det, t_hits, cam, PHYS, sides, opts, workers=2)
+    assert [f.speed_kmh for f in two] == [f.speed_kmh for f in one]
+    assert all(f.fit is not None and f.fit.speed0_ci is not None for f in two)
+    # 打点をつないだ後もずれが大きいショットは、信頼区間つきの当てはめ直しをしない
+    loose = fit_shots(det, t_hits, cam, PHYS, sides, opts, max_rms_px=0.0)
+    assert all(f.fit is not None and f.fit.speed0_ci is None for f in loose)

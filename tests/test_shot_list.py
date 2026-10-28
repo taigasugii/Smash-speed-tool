@@ -9,8 +9,9 @@ import pytest
 from smash_speed.config import load_config
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import PhysicsParams
-from smash_speed.shot_list import (DETECTIONS_FILE, SHOT_LIST_FILE, ShotListOptions, analyze_hits, analyze_video,
-                                   main, rally_groups, summarize)
+from smash_speed.shot_list import (DETECTIONS_FILE, SHOT_LIST_FILE, ShotListOptions, TrackFilter, analyze_hits,
+                                   analyze_video, court_depth_range, main, one_per_frame, rally_groups,
+                                   shuttle_tracks, summarize, track_table)
 from smash_speed.shots import RALLIES_FILE, SHOTS_FILE, Shot, read_rallies, read_shots
 from smash_speed.synth_rally import make_rally, observe_rally, rally_camera, render_rally_video
 
@@ -97,6 +98,64 @@ def test_simulate_skips_absurd_speeds_quickly():
     assert np.isfinite(pos).all()
 
 
+def _track(tid, t, uv, conf=0.9):
+    """検出の行（重なりのある形）。"""
+    return pd.DataFrame({"frame": np.round(t * 30.0).astype(int), "timestamp": t, "x_px": uv[:, 0], "y_px": uv[:, 1],
+                         "visible": 1, "confidence": conf, "track_id": tid})
+
+
+def test_court_depth_range_finds_points_in_the_court_space():
+    flt = TrackFilter()
+    inside = CAM.project(np.array([[0.0, 0.0, 2.0], [-6.0, 2.5, 0.5], [5.0, -2.0, 8.0]]))
+    lo, hi = court_depth_range(CAM, inside, CFG, flt)
+    assert (hi > lo).all() and (lo >= 0).all()
+    # 高さ 40 m の点の視線は、コートの空間（高さ 12 m まで）の上を通る
+    lo, hi = court_depth_range(CAM, CAM.project(np.array([[0.0, 0.0, 40.0]])), CFG, flt)
+    assert not (hi > lo).any()
+
+
+def test_shuttle_tracks_keep_the_rally_and_drop_clutter():
+    """合成ラリーのシャトルは全部残り、止まった物・飛び移る軌道・ゆっくり歩く人・コートの空間の外は落ちる。"""
+    rally = make_rally(np.random.default_rng(3), PHYS, n_shots=6, t_start=0.5)
+    obs = observe_rally(rally, CAM, 30.0, PHYS, np.random.default_rng(1))
+    obs = obs[obs.visible == 1]
+    shuttle = _track(0, obs.timestamp.to_numpy(), obs[["x_px", "y_px"]].to_numpy(), conf=0.8)
+    shuttle["frame"] = obs.frame.to_numpy()
+    t = np.arange(30, 90) / 30.0
+    rng = np.random.default_rng(0)
+    floor = CAM.project(np.array([[2.0, 1.0, 1.0]]))[0]
+    still = _track(1, t, floor + rng.normal(0, 1.0, (len(t), 2)), conf=0.99)
+    jump = _track(2, t[:8], np.where(np.arange(8)[:, None] % 2 == 0, floor, floor + [CAM.width * 0.4, 0]), conf=0.99)
+    walk = _track(3, t, CAM.project(np.c_[np.linspace(-3, -2, len(t)), np.zeros(len(t)), np.full(len(t), 1.2)]),
+                  conf=0.99)
+    sky = _track(4, t, CAM.project(np.c_[np.linspace(-10, 10, len(t)), np.zeros(len(t)), np.full(len(t), 40.0)]),
+                 conf=0.99)
+    for d in (still, jump, walk, sky):
+        d["frame"] = obs.frame.iloc[0] + np.arange(len(d))
+        d["timestamp"] = obs.timestamp.iloc[0] + np.arange(len(d)) / 30.0
+    det = pd.concat([shuttle, still, jump, walk, sky], ignore_index=True)
+    tab = track_table(det, CAM, CFG).set_index("track_id")
+    assert tab.keep.to_dict() == {0: True, 1: False, 2: False, 3: False, 4: False}
+    assert tab.loc[2, "image_speed"] > 1.2 and tab.loc[3, "speed_max_mps"] < 3.0 and tab.loc[4, "inside"] == 0.0
+    out, _ = shuttle_tracks(det, CAM, CFG)
+    # 1 コマ 1 点で、シャトルの点はすべて残る（ほかの物の確からしさの方が高くても）
+    assert out.frame.is_unique and set(out.track_id[out.visible == 1]) == {0}
+    assert int(out.visible.sum()) == len(shuttle)
+
+
+def test_one_per_frame_prefers_the_more_confident_track():
+    t = np.arange(10) / 30.0
+    a = _track(0, t, np.c_[np.arange(10) * 10.0, np.zeros(10)], conf=0.5)
+    b = _track(1, t[5:], np.c_[np.arange(5) * 10.0, np.ones(5)], conf=0.9)
+    out = one_per_frame(pd.concat([a, b], ignore_index=True))
+    assert list(out.track_id) == [0] * 5 + [1] * 5
+    out = one_per_frame(pd.concat([a, b], ignore_index=True), keep=pd.Series([True] * 10 + [False] * 5))
+    assert list(out.track_id) == [0] * 10
+    # 点を使わないコマも、見えないコマとして残る
+    out = one_per_frame(a, keep=pd.Series([True] * 5 + [False] * 5))
+    assert len(out) == 10 and list(out.visible) == [1] * 5 + [0] * 5 and (out.track_id[5:] == -1).all()
+
+
 @pytest.fixture(scope="module")
 def rally_video(tmp_path_factory):
     d = tmp_path_factory.mktemp("rally")
@@ -128,6 +187,8 @@ def test_analyze_video_writes_the_shot_list(rally_video, tmp_path):
     assert saved["used_audio"] and saved["n_hits"] == len(shots) == info["n_hits"]
     assert sum(v["n"] for v in saved["by_type"].values()) == len(shots)
     assert saved["fps"] == pytest.approx(30.0)
+    # 合成の動画にはシャトルしか動く物がないので、軌道は落とされない
+    assert saved["n_tracks_kept"] == saved["n_tracks"] >= 1
     assert any("完了" in m for m in msgs) and any("検出中" in m for m in msgs)
 
 

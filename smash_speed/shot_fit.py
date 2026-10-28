@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -223,10 +223,39 @@ def refine_hit_times(fits: list[ShotFit], camera: Camera, phys: PhysicsParams, m
     return out
 
 
+def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: int) -> list[Any]:
+    """``fn(*a)`` を ``args`` の順に計算する。``workers`` が 2 以上なら別々のプロセスで並べて計算する（結果は同じ）。
+
+    プロセスを起動できなかったとき（Windows で、``if __name__ == "__main__":`` のないスクリプトから呼んだ、など）は
+    1 つずつ計算する。
+    """
+    workers = min(workers, len(args))
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
+
+        try:
+            with ProcessPoolExecutor(workers) as ex:
+                return list(ex.map(fn, *zip(*args)))
+        except (BrokenProcessPool, OSError):
+            pass
+    return [fn(*a) for a in args]
+
+
+def _try_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions,
+             theta0: np.ndarray | None) -> FitResult | None:
+    """plane モードで当てはめる（計算できなければ None）。"""
+    try:
+        return fit_trajectory(obs, t_hit, "plane", plane, phys, opts, theta0=theta0)
+    except (ValueError, RuntimeError):
+        return None
+
+
 def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: PhysicsParams,
               sides: list[str] | None = None, opts: FitOptions | None = None, n_rounds: int = 2,
               min_obs: int = 5, margin_s: float = 0.01, hit_sigma_m: tuple[float, float] = (0.5, 0.5),
-              t_last: float | None = None, refine_times: bool = True) -> list[ShotFit]:
+              t_last: float | None = None, refine_times: bool = True, workers: int = 1,
+              max_rms_px: float = np.inf) -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -239,6 +268,9 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         hit_sigma_m: つないだ打点の位置の不確かさ（水平, 高さ）[m]
         t_last: 最後の飛行の終わり [s]（省略時は最後の検出）
         refine_times: 打点の時刻を、前後の軌道が交わる時刻に直す（``refine_hit_times``）
+        max_rms_px: 打点をつないだ後も画像の上のずれ（RMS）がこれを超えるショットは、信頼区間つきの当てはめ直しを
+            しない（実動画で、別の物の検出が混ざった飛行。失敗として捨てるので、時間をかけない）[px]
+        workers: ショットごとの当てはめ（それぞれの段階の中では互いに関係しない）を、この数のプロセスで並べて動かす
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
@@ -258,18 +290,21 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             sf.t_end = times[i + 1] if i + 1 < len(times) else max(t_last, times[i])
 
     split(t_hits)
-    for i, sf in enumerate(fits):
+    todo = [i for i, sf in enumerate(fits) if sf.n_obs >= min_obs]
+    for sf in fits:
         if sf.n_obs < min_obs:
             sf.message = f"打った後のシャトルが {sf.n_obs} コマしか見えていません"
-            continue
-        sf.fit = initial_fit(sf.obs, sf.t_hit, sides[i], phys, opts)
-        if sf.fit is None:
-            sf.message = "軌道を当てはめられませんでした"
+    first = _parallel_map(initial_fit, [(fits[i].obs, fits[i].t_hit, sides[i], phys, opts) for i in todo], workers)
+    for i, f in zip(todo, first):
+        fits[i].fit = f
+        if f is None:
+            fits[i].message = "軌道を当てはめられませんでした"
 
     for _ in range(n_rounds):
         if refine_times:
             split(refine_hit_times(fits, camera, phys))
         pts = joint_hit_points(fits, phys)
+        jobs, args = [], []
         for i, sf in enumerate(fits):
             a, b = pts[i], pts[i + 1]
             if (sf.fit is None or a is None or b is None or np.linalg.norm((b - a)[:2]) < 0.3
@@ -278,25 +313,25 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             fo = FitOptions(**{**opts.__dict__, "p0_prior_m": a, "p0_prior_sigma_m": hit_sigma_m,
                                "refine_plane": opts.refine_plane and sf.n_obs > 5,
                                "init_state": _state_at(sf.fit, sf.t_hit, phys), "ci_method": "none"})
-            try:
-                f = fit_trajectory(sf.obs, sf.t_hit, "plane", FlightPlane.from_points(a, b), phys, fo)
-            except (ValueError, RuntimeError):
-                continue
-            if f.success and np.isfinite(f.speed0):
-                sf.fit, sf.hit_point = f, a
+            jobs.append((i, a))
+            args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys, fo, None))
+        for (i, a), f in zip(jobs, _parallel_map(_try_fit, args, workers)):
+            if f is not None and f.success and np.isfinite(f.speed0):
+                fits[i].fit, fits[i].hit_point = f, a
 
     # 最後に、平面を決めたまま信頼区間つきで当てはめ直す
-    for sf in fits:
+    jobs, args = [], []
+    for i, sf in enumerate(fits):
         if (sf.fit is None or sf.fit.plane is None or opts.ci_method == "none"
-                or abs(sf.fit.t_ref - sf.t_hit) > 1e-9 or sf.n_obs < min_obs):
+                or abs(sf.fit.t_ref - sf.t_hit) > 1e-9 or sf.n_obs < min_obs or not sf.fit.rms_px <= max_rms_px):
             continue
         fo = FitOptions(**{**opts.__dict__, "p0_prior_m": sf.hit_point, "p0_prior_sigma_m": hit_sigma_m,
                            "refine_plane": False, "init_state": None})
-        try:
-            sf.fit = fit_trajectory(sf.obs, sf.t_hit, "plane", sf.fit.plane, phys, fo,
-                                    theta0=sf.fit.theta[:4] if sf.fit.mode == "plane" else None)
-        except (ValueError, RuntimeError):
-            continue
+        jobs.append(i)
+        args.append((sf.obs, sf.t_hit, sf.fit.plane, phys, fo, sf.fit.theta[:4] if sf.fit.mode == "plane" else None))
+    for i, f in zip(jobs, _parallel_map(_try_fit, args, workers)):
+        if f is not None:
+            fits[i].fit = f
     return fits
 
 
