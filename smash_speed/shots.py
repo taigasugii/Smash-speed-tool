@@ -201,7 +201,8 @@ def shots_of(rally: Rally, shots: Iterable[Shot]) -> list[Shot]:
 def make_rallies(shots: list[Shot], max_gap_s: float = 3.0) -> list[Rally]:
     """打った時刻の間隔が ``max_gap_s`` を超えたら別のラリーとして、ショットにラリーの番号と順番を付ける。
 
-    打球の間隔だけで分ける仮の区切り（ちゃんとした区切りは ROADMAP C1）。得点は分からないので空欄。
+    打球の間隔だけで分ける仮の区切り（着地・シャトルが飛んでいるかも使う区切りは ``rallies.split_rallies``）。
+    得点は分からないので空欄。
     ``shots`` の ``rally_id``・``index_in_rally`` を書き換える。
     """
     rallies: list[Rally] = []

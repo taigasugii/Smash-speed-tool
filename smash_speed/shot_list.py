@@ -2,9 +2,10 @@
 
 1. 動画全体を 1 回だけ縮小して読み、シャトルを検出する（``detection.baseline``。1 コマ 1 点）。
 2. 打球音（音声があれば）と軌道の向きの変化から、すべての打球の時刻と打った側を出す（``hits.find_hits``）。
-3. 打球の間隔でラリーに分け（仮の区切り。本当の区切りは C1）、ラリーごとに軌道と初速を当てはめる
-   （``shot_fit.fit_shots``）。ほかのラリーの検出が混ざらないよう、ラリーの前後で検出を切り分ける。
-4. 軌道から種類を決める（``shot_types.classify_shots``）。
+3. 打球の間隔で組に分け、組ごとに軌道と初速を当てはめる（``shot_fit.fit_shots``）。ほかの組の検出が
+   混ざらないよう、組の前後で検出を切り分ける。
+4. 打球の間隔・シャトルの着地・シャトルが飛んでいるかから、ラリーに区切る（``rallies.split_rallies``）。
+5. 軌道から種類を決める（``shot_types.classify_shots``。ラリーの最初のショットはサーブ）。
 
 結果は ``<出力先>/`` に書き出す。
 
@@ -34,11 +35,12 @@ from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
+from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.repro import run_metadata
 from smash_speed.shot_fit import fit_shots, shot_fits_to_shots
 from smash_speed.shot_types import classify_shots
-from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, make_rallies,
-                               write_rallies, write_shots)
+from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, write_rallies,
+                               write_shots)
 from smash_speed.video_io import VideoMeta, extract_audio, load_wav, probe
 
 SHOT_LIST_FILE = "shot_list.json"
@@ -56,7 +58,7 @@ class ShotListOptions:
     roi: list[float] | None = None    # 検出する範囲 [x0, y0, x1, y1]（元解像度 px）
     audio: Path | None = None         # 別の音声ファイル（動画の時刻と同じ時刻の WAV）
     use_audio: bool = True            # 偽なら打球音を使わない（軌道だけで打球を見つける）
-    rally_gap_s: float = 3.0          # 打球の間がこれより空いたら別のラリー [s]
+    rally_gap_s: float = 3.0          # 打球の間がこれより空き、シャトルが飛んでいなければ別のラリー [s]
     n_tracks: int | None = None       # 検出で残す軌道の数の上限（None なら全部。実動画では 20 秒で 1000 本ほど）
     filter_tracks: bool = True        # シャトルらしい軌道だけを残す（``shuttle_tracks``）
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
@@ -310,7 +312,7 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         shots += rally_shots
         n_ok = sum(s.speed_kmh is not None for s in rally_shots)
         progress(f"[進行] ラリー {g + 1}/{len(groups)}：{len(hs)} 本（速さが出たもの {n_ok} 本）")
-    make_rallies(shots, max_gap_s=rally_gap_s)
+    split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
 
 
@@ -365,7 +367,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     progress(f"[進行] 打球 {len(hits)} 本")
     workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress)
-    rallies = make_rallies(shots, max_gap_s=o.rally_gap_s)
+    rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
     write_rallies(out / RALLIES_FILE, rallies)
 

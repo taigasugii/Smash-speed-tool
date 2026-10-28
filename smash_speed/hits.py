@@ -434,7 +434,8 @@ def _most_likely_sides(votes: list[float], p_alternate: float) -> list[str]:
 def hits_to_shots(hits: list[Hit], rally_gap_s: float = 3.0, source: str = "hits") -> list[Shot]:
     """見つけた打球を ``shots.csv`` の形（``Shot``。種類・初速はまだ分からない）にする。
 
-    ラリーは打球の間隔で仮に分ける（``shots.make_rallies``。本当の区切りは C1）。
+    ラリーは打球の間隔で仮に分ける（``shots.make_rallies``。着地も使う区切りは、軌道を当てはめた後の
+    ``rallies.split_rallies``）。
     """
     shots = [Shot(t_hit_s=h.t, side=h.side, confidence=round(h.confidence, 3), source=source, note=h.method)
              for h in hits]
