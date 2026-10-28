@@ -14,6 +14,24 @@
 
 ---
 
+## 2026-10-28 16:20 C2 ラリーの統計（済み。クラウドのセッション）
+- やったこと：
+  - `smash_speed/rally_stats.py`：`rally_stats`（ラリーの本数・秒の平均・中央値・最長、本数の分布、終わり方・得点した側ごとの数、
+    種類ごとの本数・割合（種類の分かったものの中で）・平均と最高の初速、打った側ごと、着地点の 9 区画（深さ 前・中・後 × 幅 3 つ）の数）、
+    `landing_svg`（種類ごとに 1 面のコートを上から見た図。区画の本数を青の濃さ 4 段で、1 本ずつの着地点を点で。指を乗せると時刻と初速。
+    明るい画面・暗い画面の色を CSS の変数で持つ）、`write_stats`（`stats.json`・`landing.svg`）、
+    `python -m smash_speed.rally_stats <出力先>`。
+  - `shot_list.analyze_video` の最後に `stats.json`・`landing.svg` を書くようにした。
+  - 分布図は、種類が 8 つあり 1 枚の散布図で色分けすると見分けにくいので、種類ごとに小さな図を並べた（色は 1 色）。
+  - テスト `tests/test_rally_stats.py`（10 件）、`test_shot_list.py::test_analyze_video_writes_the_shot_list` に確認を足した。README に節を足した。
+- 結果（数字）：合成のセッション（5 ラリー・36 本）で、本数・割合・速さが正解の `shots.csv` と合う（テスト）。分布図はブラウザ（Chromium）で
+  明るい・暗い画面とも確かめた。解析の中身は変えていないので、初速の数字は前と同じ。
+- 品質チェック：通った（pytest 通過 703 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% /
+  240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、
+  check_shot_types 1.000、実動画は飛ばした）。
+- デスクトップで実動画の確認が要る：実動画の `landing.svg` で、当てはめの外れた着地点（コートの外の遠く）が多すぎないか。
+- 次にやること：C3（1 枚のレポート）。
+
 ## 2026-10-28 15:40 C1 ラリーの区切り（済み。クラウドのセッション）
 - やったこと：
   - `smash_speed/rallies.py`（`split_rallies`・`RallyOptions`）：となり合う 2 本のショットの間ごとに、

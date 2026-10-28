@@ -12,6 +12,7 @@
 - ``shots.csv``・``rallies.csv``：ショットとラリー（``shots`` の形）
 - ``detections.csv``：全コマのシャトルの検出（GUI で場面に軌道を重ねる・解析し直すのに使う）
 - ``shot_list.json``：動画・キャリブレーション・打球の見つけ方・種類ごとの本数と速さなど（GUI が読む）
+- ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -36,6 +37,7 @@ from smash_speed.errors import AnalysisError
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
 from smash_speed.rallies import RallyOptions, split_rallies
+from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.shot_fit import fit_shots, shot_fits_to_shots
 from smash_speed.shot_types import classify_shots
@@ -387,6 +389,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "meta": run_metadata(),
     }
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_stats(out, shots, rallies, cfg.get("court"))
     progress(f"[進行] 完了：{len(shots)} 本（{len(rallies)} ラリー）、{info['elapsed_s']:.0f} 秒")
     return info
 

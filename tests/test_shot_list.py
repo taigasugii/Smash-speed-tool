@@ -230,6 +230,11 @@ def test_analyze_video_writes_the_shot_list(rally_video, tmp_path):
     # 合成の動画にはシャトルしか動く物がないので、軌道は落とされない
     assert saved["n_tracks_kept"] == saved["n_tracks"] >= 1
     assert any("完了" in m for m in msgs) and any("検出中" in m for m in msgs)
+    # ラリーの統計と着地点の分布図（C2）
+    stats = json.loads((out / "stats.json").read_text(encoding="utf-8"))
+    assert stats["n_shots"] == len(shots) and stats["n_rallies"] == 1
+    assert stats["rally_shots"]["max"] == len(shots)
+    assert (out / "landing.svg").read_text(encoding="utf-8").startswith("<svg")
 
 
 def test_cli_without_audio(rally_video, tmp_path, capsys):
