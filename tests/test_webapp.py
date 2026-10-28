@@ -139,3 +139,47 @@ def test_fastest_smash_flow(client, session):
     assert c2["confirmed"] and c2["result"]["kmh"] == pytest.approx(75.0 * 3.6, rel=0.05)
     res = client.get("/api/result", query_string={"dir": c2["result"]["dir"]}).get_json()
     assert res["ok"] and res["row"]["speed_initial_mps"] == pytest.approx(75.0, rel=0.05)
+
+
+def test_shot_list_flow(client, tmp_path):
+    """ショットの一覧：裏で ``shots`` を動かし、種類・初速つきのショットを返す。区間を決めて解析し直せる。"""
+    from smash_speed.physics import PhysicsParams
+    from smash_speed.synth_rally import make_rally, rally_camera, render_rally_video
+
+    cfg = load_config()
+    phys = PhysicsParams.from_config(cfg)
+    cam = rally_camera(cfg)
+    rally = make_rally(np.random.default_rng(6), phys, n_shots=4)
+    d = tmp_path / "rally"
+    d.mkdir()
+    render_rally_video(rally, cam, cfg, phys, d / "rally.mp4", fps=30.0, pre_s=0.3, audio_path=d / "rally.wav")
+    (d / "calibration.json").write_text(json.dumps({"camera": cam.to_dict()}), encoding="utf-8")
+    truth = rally.to_shots(0.3 - rally.t_start, phys=phys)
+
+    assert client.get("/api/shots").get_json()["shots"] == []  # まだ解析していない
+    client.post("/api/video", json={"path": str(d / "rally.mp4")})
+    assert not client.post("/api/run/shots", json={}).get_json()["ok"]  # コートを合わせる前は始めない
+    client.post("/api/state", json={"calib": str(d / "calibration.json"), "audio": str(d / "rally.wav")})
+    r = client.post("/api/run/shots", json={}).get_json()
+    assert r["ok"]
+    st = _wait(client, r["task"])
+    lines = client.get(f"/api/task/{r['task']}").get_json()["lines"]
+    assert st["status"] == "done", "\n".join(lines)
+    assert any("検出中" in s for s in lines)  # 進み具合が流れてくる
+    g = client.get("/api/shots").get_json()
+    assert g["ok"] and g["dir"].endswith("rally_shots") and g["files"]["shots"].endswith("shots.csv")
+    assert len(g["shots"]) == len(truth) and g["info"]["n_hits"] == len(truth)
+    assert [s["shot_type"] for s in g["shots"]] == [s.shot_type for s in truth]
+    assert all(s["label"] == g["labels"][s["shot_type"]] for s in g["shots"])
+    assert sum(v["n"] for v in g["info"]["by_type"].values()) == len(truth)
+    for s, t in zip(g["shots"], truth):
+        if t.shot_type != "serve":
+            assert s["speed_kmh"] == pytest.approx(t.speed_kmh, rel=0.12)
+    assert client.get("/file", query_string={"path": g["files"]["shots"]}).status_code == 200
+    # 区間を決めて解析し直す（最初の 2 本の後から）
+    t0 = (truth[1].t_hit_s + truth[2].t_hit_s) / 2
+    r = client.post("/api/run/shots", json={"start": t0, "end": 100.0}).get_json()
+    assert _wait(client, r["task"])["status"] == "done"
+    g2 = client.get("/api/shots").get_json()
+    assert g2["info"]["start_s"] == pytest.approx(t0, abs=1e-3)
+    assert 0 < len(g2["shots"]) < len(truth) and all(s["t_hit_s"] >= t0 for s in g2["shots"])

@@ -396,6 +396,7 @@ def open_video():
                        str(out_root() / f"{stem}_calibration.json"))
         bd = out_root() / f"{stem}_smashes"  # この動画で前に探したスマッシュの候補があれば続きから
         S.state["batch_dir"] = str(bd) if (bd / "candidates.json").exists() else None
+        S.state["shots_dir"] = None  # ショットの一覧も、この動画の決まった場所から読む
     S.state["capture_fps"] = fps
     S.save()
     calib = load_camera()
@@ -665,6 +666,20 @@ def run(kind: str):
         if not st.get("overlay", True):
             args.append("--no-overlay")
         t = start_task("選んだ候補を詳しく解析", [cli(*args)])
+    elif kind == "shots":
+        if not st.get("video") or not st.get("calib") or not Path(st["calib"]).exists():
+            return err("動画を開き、手順 2 でコートを合わせてから始めてください。")
+        out = root / f"{Path(st['video']).stem}_shots"
+        st["shots_dir"] = str(out)
+        S.save()
+        args = ["shots", *video_args(), "--calib", st["calib"], "--out", out]
+        if b.get("start") is not None and b.get("end") is not None:
+            args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
+        if st.get("audio"):
+            args += ["--audio", st["audio"]]
+        if b.get("use_roi") and st.get("roi"):
+            args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
+        t = start_task("すべてのショットを解析", [cli(*args)])
     elif kind == "synth":
         speed, fps = float(b.get("speed", 80)), float(b.get("fps", 240))
         out = root / f"synthetic_{speed:g}mps_{fps:g}fps"
@@ -832,6 +847,33 @@ def batch_update():
                 setattr(c, k, bool(u[k]))
     save_candidates(d, cands)
     return ok()
+
+
+# =============================================================================
+# ショットの一覧
+# =============================================================================
+@app.get("/api/shots")
+def shots_get():
+    """``shots`` の結果（``shot_list.json`` と ``shots.csv``）。ショットは打った時刻の順。"""
+    from dataclasses import asdict
+
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
+
+    d = request.args.get("dir") or S.state.get("shots_dir")
+    if not d and S.state.get("video"):  # コマンドで解析した結果も、決まった場所にあれば読む
+        d = str(out_root() / f"{Path(S.state['video']).stem}_shots")
+    if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
+        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS)
+    info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+    rows = []
+    for k, s in enumerate(read_shots(Path(d) / SHOTS_FILE)):
+        r = asdict(s)
+        r["id"] = k
+        r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
+        rows.append(r)
+    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv")) if (Path(d) / f).exists()}
+    return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, files=files)
 
 
 # =============================================================================

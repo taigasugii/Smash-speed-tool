@@ -200,6 +200,22 @@ def cmd_find_smashes(a: argparse.Namespace, cfg: dict) -> int:
     return 0
 
 
+def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
+    from smash_speed.shot_list import ShotListOptions, analyze_video
+
+    o = ShotListOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
+                        start_s=a.start, end_s=a.end, roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
+                        audio=Path(a.audio) if a.audio else None, use_audio=not a.no_audio)
+    info = analyze_video(o, cfg, progress=lambda m: print(m, flush=True))
+    print()
+    print("種類ごとの本数")
+    for v in info["by_type"].values():
+        print(f"  {v['label']} {v['n']} 本" + (f"（平均 {v['mean_kmh']:.0f} km/h、最高 {v['max_kmh']:.0f} km/h）"
+                                             if v["max_kmh"] is not None else ""))
+    print(f"出力: {a.out}")
+    return 0
+
+
 def cmd_analyze_smashes(a: argparse.Namespace, cfg: dict) -> int:
     from smash_speed.batch import analyze_selected, write_ranking
 
@@ -333,6 +349,7 @@ SUBCOMMANDS: dict[str, str] = {
     "summarize": "複数本の結果を集計表にまとめる",
     "find-smashes": "動画全体からスマッシュの候補を探し、だいたいの初速を出す（いちばん速いスマッシュ探しの 1 段目）",
     "analyze-smashes": "確認した候補を詳しく解析して速い順に並べる（2 段目）",
+    "shots": "動画のすべてのショットを、種類・初速つきで一覧にする（shots.csv）",
 }
 
 
@@ -487,6 +504,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ids", help="解析する候補の番号（カンマ区切り。省略時は選んだ候補）")
     p.add_argument("--no-overlay", action="store_true")
     p.set_defaults(func=cmd_analyze_smashes)
+
+    p = add("shots")
+    video_args(p, rng=True)
+    p.add_argument("--calib", required=True)
+    p.add_argument("--out", required=True, help="一覧の保存先フォルダ")
+    p.add_argument("--roi", help="シャトルを検出する範囲 x0,y0,x1,y1（元解像度 px）")
+    p.add_argument("--audio", help="音声ファイル（動画の音声の代わりに使う）")
+    p.add_argument("--no-audio", action="store_true", help="打球音を使わない（軌道だけで打球を見つける）")
+    p.set_defaults(func=cmd_shots)
 
     p = add("summarize")
     p.add_argument("--results", required=True, help="result.csv を含むディレクトリ")
