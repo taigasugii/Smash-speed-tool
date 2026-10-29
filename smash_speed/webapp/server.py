@@ -881,7 +881,8 @@ def shot_view():
     """1 本のショットの場面と軌道（ROADMAP B5c）。
 
     ``i`` は ``/api/shots`` の ``id``。返すもの：場面に使うコマの番号、当てはめた軌道（コートの座標と画像の上の点）、
-    打点・着地点、打ってから次の打球までのシャトルの検出（画像の上の点）。
+    打点・着地点、打ってから次の打球までのシャトルの検出（画像の上の点）、場面を前後に送れるコマの並び
+    （``frames``：打つ少し前から次の打球までの ``[コマ, 時刻, x, y]``。見えないコマは x・y が None）。
     """
     from smash_speed.physics import PhysicsParams
     from smash_speed.shot_list import DETECTIONS_FILE
@@ -900,12 +901,15 @@ def shot_view():
     t_next = shots[k + 1].t_hit_s if k + 1 < len(shots) else None
     traj = s.trajectory(PhysicsParams.from_config(S.cfg()))
     pts: list[list[float]] = []
+    pts_t: list[float] = []
     if traj is not None:
         t, p = traj["t"], traj["pos"]
         if t_next is not None:  # 次の打球より後は描かない（打ち返されている）
             n = max(int(np.searchsorted(t, t_next)), 2)
             t, p = t[:n], p[:n]
-        pts = p[:: max(1, len(p) // 80)].tolist() + [p[-1].tolist()]
+        step = max(1, len(p) // 80)
+        pts = p[::step].tolist() + [p[-1].tolist()]
+        pts_t = t[::step].tolist() + [float(t[-1])]
         t_end = float(t[-1])
     else:
         t_end = t_next if t_next is not None else s.t_hit_s + 1.0
@@ -915,7 +919,7 @@ def shot_view():
     if S.camera is not None and pts:
         uv = [[float(u), float(v)] if np.isfinite([u, v]).all() else None
               for u, v in S.camera.project(np.array(pts, float))]
-    det, frame = [], None
+    det, frame, frames = [], None, []
     if (Path(d) / DETECTIONS_FILE).exists():
         df = pd.read_csv(Path(d) / DETECTIONS_FILE)
         if len(df):
@@ -924,13 +928,19 @@ def shot_view():
             frame = int(df.frame.iloc[int(np.argmin(np.abs(df.timestamp.to_numpy() - t_show)))])
             w = df[(df.timestamp >= s.t_hit_s - 0.05) & (df.timestamp <= t_end + 0.05) & (df.visible > 0)]
             det = [[round(float(r.timestamp), 4), round(float(r.x_px), 1), round(float(r.y_px), 1)] for r in w.itertuples()]
+            # 前後に送れるコマ：打つ 0.2 秒前から、次の打球（または軌道の終わり）まで
+            a = df[(df.timestamp >= s.t_hit_s - 0.2) & (df.timestamp <= t_end + 0.05)]
+            frames = [[int(r.frame), round(float(r.timestamp), 4)]
+                      + ([round(float(r.x_px), 1), round(float(r.y_px), 1)] if r.visible > 0 else [None, None])
+                      for r in a.itertuples()]
     if frame is None and S.meta is not None:
         frame = int(round(s.t_hit_s * S.meta.fps_meta))
     r3 = lambda v: None if v is None else round(float(v), 3)  # noqa: E731
     return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end,
               hit=[r3(s.hit_x_m), r3(s.hit_y_m), r3(s.hit_z_m)] if s.hit_point is not None else None,
               land=[r3(s.land_x_m), r3(s.land_y_m)] if s.land_x_m is not None and s.land_y_m is not None else None,
-              path=[[round(float(c), 3) for c in p] for p in pts], path_px=uv, detections=det,
+              path=[[round(float(c), 3) for c in p] for p in pts], path_t=[round(float(v), 4) for v in pts_t],
+              path_px=uv, detections=det, frames=frames,
               court=[[a[:2].tolist(), b[:2].tolist()] for a, b, kind in court_segments(S.cfg()) if kind == "line"],
               image_size=[S.meta.width, S.meta.height] if S.meta is not None else None)
 

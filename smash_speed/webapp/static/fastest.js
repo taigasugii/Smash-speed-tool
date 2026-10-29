@@ -29,7 +29,10 @@ App.views.fastest = {
         ①のだいたいの初速は、打つ人と着地点を推定して出しているため <b>±30% ほどずれる</b>ことがあります（速そうな 8 個を最初から選んでおきます）。順位は ③ の結果で決めてください。</div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="find">${cands.length ? "候補を探し直す" : "① 候補を探す"}</button>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${r.info && r.info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す（選手の動きと間違えやすい動画で）</label>` : ""}
-        ${cands.length ? `<span class="muted small">前回の結果：打球音 ${cands.length} 個のうち、シャトルの軌道が見つかったもの ${cands.filter((c) => c.status === "ok").length} 個</span>` : ""}</div></div>`);
+        ${cands.length ? `<span class="muted small">前回の結果：打球音 ${cands.length} 個のうち、シャトルの軌道が見つかったもの ${cands.filter((c) => c.status === "ok").length} 個</span>` : ""}</div>
+      <div class="row small" style="margin-top:10px;gap:8px;flex-wrap:wrap"><span class="muted">スマッシュ以外（クリア・ドロップ・ロブなど）も含めて、すべての球の種類と速さを並べて見るなら</span>
+        <button class="btn sm" id="toshots">▤ ショットの一覧 へ</button></div></div>`);
+    $("#toshots", intro).onclick = () => go("shots");
     el.appendChild(intro);
     $("#find", intro).onclick = () => {
       if (cands.some((c) => c.confirmed || c.result) && !confirm("探し直すと、確認した打つ人・着地点と詳しい解析の結果が消えます。よろしいですか？")) return;
