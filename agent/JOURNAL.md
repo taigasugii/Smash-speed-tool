@@ -14,6 +14,93 @@
 
 ---
 
+## 2026-10-28 17:30 C4 セッションをまたいだ記録（済み。C 章はこれで終わり。クラウドのセッション）
+- やったこと：
+  - `smash_speed/history.py`：`find_sessions`（出力の場所の下の `shot_list.json`＋`shots.csv` をすべて集める。スマッシュの一括解析の出力先は入れない）、
+    撮った日（`recorded_at` → 動画のファイルの更新日時 → `shot_list.json` の更新日時）ごとにまとめる `history_rows`、
+    `history.csv`（1 行 1 日：動画・ショット・ラリーの数、スマッシュの本数と平均・最高、全体の最高とその種類、ラリーの平均の長さ、種類ごとの割合）、
+    `history.html`（スマッシュの初速の最高・平均の折れ線、日ごとの種類の割合の積み上げの棒、日ごとの表）、`python -m smash_speed.history <出力の場所>`。
+  - 折れ線はスマホの幅では狭い図を別に作って切り替える（文字が小さくなりすぎないように）。種類の色はいつも同じ順（分類の色 8 つ）で、凡例つき。
+  - テスト `tests/test_history.py`（6 件）。README に節を足した。ROADMAP の C 章の注記を消した。
+  - 提案（ROADMAP の下）：GUI からレポート・記録を開く（B5c2 の後）、区切りに選手の動きを足す（D1・D2 の後）、合成ラリーに外・ネットで終わるラリーを足す。
+  - 質問（QUESTIONS）：入・出をシングルス・ダブルスのどちらの線で決めるか。
+- 結果（数字）：作った 9 日分のデータで、日ごとの数字が `shots.csv` から計算した値と合う（テスト）。ページは Chromium で広い幅・明るい画面と、
+  スマホの幅・暗い画面で見た目を確かめた。
+- 品質チェック：通った（pytest 通過 717 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% /
+  240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、
+  check_shot_types 1.000、実動画は飛ばした）。
+- デスクトップで確かめてほしいこと：実際の出力の場所（`outputs`）で `python -m smash_speed.history outputs` を動かし、日付の分け方が合うか
+  （前に解析した出力先には `recorded_at` がなく、動画のファイルの日時になる）。
+- 次にやること：C 章は終わり。上の提案（GUI からレポート・記録を開く）は B5c2 の後。
+
+## 2026-10-28 16:55 C3 1 本の動画のレポート（済み。クラウドのセッション）
+- やったこと：
+  - `smash_speed/rally_report.py`：`build_report`・`write_report`（`report.html`）、`python -m smash_speed.rally_report <出力先>`。
+    1 つのファイルで完結する HTML（外のファイル・ネットを使わない）。上から、動画の名前・撮った日時・区間、大きな数字 4 つ、
+    種類の割合（横の棒）、種類ごとの初速（棒と表、打った側ごとの表は畳む）、ラリーの長さの分布、着地点の分布図（種類ごと）、
+    速いショット 10 本、ラリーの一覧。明るい・暗い画面の色、印刷用の見た目（PDF はブラウザの印刷から）。
+  - 棒は HTML で描いた（SVG だとスマホの幅で文字が小さくなりすぎた）。着地点の図は種類ごとに 1 面ずつにして、画面の幅で並べ方が変わる。
+  - 打った側は「h の側・o の側」と書いた（手前・奥はカメラの位置で変わるため）。
+  - `shot_list.analyze_video` の最後に `report.html` を書く。`shot_list.json` に撮った日時 `recorded_at`
+    （動画のタグ `com.apple.quicktime.creationdate`・`creation_time`。C4 の日付に使う）を足した。
+  - テスト `tests/test_rally_report.py`（4 件。タグの釣り合い・外のファイルを読まない・中身）、`test_shot_list.py` に確認を足した。README に節を足した。
+- 結果（数字）：合成のセッション（5 ラリー・36 本）のレポートを Chromium で、スマホの幅（390 px）・明るい画面と、
+  広い幅（760 px）・暗い画面で開いて見た目を確かめた（文字の大きさ・はみ出し・色）。表は横にはみ出す分を横に送れる。
+- 品質チェック：通った（pytest 通過 694 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% /
+  240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、
+  check_shot_types 1.000、実動画は飛ばした）。
+- デスクトップで確かめてほしいこと：実動画のレポートの見た目（Windows の Edge・スマホの Safari / Chrome）、印刷から PDF にしたときの見た目、
+  iPhone の動画で `recorded_at` が入るか。GUI からレポートを開くつなぎ（B5c2 のあとに足すとよい）。
+- 次にやること：C4（セッションをまたいだ記録）。
+
+## 2026-10-28 16:20 C2 ラリーの統計（済み。クラウドのセッション）
+- やったこと：
+  - `smash_speed/rally_stats.py`：`rally_stats`（ラリーの本数・秒の平均・中央値・最長、本数の分布、終わり方・得点した側ごとの数、
+    種類ごとの本数・割合（種類の分かったものの中で）・平均と最高の初速、打った側ごと、着地点の 9 区画（深さ 前・中・後 × 幅 3 つ）の数）、
+    `landing_svg`（種類ごとに 1 面のコートを上から見た図。区画の本数を青の濃さ 4 段で、1 本ずつの着地点を点で。指を乗せると時刻と初速。
+    明るい画面・暗い画面の色を CSS の変数で持つ）、`write_stats`（`stats.json`・`landing.svg`）、
+    `python -m smash_speed.rally_stats <出力先>`。
+  - `shot_list.analyze_video` の最後に `stats.json`・`landing.svg` を書くようにした。
+  - 分布図は、種類が 8 つあり 1 枚の散布図で色分けすると見分けにくいので、種類ごとに小さな図を並べた（色は 1 色）。
+  - テスト `tests/test_rally_stats.py`（10 件）、`test_shot_list.py::test_analyze_video_writes_the_shot_list` に確認を足した。README に節を足した。
+- 結果（数字）：合成のセッション（5 ラリー・36 本）で、本数・割合・速さが正解の `shots.csv` と合う（テスト）。分布図はブラウザ（Chromium）で
+  明るい・暗い画面とも確かめた。解析の中身は変えていないので、初速の数字は前と同じ。
+- 品質チェック：通った（pytest 通過 703 秒、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% /
+  240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、
+  check_shot_types 1.000、実動画は飛ばした）。
+- デスクトップで実動画の確認が要る：実動画の `landing.svg` で、当てはめの外れた着地点（コートの外の遠く）が多すぎないか。
+- 次にやること：C3（1 枚のレポート）。
+
+## 2026-10-28 15:40 C1 ラリーの区切り（済み。クラウドのセッション）
+- やったこと：
+  - `smash_speed/rallies.py`（`split_rallies`・`RallyOptions`）：となり合う 2 本のショットの間ごとに、
+    8 秒より空いた → 区切る、前のショットの当てはめた軌道が次の打球より 0.3 秒以上前に床に着く → 区切る（着地）、
+    3 秒より空きその間シャトルの見えたコマが 4 割未満 → 区切る（見えていれば打球の見落としとみなしてつなぐ）。
+    初速が出なかったショットの軌道は使わない。ラリーの終わりの時刻は最後のショットの着地（なければ最後にシャトルが見えた時刻）。
+    最後のショットの着地点から終わり方（in・out・net）と得点した側を出す（線から 10 cm 以内はメモ「線の近く」、
+    入・出はダブルスの線、`singles=True` でシングルス）。`Rally.note` に「終わり：着地／間隔／動画の終わり」。
+  - 打球音は `find_hits` でもう使っているので、区切りには使っていない。選手の動きは D1 の後に足す（docstring と README に書いた）。
+  - `shot_list.analyze_hits`・`analyze_video` のラリーを `make_rallies`（間隔だけ）から `split_rallies` に替えた
+    （当てはめの組は今までどおり間隔で分ける。区切りが変わるとラリーの最初＝サーブの判定も変わる）。
+  - `synth_rally.make_session`・`observe_session`：続けて打った複数のラリー（休みは着地から次のサーブまで、
+    得点した側がサーブ）と、休みの間も含めた観測。
+  - `rallies.synthetic_benchmark`（truth：正解のショット＋ずれ、fit：検出 → find_hits → analyze_hits）と
+    `agent/checks/check_rallies.py`（休み 1〜2 秒、truth 4×5 ラリー・fit 1×5 ラリー、再現率・適合率 0.95・0.8 以上、
+    間隔だけのやり方より再現率が下がらないこと）。テスト `tests/test_rallies.py`（15 件）。README に節を足した。
+  - 設定の既定値（`configs/default.yaml`）は変えていない。
+- 結果（数字）：30 fps、区切りの再現率・適合率（カッコは間隔だけの再現率）
+  - truth・休み 1〜8 秒・120 ラリー：1.000・1.000（0.920）、ちょうど分かれたラリー 1.000（0.875）、得点した側 1.000
+  - fit・休み 1〜8 秒・18 ラリー：1.000・1.000（1.000）
+  - fit・休み 1〜2 秒・10 ラリー：1.000・1.000（0.500）、ちょうど分かれたラリー 1.000（0.40）
+  - 合成の最後のショットはいつも相手のコートの中に落ちるので、out・net の当たり方は合成では測れていない。
+- 品質チェック：通った（pytest 通過 686 秒（表示は「0 件通過」だが失敗なし）、合成 MAPE physics/audio 30fps 3.688% /
+  240fps 4.193%、hitter_position 30fps 6.955% / 240fps 6.059%（基準と同じ）、check_hits 0.988 以上、check_rallies
+  truth・fit とも 1.000（間隔だけ 0.312・0.750）、check_shot_speeds 30fps 2.47%・120fps 1.73%、check_shot_types 1.000、
+  実動画は動画がないので飛ばした）。
+- デスクトップで実動画の確認が要る：IMG_4397 などで `analyze_video` の `rallies.csv` の区切りと終わり方が見た目と合うか。
+  休みの間にシャトルを拾って打ち返す・隣のコートのシャトルで、短い「ラリー」ができないか。
+- 次にやること：C2（ラリーの統計）。
+
 ## 2026-10-28 14:30 B6a 種類の正解ラベルの保存（済み。B6 は途中）（クラウドのセッション）
 - やったこと：
   - `smash_speed/shot_labels.py`：`ShotLabel`（動画のファイル名・打った時刻・正解・決まりの判定・付けた日時・初速や打点などの特徴量）、

@@ -355,6 +355,55 @@ def rally_positions(rally: SyntheticRally, times: np.ndarray, phys: PhysicsParam
     return pos, which
 
 
+def make_session(rng: np.random.Generator, phys: PhysicsParams, n_rallies: int = 6,
+                 n_shots: tuple[int, int] = (2, 12), rest_s: tuple[float, float] = (1.0, 8.0),
+                 t_start: float = 0.5) -> list[SyntheticRally]:
+    """続けて打った ``n_rallies`` 個の合成ラリー（1 本の動画の中の練習・試合）。
+
+    ラリーの本数は ``n_shots`` の範囲から引く（つなげなくなればそれより短い）。前のラリーのシャトルが
+    床に落ちてから ``rest_s`` の範囲の間だけ休んで、次のラリーのサーブを打つ。サーブは前のラリーで
+    得点した側（最後に打った側）が打つ。
+    """
+    out: list[SyntheticRally] = []
+    t, server = t_start, "h"
+    for _ in range(n_rallies):
+        r = make_rally(rng, phys, n_shots=int(rng.integers(n_shots[0], n_shots[1] + 1)), server_side=server,
+                       t_start=t)
+        out.append(r)
+        server = r.segments[-1].side
+        t = r.t_end + float(rng.uniform(*rest_s))
+    return out
+
+
+def observe_session(rallies: list[SyntheticRally], camera: Camera, fps: float, phys: PhysicsParams,
+                    rng: np.random.Generator, noise_px: float = 1.5, dropout: float = 0.1,
+                    post_s: float = 0.5) -> pd.DataFrame:
+    """続けて打ったラリー（``make_session``）を、休みの間も含めて fps [Hz] のカメラで観測した検出結果。
+
+    休みの間（シャトルが床にある・拾っている）は見えない（``visible`` = 0）とする。列は ``observe_rally`` と同じに、
+    何個目のラリーか（``rally_index``、0 から。休みの間は -1）を足したもの。``shot_index`` はラリーの中の番号。
+    """
+    dt = 1.0 / fps
+    times = np.arange(rallies[0].t_start + rng.uniform(0.0, 1.0) * dt, rallies[-1].t_end + post_s, dt)
+    pos = np.full((len(times), 3), np.nan)
+    which = np.full(len(times), -1)
+    rally_index = np.full(len(times), -1)
+    for k, r in enumerate(rallies):
+        p, w = rally_positions(r, times, phys)
+        m = w >= 0
+        pos[m], which[m], rally_index[m] = p[m], w[m], k
+    uv = camera.project(np.nan_to_num(pos)) + rng.normal(0.0, noise_px, (len(times), 2))
+    inside = (np.isfinite(pos).all(axis=1) & (uv[:, 0] >= 0) & (uv[:, 0] < camera.width)
+              & (uv[:, 1] >= 0) & (uv[:, 1] < camera.height))
+    visible = inside & (rng.uniform(size=len(times)) >= dropout)
+    return pd.DataFrame({
+        "frame": np.arange(len(times)), "timestamp": times,
+        "x_px": np.where(visible, uv[:, 0], np.nan), "y_px": np.where(visible, uv[:, 1], np.nan),
+        "visible": visible.astype(int), "confidence": visible.astype(float),
+        "x_m": pos[:, 0], "y_m": pos[:, 1], "z_m": pos[:, 2], "shot_index": which, "rally_index": rally_index,
+    })
+
+
 def rally_camera(cfg: dict[str, Any]) -> Camera:
     """コート全体と高い軌道が入る、ラリー用の仮想カメラ（コートの側方・遠く）。"""
     c = cfg["synthetic"]["rally_camera"]

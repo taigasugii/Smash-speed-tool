@@ -2,15 +2,18 @@
 
 1. 動画全体を 1 回だけ縮小して読み、シャトルを検出する（``detection.baseline``。1 コマ 1 点）。
 2. 打球音（音声があれば）と軌道の向きの変化から、すべての打球の時刻と打った側を出す（``hits.find_hits``）。
-3. 打球の間隔でラリーに分け（仮の区切り。本当の区切りは C1）、ラリーごとに軌道と初速を当てはめる
-   （``shot_fit.fit_shots``）。ほかのラリーの検出が混ざらないよう、ラリーの前後で検出を切り分ける。
-4. 軌道から種類を決める（``shot_types.classify_shots``）。
+3. 打球の間隔で組に分け、組ごとに軌道と初速を当てはめる（``shot_fit.fit_shots``）。ほかの組の検出が
+   混ざらないよう、組の前後で検出を切り分ける。
+4. 打球の間隔・シャトルの着地・シャトルが飛んでいるかから、ラリーに区切る（``rallies.split_rallies``）。
+5. 軌道から種類を決める（``shot_types.classify_shots``。ラリーの最初のショットはサーブ）。
 
 結果は ``<出力先>/`` に書き出す。
 
 - ``shots.csv``・``rallies.csv``：ショットとラリー（``shots`` の形）
 - ``detections.csv``：全コマのシャトルの検出（GUI で場面に軌道を重ねる・解析し直すのに使う）
 - ``shot_list.json``：動画・キャリブレーション・打球の見つけ方・種類ごとの本数と速さなど（GUI が読む）
+- ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
+- ``report.html``：統計をまとめた 1 枚のページ（``rally_report``。スマホでも見られる）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -34,11 +37,14 @@ from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
+from smash_speed.rallies import RallyOptions, split_rallies
+from smash_speed.rally_report import write_report
+from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.shot_fit import fit_shots, shot_fits_to_shots
 from smash_speed.shot_types import classify_shots
-from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, make_rallies,
-                               write_rallies, write_shots)
+from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, write_rallies,
+                               write_shots)
 from smash_speed.video_io import VideoMeta, extract_audio, load_wav, probe
 
 SHOT_LIST_FILE = "shot_list.json"
@@ -56,7 +62,7 @@ class ShotListOptions:
     roi: list[float] | None = None    # 検出する範囲 [x0, y0, x1, y1]（元解像度 px）
     audio: Path | None = None         # 別の音声ファイル（動画の時刻と同じ時刻の WAV）
     use_audio: bool = True            # 偽なら打球音を使わない（軌道だけで打球を見つける）
-    rally_gap_s: float = 3.0          # 打球の間がこれより空いたら別のラリー [s]
+    rally_gap_s: float = 3.0          # 打球の間がこれより空き、シャトルが飛んでいなければ別のラリー [s]
     n_tracks: int | None = None       # 検出で残す軌道の数の上限（None なら全部。実動画では 20 秒で 1000 本ほど）
     filter_tracks: bool = True        # シャトルらしい軌道だけを残す（``shuttle_tracks``）
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
@@ -310,8 +316,16 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         shots += rally_shots
         n_ok = sum(s.speed_kmh is not None for s in rally_shots)
         progress(f"[進行] ラリー {g + 1}/{len(groups)}：{len(hs)} 本（速さが出たもの {n_ok} 本）")
-    make_rallies(shots, max_gap_s=rally_gap_s)
+    split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
+
+
+def recorded_at(meta: VideoMeta) -> str | None:
+    """動画を撮った日時（ISO 8601。動画のタグ ``creation_time`` など。なければ None）。日付ごとの記録（``history``）に使う。"""
+    for k in ("com.apple.quicktime.creationdate", "creation_time"):
+        if meta.tags.get(k):
+            return str(meta.tags[k])
+    return None
 
 
 def summarize(shots: list[Shot]) -> dict[str, Any]:
@@ -365,14 +379,14 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     progress(f"[進行] 打球 {len(hits)} 本")
     workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress)
-    rallies = make_rallies(shots, max_gap_s=o.rally_gap_s)
+    rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
     write_rallies(out / RALLIES_FILE, rallies)
 
     info = {
         "video": str(Path(o.video).resolve()), "calib": str(Path(o.calib).resolve()),
         "capture_fps": o.capture_fps, "fps": meta.capture_fps, "width": meta.width, "height": meta.height,
-        "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi,
+        "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi, "recorded_at": recorded_at(meta),
         "audio": str(Path(o.audio).resolve()) if o.audio else None,
         "used_audio": onsets is not None, "n_onsets": None if onsets is None else len(onsets),
         "n_frames": len(det), "n_visible": n_vis,
@@ -385,6 +399,8 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "meta": run_metadata(),
     }
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_stats(out, shots, rallies, cfg.get("court"))
+    write_report(out, cfg.get("court"), shots, rallies)
     progress(f"[進行] 完了：{len(shots)} 本（{len(rallies)} ラリー）、{info['elapsed_s']:.0f} 秒")
     return info
 
