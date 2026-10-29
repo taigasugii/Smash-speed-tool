@@ -188,6 +188,7 @@ def rally_scores(pred: list[Shot], pred_rallies: list[Rally], truth: list[Shot],
     - ``exact``：正解のラリーのうち、組になった打球がちょうど 1 つの推定したラリーにまとまったものの割合
     - ``end_err_s``：ちょうどまとまったラリーの終わりの時刻のずれの中央値 [s]
     - ``outcome_acc``：ちょうどまとまったラリーのうち、得点した側が正解と同じものの割合（推定が空欄なら数えない）
+    - ``by_reason``：正解の終わり方（in・out・net）ごとの［終わり方と得点した側が両方とも合ったラリーの数, ちょうどまとまったラリーの数］
     """
     m = match_to_truth(pred, truth, tol_s)
     seq = sorted((p.t_hit_s, p.rally_id, truth[j].rally_id) for p, j in zip(pred, m) if j is not None)
@@ -205,6 +206,7 @@ def rally_scores(pred: list[Shot], pred_rallies: list[Rally], truth: list[Shot],
     pr = {r.rally_id: r for r in pred_rallies}
     tr = {r.rally_id: r for r in true_rallies}
     exact, end_err, outcome = [], [], []
+    by_reason: dict[str, list[int]] = {}
     for ta in tr:
         ps = by_true.get(ta, set())
         ok = len(ps) == 1 and by_pred[next(iter(ps))] == {ta}
@@ -215,17 +217,21 @@ def rally_scores(pred: list[Shot], pred_rallies: list[Rally], truth: list[Shot],
                 end_err.append(abs(p.t_end_s - tr[ta].t_end_s))
             if p.winner_side:
                 outcome.append(p.winner_side == tr[ta].winner_side)
+            c = by_reason.setdefault(tr[ta].end_reason, [0, 0])
+            c[0] += p.end_reason == tr[ta].end_reason and p.winner_side == tr[ta].winner_side
+            c[1] += 1
     return {"n_true": len(tr), "n_pred": len(pred_rallies), "boundary_tp": tp, "boundary_fp": fp, "boundary_fn": fn,
             "boundary_recall": tp / max(tp + fn, 1), "boundary_precision": tp / max(tp + fp, 1),
             "exact": float(np.mean(exact)) if exact else 1.0,
             "end_err_s": float(np.median(end_err)) if end_err else None,
-            "outcome_acc": float(np.mean(outcome)) if outcome else None, "n_outcome": len(outcome)}
+            "outcome_acc": float(np.mean(outcome)) if outcome else None, "n_outcome": len(outcome),
+            "by_reason": by_reason}
 
 
 def synthetic_benchmark(n_sessions: int = 4, n_rallies: int = 6, fps: float = 30.0, seed: int = 0,
                         mode: str = "fit", rest_s: tuple[float, float] = (1.0, 8.0),
                         opts: RallyOptions | None = None, cfg: dict[str, Any] | None = None,
-                        workers: int = 1) -> dict[str, Any]:
+                        workers: int = 1, ends: dict[str, float] | None = None) -> dict[str, Any]:
     """続けて打った合成ラリーで、ラリーの区切りの精度を測る（``rally_scores``）。
 
     Args:
@@ -233,6 +239,7 @@ def synthetic_benchmark(n_sessions: int = 4, n_rallies: int = 6, fps: float = 30
             通したショットを区切る（実際の流れと同じ）。"truth" は正解のショット（打った時刻に 5 ms、着地の時刻に
             0.1 s のずれを足す）を区切る（速いので多くのラリーで測れる）
         rest_s: ラリーの間の休み（着地から次のサーブまで）の範囲 [s]。短い休みは間隔だけでは区切れない
+        ends: ラリーの終わり方の割合（``synth_rally.make_session``。省略時はすべて相手のコートの中）
 
     Returns:
         ``new``（``split_rallies``）と ``gap``（``make_rallies``。打球の間隔だけ）の ``rally_scores`` を足し合わせたもの
@@ -250,7 +257,7 @@ def synthetic_benchmark(n_sessions: int = 4, n_rallies: int = 6, fps: float = 30
     n_shots = 0
     for k in range(n_sessions):
         rng = np.random.default_rng([seed, 7, k])
-        session = make_session(rng, phys, n_rallies, rest_s=rest_s)
+        session = make_session(rng, phys, n_rallies, rest_s=rest_s, ends=ends)
         truth: list[Shot] = []
         true_rallies: list[Rally] = []
         for i, r in enumerate(session, start=1):
@@ -282,14 +289,19 @@ def synthetic_benchmark(n_sessions: int = 4, n_rallies: int = 6, fps: float = 30
     for name, d in tot.items():
         tp, fp, fn = (sum(d[f"boundary_{x}"]) for x in ("tp", "fp", "fn"))
         n_true = sum(d["n_true"])
-        ends = [e for e in d["end_err_s"] if e is not None]
+        end_errs = [e for e in d["end_err_s"] if e is not None]
         n_out = sum(d["n_outcome"])
+        by_reason: dict[str, list[int]] = {}
+        for br in d["by_reason"]:
+            for k, (ok, n) in br.items():
+                c = by_reason.setdefault(k, [0, 0])
+                c[0], c[1] = c[0] + ok, c[1] + n
         out[name] = {"boundary_recall": tp / max(tp + fn, 1), "boundary_precision": tp / max(tp + fp, 1),
                      "exact": float(np.dot(d["exact"], d["n_true"]) / max(n_true, 1)),
                      "n_pred": sum(d["n_pred"]),
-                     "end_err_s": float(np.mean(ends)) if ends else None,
+                     "end_err_s": float(np.mean(end_errs)) if end_errs else None,
                      "outcome_acc": (sum(a * n for a, n in zip(d["outcome_acc"], d["n_outcome"]) if a is not None)
-                                     / n_out) if n_out else None, "n_outcome": n_out}
+                                     / n_out) if n_out else None, "n_outcome": n_out, "by_reason": by_reason}
     return out
 
 
