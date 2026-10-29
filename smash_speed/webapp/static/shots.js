@@ -16,6 +16,7 @@ App.views.shots = {
     const shots = mine ? r.shots : [];
     const info = mine ? r.info : {};
     this.labels = r.labels || {};
+    this.stats = r.label_stats || null;
     this.renderStart(el, info, shots.length > 0);
     if (!mine) return;
     this.renderSummary(el, info, shots);
@@ -106,13 +107,19 @@ App.views.shots = {
         <h2 style="margin:0;flex:1">ショット（${shown.length} 本）</h2>
         <div class="seg" id="flt"><button data-v="all">すべて</button>${types.map((k) => `<button data-v="${k}">${esc(this.labels[k] || k)}</button>`).join("")}</div>
         <div class="seg" id="srt"><button data-v="time">時刻の順</button><button data-v="speed">速い順</button></div></div>
+      <p class="small" style="margin:0 0 10px">正しい種類が分かるショットは、「正しい種類」の欄か、行を押して出る詳しい所で選んでください。
+        選んだ種類は、解析し直しても残り、決まりの判定を良くするのに使います。<br><span id="lstat" class="muted"></span></p>
       <div style="overflow:auto;max-height:70vh"><table class="tbl"><thead><tr><th>時刻</th><th>ラリー</th><th>打った人</th><th>種類</th>
-        <th class="r">初速 km/h</th><th class="r">95% の範囲</th><th>確かさ</th></tr></thead><tbody></tbody></table></div>
+        <th class="r">初速 km/h</th><th class="r">95% の範囲</th><th>確かさ</th><th>正しい種類</th></tr></thead><tbody></tbody></table></div>
       ${files.shots ? `<p class="small" style="margin:10px 0 0"><a href="${fileUrl(files.shots)}" download="shots.csv">一覧を CSV で保存（Excel で開けます）</a></p>` : ""}</div>`);
     $$("#flt button", card).forEach((b) => { b.classList.toggle("on", b.dataset.v === this.filter); b.onclick = () => { this.filter = b.dataset.v; go("shots"); }; });
     $$("#srt button", card).forEach((b) => { b.classList.toggle("on", b.dataset.v === this.sort); b.onclick = () => { this.sort = b.dataset.v; go("shots"); }; });
     const tb = $("tbody", card);
-    if (!shown.length) tb.appendChild(h(`<tr><td colspan="7" class="muted">ショットがありません。</td></tr>`));
+    this.shown = shown;
+    this.tbody = tb;
+    this.lstat = $("#lstat", card);
+    this.renderStats();
+    if (!shown.length) tb.appendChild(h(`<tr><td colspan="8" class="muted">ショットがありません。</td></tr>`));
     for (const s of shown) {
       const ci = s.speed_ci_low_kmh != null && s.speed_ci_high_kmh != null ? `${fmt(s.speed_ci_low_kmh, 0)}–${fmt(s.speed_ci_high_kmh, 0)}` : "—";
       const c = s.speed_kmh == null ? null : s.confidence;  // 初速が出なかったショットの確かさは出さない
@@ -120,8 +127,14 @@ App.views.shots = {
       const rally = s.rally_id != null ? `${s.rally_id}${s.index_in_rally != null ? `<span class="muted small">（${s.index_in_rally} 本目）</span>` : ""}` : "—";
       const tr = tb.appendChild(h(`<tr class="click"${s.id === this.sel ? ' style="outline:2px solid var(--primary)"' : ""}><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}</td>
         <td>${s.shot_type === "unknown" ? `<span class="muted">${esc(s.label)}</span>` : `<span class="badge info">${esc(s.label)}</span>`}</td>
-        <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td></tr>`));
+        <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td>
+        <td><select class="input truth" style="height:30px;font-size:13px"><option value="">—</option>
+          ${this.truthTypes().map((k) => `<option value="${k}">${esc(this.labels[k] || k)}</option>`).join("")}</select></td></tr>`));
       tr.dataset.id = s.id;
+      const sel = $("select.truth", tr);
+      sel.onclick = (e) => e.stopPropagation();  // 選ぶときに行の詳しい所は開かない
+      sel.onchange = () => this.setTruth(s, sel.value);
+      this.paintRow(tr, s);
       // 行を選んだら、画面を作り直さずに詳しい所だけ入れ替えて、そこへ移る
       tr.onclick = () => {
         this.sel = s.id;
@@ -131,7 +144,87 @@ App.views.shots = {
     }
     el.appendChild(card);
     const host = el.appendChild(h(`<div></div>`));
+    this.host = host;
     if (this.sel != null && shots.some((s) => s.id === this.sel)) this.renderDetail(host, shots.find((s) => s.id === this.sel), false);
+  },
+
+  // ---- 種類の正解ラベル（ROADMAP B6）
+  truthTypes() { return Object.keys(this.labels).filter((k) => k !== "unknown"); },
+
+  // 正解を付けた本数と、決まりの判定が合っていた割合
+  renderStats() {
+    if (!this.lstat) return;
+    const st = this.stats;
+    const pct = (a) => a == null ? "—" : `${fmt(a * 100, 0)}%`;
+    this.lstat.textContent = !st || !st.all.n ? "まだ正しい種類を選んだショットはありません。"
+      : `正しい種類を選んだショット：この動画 ${st.video.n} 本・全部で ${st.all.n} 本（動画 ${st.all.n_videos} 本）。`
+        + `決まりの判定が合っていた割合：この動画 ${pct(st.video.rule_accuracy)}・全部 ${pct(st.all.rule_accuracy)}。`;
+  },
+
+  // 表の行の「正しい種類」：選んだ値と、決まりの判定と違うときの色
+  paintRow(tr, s) {
+    const sel = $("select.truth", tr);
+    sel.value = s.truth || "";
+    sel.style.borderColor = !s.truth ? "" : s.truth === s.shot_type ? "var(--ok)" : "var(--warn)";
+    sel.title = !s.truth ? "" : s.truth === s.shot_type ? "決まりの判定と同じ" : `決まりの判定（${this.labels[s.shot_type] || s.shot_type}）と違う`;
+  },
+
+  async setTruth(s, label) {
+    const r = await api.post("/api/shot_label", { i: s.id, label: label || "" });
+    if (!r.ok) { toast(r.error || "保存できませんでした", "bad"); return false; }
+    s.truth = r.truth || null;
+    this.stats = r.label_stats;
+    this.renderStats();
+    const tr = this.tbody && $$("tr.click", this.tbody).find((x) => +x.dataset.id === s.id);
+    if (tr) this.paintRow(tr, s);
+    if (this.sel === s.id && this.truthBox) this.paintTruth(s);
+    return true;
+  },
+
+  // 表に出ている並び（絞り込み・並べ替えのまま）で、次のショットを選ぶ
+  selectNext(s) {
+    const i = (this.shown || []).findIndex((x) => x.id === s.id);
+    const n = i >= 0 ? this.shown[i + 1] : null;
+    if (!n) { toast("表の最後のショットです", "ok"); return; }
+    this.sel = n.id;
+    $$("tr.click", this.tbody).forEach((x) => { x.style.outline = +x.dataset.id === n.id ? "2px solid var(--primary)" : ""; });
+    const tr = $$("tr.click", this.tbody).find((x) => +x.dataset.id === n.id);
+    if (tr) tr.scrollIntoView({ block: "nearest" });
+    this.renderDetail(this.host, n, true);
+  },
+
+  // 詳しい所の種類のボタン
+  renderTruth(card, s) {
+    const box = $("#truth", card);
+    const types = this.truthTypes();
+    box.innerHTML = `<div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+        <b class="small">正しい種類：</b>
+        <div class="seg" id="tt">${types.map((k, i) => `<button data-v="${k}" title="キーボードの ${i + 1}">${esc(this.labels[k] || k)}</button>`).join("")}</div>
+        <button class="btn sm ghost" id="tclear">選び直す（消す）</button>
+        <button class="btn sm" id="tnext">次のショットへ ▶</button>
+        <label class="row small"><input type="checkbox" id="tauto" ${this.autoNext !== false ? "checked" : ""}> 選んだら次のショットへ進む</label></div>
+      <p class="small muted" id="tnote" style="margin:6px 0 0"></p>`;
+    this.truthBox = box;
+    const pick = async (k) => {
+      if (this.sel !== s.id) return;  // 次のショットを読み込んでいる間は、前のショットに付けない
+      if (!(await this.setTruth(s, k))) return;
+      if (k && this.autoNext !== false) this.selectNext(s);
+    };
+    $$("#tt button", box).forEach((b) => { b.onclick = () => pick(b.dataset.v); });
+    $("#tclear", box).onclick = () => pick("");
+    $("#tnext", box).onclick = () => this.selectNext(s);
+    $("#tauto", box).onchange = (e) => { this.autoNext = e.target.checked; };
+    this.pickTruth = pick;
+    this.paintTruth(s);
+  },
+
+  paintTruth(s) {
+    const box = this.truthBox;
+    $$("#tt button", box).forEach((b) => b.classList.toggle("on", b.dataset.v === s.truth));
+    $("#tclear", box).disabled = !s.truth;
+    const rule = this.labels[s.shot_type] || s.shot_type;
+    $("#tnote", box).textContent = !s.truth ? `決まりの判定は「${rule}」です。合っていればそのまま「${rule}」を、違えば正しい種類を選んでください（キーボードの 1〜${this.truthTypes().length} でも選べます）。`
+      : s.truth === s.shot_type ? `決まりの判定（${rule}）と同じです。` : `決まりの判定（${rule}）と違います。`;
   },
 
   leave() { this.unbindKeys(); },
@@ -147,11 +240,24 @@ App.views.shots = {
       <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">○</span> は見つけたシャトル（<span style="color:#ea580c">●</span> がこのコマ）、<span style="color:#2563eb">線</span> は計算した飛び方
         （<span style="color:#2563eb">●</span> がこのコマの時刻の位置）です。下のボタンか、キーボードの ← → でコマを前後に送れます。
         右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所です。
-        ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}</p>
+        ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}
+        いちばん下で、このショットの正しい種類を選べます（キーボードの数字でも選べます）。</p>
       <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
         <div style="flex:2;min-width:320px"><div id="scene" style="position:relative"></div><div id="step"></div></div>
-        <div id="top" style="flex:1;min-width:240px"></div></div></div>`);
+        <div id="top" style="flex:1;min-width:240px"></div></div>
+      <div id="truth" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)"></div></div>`);
+    this.sceneKey = null;
     if (v.frame != null && v.image_size) this.renderScene(card, v, s);
+    this.renderTruth(card, s);
+    this.keyh = (e) => {
+      // 入力欄（スライダーも）の上では、その欄の動きに任せる
+      if (!card.isConnected || ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName) || e.ctrlKey || e.altKey || e.metaKey) return;
+      const n = /^[1-9]$/.test(e.key) ? +e.key - 1 : -1;
+      const types = this.truthTypes();
+      if (n >= 0 && n < types.length) { this.pickTruth(types[n]); e.preventDefault(); return; }
+      if (this.sceneKey) this.sceneKey(e);
+    };
+    window.addEventListener("keydown", this.keyh);
     // 上から見た図：コートの座標 [m]（x が長い方向）。少し余白をとる
     const xs = v.court.flat().map((p) => Math.abs(p[0])), ys = v.court.flat().map((p) => Math.abs(p[1]));
     const X = Math.max(...xs) + 0.6, Y = Math.max(...ys) + 0.6, sw = 0.05;
@@ -220,13 +326,11 @@ App.views.shots = {
       frames.forEach((f, i) => { if (f[1] != null && Math.abs(f[1] - s.t_hit_s) < Math.abs((frames[best][1] ?? 1e9) - s.t_hit_s)) best = i; });
       show(best);
     };
-    this.keyh = (e) => {
-      // 入力欄（スライダーも）の上では、その欄の動きに任せる
-      if (!scene.isConnected || ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) return;
+    // ← → はコマ送り（キーの受け取りは renderDetail がまとめてする）
+    this.sceneKey = (e) => {
       if (e.key === "ArrowLeft") { show(k - 1); e.preventDefault(); }
       if (e.key === "ArrowRight") { show(k + 1); e.preventDefault(); }
     };
-    window.addEventListener("keydown", this.keyh);
     show(k);
   },
 };

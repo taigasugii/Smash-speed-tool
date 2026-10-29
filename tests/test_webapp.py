@@ -141,6 +141,45 @@ def test_fastest_smash_flow(client, session):
     assert res["ok"] and res["row"]["speed_initial_mps"] == pytest.approx(75.0, rel=0.05)
 
 
+def test_shot_labels_api(client, tmp_path):
+    """種類の正解ラベル（B6b）：保存すると一覧に付き、解析し直した一覧（時刻が少しずれる）にも付き直す。"""
+    from smash_speed.shots import Shot, write_shots
+
+    out = tmp_path / "IMG_1_shots"
+    out.mkdir()
+    shots = [Shot(t_hit_s=1.0, side="h", shot_type="clear", speed_kmh=150.0),
+             Shot(t_hit_s=2.0, side="o", shot_type="smash", speed_kmh=300.0),
+             Shot(t_hit_s=3.0, side="h", shot_type="unknown")]
+    write_shots(out / "shots.csv", shots)
+    (out / "shot_list.json").write_text(json.dumps({"video": r"C:\v\IMG_1.MOV", "by_type": {}}), encoding="utf-8")
+    client.post("/api/state", json={"shots_dir": str(out), "out_root": str(tmp_path / "out")})
+
+    g = client.get("/api/shots").get_json()
+    assert [s["truth"] for s in g["shots"]] == [None, None, None]
+    assert g["label_stats"]["all"]["n"] == 0 and g["label_stats"]["all"]["rule_accuracy"] is None
+    assert not client.post("/api/shot_label", json={"i": 9, "label": "drop"}).get_json()["ok"]
+    assert not client.post("/api/shot_label", json={"i": 0, "label": "kick"}).get_json()["ok"]
+    assert not client.post("/api/shot_label", json={"i": 0, "label": "unknown"}).get_json()["ok"]
+    r = client.post("/api/shot_label", json={"i": 0, "label": "drop"}).get_json()
+    assert r["ok"] and r["truth"] == "drop"
+    r = client.post("/api/shot_label", json={"i": 1, "label": "smash"}).get_json()
+    st = r["label_stats"]
+    assert st["video"]["n"] == st["all"]["n"] == 2 and st["all"]["rule_accuracy"] == pytest.approx(0.5)
+    assert (tmp_path / "out" / "shot_labels.csv").exists()  # 出力の場所に 1 つ
+    assert [s["truth"] for s in client.get("/api/shots").get_json()["shots"]] == ["drop", "smash", None]
+    # 空にすると消える
+    r = client.post("/api/shot_label", json={"i": 0, "label": ""}).get_json()
+    assert r["ok"] and r["truth"] is None and r["label_stats"]["all"]["n"] == 1
+    # 解析し直して時刻が少しずれても付き直す。別の動画の一覧には付かないが、全部の本数には入る
+    write_shots(out / "shots.csv", [Shot(t_hit_s=1.02, shot_type="clear"), Shot(t_hit_s=2.03, shot_type="drive")])
+    g = client.get("/api/shots").get_json()
+    assert [s["truth"] for s in g["shots"]] == [None, "smash"]
+    (out / "shot_list.json").write_text(json.dumps({"video": "/x/IMG_2.mp4", "by_type": {}}), encoding="utf-8")
+    g = client.get("/api/shots").get_json()
+    assert [s["truth"] for s in g["shots"]] == [None, None]
+    assert g["label_stats"]["video"]["n"] == 0 and g["label_stats"]["all"]["n"] == 1
+
+
 def test_shot_list_flow(client, tmp_path):
     """ショットの一覧：裏で ``shots`` を動かし、種類・初速つきのショットを返す。区間を決めて解析し直せる。"""
     from smash_speed.physics import PhysicsParams

@@ -852,28 +852,80 @@ def batch_update():
 # =============================================================================
 # ショットの一覧
 # =============================================================================
+def _shots_dir() -> str | None:
+    d = request.args.get("dir") or (body().get("dir") if request.method == "POST" else None) or S.state.get("shots_dir")
+    if not d and S.state.get("video"):  # コマンドで解析した結果も、決まった場所にあれば読む
+        d = str(out_root() / f"{Path(S.state['video']).stem}_shots")
+    return d
+
+
+def _label_stats(labels: list, video: str) -> dict[str, Any]:
+    """正解ラベルの本数と、決まりの判定が合っていた割合（全部・この動画）。"""
+    from smash_speed.shot_labels import label_summary, video_key
+
+    def clean(r: dict[str, Any]) -> dict[str, Any]:
+        a = r["rule_accuracy"]
+        return {**r, "rule_accuracy": round(float(a), 4) if np.isfinite(a) else None}
+
+    key = video_key(video)
+    return {"all": clean(label_summary(labels)), "video": clean(label_summary([r for r in labels if r.video_name == key]))}
+
+
 @app.get("/api/shots")
 def shots_get():
-    """``shots`` の結果（``shot_list.json`` と ``shots.csv``）。ショットは打った時刻の順。"""
+    """``shots`` の結果（``shot_list.json`` と ``shots.csv``）。ショットは打った時刻の順。
+
+    種類の正解ラベル（ROADMAP B6）は出力の場所の ``shot_labels.csv`` から付け直し、各ショットの ``truth`` に入れる。
+    """
     from dataclasses import asdict
 
+    from smash_speed.shot_labels import LABELS_FILE, match_labels, read_labels
     from smash_speed.shot_list import SHOT_LIST_FILE
     from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
 
-    d = request.args.get("dir") or S.state.get("shots_dir")
-    if not d and S.state.get("video"):  # コマンドで解析した結果も、決まった場所にあれば読む
-        d = str(out_root() / f"{Path(S.state['video']).stem}_shots")
+    d = _shots_dir()
     if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
         return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS)
     info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+    shots = read_shots(Path(d) / SHOTS_FILE)
+    labels = read_labels(out_root() / LABELS_FILE)
+    truth = match_labels(labels, info.get("video", ""), shots)
     rows = []
-    for k, s in enumerate(read_shots(Path(d) / SHOTS_FILE)):
+    for k, s in enumerate(shots):
         r = asdict(s)
         r["id"] = k
         r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
+        r["truth"] = truth.get(k)
         rows.append(r)
     files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv")) if (Path(d) / f).exists()}
-    return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, files=files)
+    return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, files=files,
+              label_stats=_label_stats(labels, info.get("video", "")))
+
+
+@app.post("/api/shot_label")
+def shot_label():
+    """1 本のショットに種類の正解ラベルを付ける（``label`` が空なら消す）。``i`` は ``/api/shots`` の ``id``。"""
+    from smash_speed.shot_labels import LABELS_FILE, set_label
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOTS_FILE, read_shots
+
+    d = _shots_dir()
+    if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
+        return err("ショットの一覧がありません")
+    b = body()
+    shots = read_shots(Path(d) / SHOTS_FILE)
+    k = int(b.get("i", -1))
+    if not 0 <= k < len(shots):
+        return err("そのショットはありません")
+    label = b.get("label") or None
+    if label == "unknown":
+        return err("正解には種類（スマッシュ・クリアなど）を選んでください")
+    video = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8")).get("video", "")
+    try:
+        labels = set_label(out_root() / LABELS_FILE, video, shots[k], label)
+    except ValueError as e:
+        return err(str(e))
+    return ok(id=k, truth=label, label_stats=_label_stats(labels, video))
 
 
 @app.get("/api/shot_view")
@@ -888,9 +940,7 @@ def shot_view():
     from smash_speed.shot_list import DETECTIONS_FILE
     from smash_speed.shots import SHOTS_FILE, read_shots
 
-    d = request.args.get("dir") or S.state.get("shots_dir")
-    if not d and S.state.get("video"):
-        d = str(out_root() / f"{Path(S.state['video']).stem}_shots")
+    d = _shots_dir()
     if not d or not (Path(d) / SHOTS_FILE).exists():
         return err("ショットの一覧がありません")
     shots = read_shots(Path(d) / SHOTS_FILE)
