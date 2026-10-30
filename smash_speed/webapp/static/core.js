@@ -47,6 +47,7 @@ const NAV = [
   { group: "そのほか" },
   { id: "fastest", num: "★", label: "いちばん速いスマッシュ", sub: "動画の中をまとめて解析" },
   { id: "shots", num: "▤", label: "ショットの一覧", sub: "すべての球の種類と速さ" },
+  { id: "form", num: "人", label: "フォームを比べる", sub: "横から撮ったスイング" },
   { id: "list", num: "≡", label: "結果の一覧", sub: "これまでの解析" },
   { id: "tools", num: "⚗", label: "研究ツール", sub: "ラベル付け・検証など" },
   { id: "agent", num: "🤖", label: "開発エージェント", sub: "自動で機能を増やす" },
