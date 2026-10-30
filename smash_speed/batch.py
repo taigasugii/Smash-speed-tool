@@ -488,7 +488,7 @@ def load_candidates(out_dir: Path) -> tuple[list[Candidate], dict[str, Any]]:
 
 def analyze_selected(out_dir: Path, cfg: dict[str, Any], ids: list[int] | None = None,
                      overlay: bool = True, progress: Callable[[str], None] = print) -> list[Candidate]:
-    """選んだ候補を、確認した打つ人・着地点で詳しく解析し、結果を ``candidates.json`` と ``ranking.csv`` に書く。"""
+    """選んだ候補を、確認した打つ人・着地点で詳しく解析し、結果を ``candidates.json``・``ranking.csv``・``shots.csv`` に書く。"""
     from smash_speed.pipeline import AnalyzeOptions, analyze
 
     out_dir = Path(out_dir).resolve()
@@ -541,6 +541,8 @@ def analyze_selected(out_dir: Path, cfg: dict[str, Any], ids: list[int] | None =
             progress(f"[進行] {c.t_onset:.2f} s → 解析できませんでした（{e.message}）")
         save_candidates(out_dir, cands)
     write_ranking(out_dir, cands)
+    from smash_speed.shots import export_batch
+    export_batch(out_dir, PhysicsParams.from_config(cfg))  # ショットの形（shots.csv）でも書き出す
     return cands
 
 

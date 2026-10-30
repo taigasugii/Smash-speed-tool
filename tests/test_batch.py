@@ -8,6 +8,7 @@ import pytest
 from smash_speed.batch import (BatchOptions, _back_extrapolate, analyze_selected, find_candidates, load_candidates,
                                save_candidates, strong_onsets)
 from smash_speed.config import load_config
+from smash_speed.shots import read_shots, side_of
 from smash_speed.validate import make_synthetic_session
 
 
@@ -64,6 +65,10 @@ def test_find_and_analyze_on_synthetic_video(session, tmp_path):
     r = [x for x in back if x.id == c.id][0].result
     assert r["kmh"] == pytest.approx(75.0 * 3.6, rel=0.05) and r["confirmed"]
     assert (tmp_path / "b" / "ranking.csv").exists()
+    # 同じ結果がショットの形（shots.csv）でも出る
+    shot, = read_shots(tmp_path / "b" / "shots.csv")
+    assert shot.shot_type == "smash" and shot.speed_kmh == pytest.approx(r["kmh"])
+    assert shot.side == side_of(info["hitter_xy"][0]) and shot.hit_z_m is not None and shot.land_x_m is not None
     json.loads((tmp_path / "b" / "candidates.json").read_text(encoding="utf-8"))  # NaN を含まない
 
 

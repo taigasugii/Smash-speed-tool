@@ -396,6 +396,7 @@ def open_video():
                        str(out_root() / f"{stem}_calibration.json"))
         bd = out_root() / f"{stem}_smashes"  # この動画で前に探したスマッシュの候補があれば続きから
         S.state["batch_dir"] = str(bd) if (bd / "candidates.json").exists() else None
+        S.state["shots_dir"] = None  # ショットの一覧も、この動画の決まった場所から読む
     S.state["capture_fps"] = fps
     S.save()
     calib = load_camera()
@@ -665,6 +666,20 @@ def run(kind: str):
         if not st.get("overlay", True):
             args.append("--no-overlay")
         t = start_task("選んだ候補を詳しく解析", [cli(*args)])
+    elif kind == "shots":
+        if not st.get("video") or not st.get("calib") or not Path(st["calib"]).exists():
+            return err("動画を開き、手順 2 でコートを合わせてから始めてください。")
+        out = root / f"{Path(st['video']).stem}_shots"
+        st["shots_dir"] = str(out)
+        S.save()
+        args = ["shots", *video_args(), "--calib", st["calib"], "--out", out]
+        if b.get("start") is not None and b.get("end") is not None:
+            args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
+        if st.get("audio"):
+            args += ["--audio", st["audio"]]
+        if b.get("use_roi") and st.get("roi"):
+            args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
+        t = start_task("すべてのショットを解析", [cli(*args)])
     elif kind == "synth":
         speed, fps = float(b.get("speed", 80)), float(b.get("fps", 240))
         out = root / f"synthetic_{speed:g}mps_{fps:g}fps"
@@ -832,6 +847,152 @@ def batch_update():
                 setattr(c, k, bool(u[k]))
     save_candidates(d, cands)
     return ok()
+
+
+# =============================================================================
+# ショットの一覧
+# =============================================================================
+def _shots_dir() -> str | None:
+    d = request.args.get("dir") or (body().get("dir") if request.method == "POST" else None) or S.state.get("shots_dir")
+    if not d and S.state.get("video"):  # コマンドで解析した結果も、決まった場所にあれば読む
+        d = str(out_root() / f"{Path(S.state['video']).stem}_shots")
+    return d
+
+
+def _label_stats(labels: list, video: str) -> dict[str, Any]:
+    """正解ラベルの本数と、決まりの判定が合っていた割合（全部・この動画）。"""
+    from smash_speed.shot_labels import label_summary, video_key
+
+    def clean(r: dict[str, Any]) -> dict[str, Any]:
+        a = r["rule_accuracy"]
+        return {**r, "rule_accuracy": round(float(a), 4) if np.isfinite(a) else None}
+
+    key = video_key(video)
+    return {"all": clean(label_summary(labels)), "video": clean(label_summary([r for r in labels if r.video_name == key]))}
+
+
+@app.get("/api/shots")
+def shots_get():
+    """``shots`` の結果（``shot_list.json`` と ``shots.csv``）。ショットは打った時刻の順。
+
+    種類の正解ラベル（ROADMAP B6）は出力の場所の ``shot_labels.csv`` から付け直し、各ショットの ``truth`` に入れる。
+    """
+    from dataclasses import asdict
+
+    from smash_speed.shot_labels import LABELS_FILE, match_labels, read_labels
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
+
+    d = _shots_dir()
+    if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
+        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS)
+    info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+    shots = read_shots(Path(d) / SHOTS_FILE)
+    labels = read_labels(out_root() / LABELS_FILE)
+    truth = match_labels(labels, info.get("video", ""), shots)
+    rows = []
+    for k, s in enumerate(shots):
+        r = asdict(s)
+        r["id"] = k
+        r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
+        r["truth"] = truth.get(k)
+        rows.append(r)
+    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv")) if (Path(d) / f).exists()}
+    return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, files=files,
+              label_stats=_label_stats(labels, info.get("video", "")))
+
+
+@app.post("/api/shot_label")
+def shot_label():
+    """1 本のショットに種類の正解ラベルを付ける（``label`` が空なら消す）。``i`` は ``/api/shots`` の ``id``。"""
+    from smash_speed.shot_labels import LABELS_FILE, set_label
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOTS_FILE, read_shots
+
+    d = _shots_dir()
+    if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
+        return err("ショットの一覧がありません")
+    b = body()
+    shots = read_shots(Path(d) / SHOTS_FILE)
+    k = int(b.get("i", -1))
+    if not 0 <= k < len(shots):
+        return err("そのショットはありません")
+    label = b.get("label") or None
+    if label == "unknown":
+        return err("正解には種類（スマッシュ・クリアなど）を選んでください")
+    video = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8")).get("video", "")
+    try:
+        labels = set_label(out_root() / LABELS_FILE, video, shots[k], label)
+    except ValueError as e:
+        return err(str(e))
+    return ok(id=k, truth=label, label_stats=_label_stats(labels, video))
+
+
+@app.get("/api/shot_view")
+def shot_view():
+    """1 本のショットの場面と軌道（ROADMAP B5c）。
+
+    ``i`` は ``/api/shots`` の ``id``。返すもの：場面に使うコマの番号、当てはめた軌道（コートの座標と画像の上の点）、
+    打点・着地点、打ってから次の打球までのシャトルの検出（画像の上の点）、場面を前後に送れるコマの並び
+    （``frames``：打つ少し前から次の打球までの ``[コマ, 時刻, x, y]``。見えないコマは x・y が None）。
+    """
+    from smash_speed.physics import PhysicsParams
+    from smash_speed.shot_list import DETECTIONS_FILE
+    from smash_speed.shots import SHOTS_FILE, read_shots
+
+    d = _shots_dir()
+    if not d or not (Path(d) / SHOTS_FILE).exists():
+        return err("ショットの一覧がありません")
+    shots = read_shots(Path(d) / SHOTS_FILE)
+    k = int(request.args.get("i", -1))
+    if not 0 <= k < len(shots):
+        return err("そのショットはありません")
+    s = shots[k]
+    t_next = shots[k + 1].t_hit_s if k + 1 < len(shots) else None
+    traj = s.trajectory(PhysicsParams.from_config(S.cfg()))
+    pts: list[list[float]] = []
+    pts_t: list[float] = []
+    if traj is not None:
+        t, p = traj["t"], traj["pos"]
+        if t_next is not None:  # 次の打球より後は描かない（打ち返されている）
+            n = max(int(np.searchsorted(t, t_next)), 2)
+            t, p = t[:n], p[:n]
+        step = max(1, len(p) // 80)
+        pts = p[::step].tolist() + [p[-1].tolist()]
+        pts_t = t[::step].tolist() + [float(t[-1])]
+        t_end = float(t[-1])
+    else:
+        t_end = t_next if t_next is not None else s.t_hit_s + 1.0
+    if S.camera is None and S.state.get("calib"):
+        load_camera()
+    uv = []
+    if S.camera is not None and pts:
+        uv = [[float(u), float(v)] if np.isfinite([u, v]).all() else None
+              for u, v in S.camera.project(np.array(pts, float))]
+    det, frame, frames = [], None, []
+    if (Path(d) / DETECTIONS_FILE).exists():
+        df = pd.read_csv(Path(d) / DETECTIONS_FILE)
+        if len(df):
+            # 場面は打ってから少し後（0.1 秒）のコマ。打った瞬間はシャトルが人と重なりやすい
+            t_show = min(s.t_hit_s + 0.1, t_end)
+            frame = int(df.frame.iloc[int(np.argmin(np.abs(df.timestamp.to_numpy() - t_show)))])
+            w = df[(df.timestamp >= s.t_hit_s - 0.05) & (df.timestamp <= t_end + 0.05) & (df.visible > 0)]
+            det = [[round(float(r.timestamp), 4), round(float(r.x_px), 1), round(float(r.y_px), 1)] for r in w.itertuples()]
+            # 前後に送れるコマ：打つ 0.2 秒前から、次の打球（または軌道の終わり）まで
+            a = df[(df.timestamp >= s.t_hit_s - 0.2) & (df.timestamp <= t_end + 0.05)]
+            frames = [[int(r.frame), round(float(r.timestamp), 4)]
+                      + ([round(float(r.x_px), 1), round(float(r.y_px), 1)] if r.visible > 0 else [None, None])
+                      for r in a.itertuples()]
+    if frame is None and S.meta is not None:
+        frame = int(round(s.t_hit_s * S.meta.fps_meta))
+    r3 = lambda v: None if v is None else round(float(v), 3)  # noqa: E731
+    return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end,
+              hit=[r3(s.hit_x_m), r3(s.hit_y_m), r3(s.hit_z_m)] if s.hit_point is not None else None,
+              land=[r3(s.land_x_m), r3(s.land_y_m)] if s.land_x_m is not None and s.land_y_m is not None else None,
+              path=[[round(float(c), 3) for c in p] for p in pts], path_t=[round(float(v), 4) for v in pts_t],
+              path_px=uv, detections=det, frames=frames,
+              court=[[a[:2].tolist(), b[:2].tolist()] for a, b, kind in court_segments(S.cfg()) if kind == "line"],
+              image_size=[S.meta.width, S.meta.height] if S.meta is not None else None)
 
 
 # =============================================================================

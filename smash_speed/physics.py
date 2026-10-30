@@ -28,6 +28,7 @@ from smash_speed.camera import Camera
 from smash_speed.geometry import FlightPlane, intersect_plane, triangulate
 
 MPS_TO_KMH = 3.6
+MAX_SIM_SPEED_MPS = 1000.0  # これより速い初速は積分しない（最速のスマッシュの約 6 倍。最適化の途中の極端な値）
 
 
 # =============================================================================
@@ -83,6 +84,11 @@ def simulate(p0: np.ndarray, v0: np.ndarray, t_ref: float, times: np.ndarray,
     """
     times = np.asarray(times, float)
     out = np.empty((len(times), 6))
+    if not np.linalg.norm(v0) <= MAX_SIM_SPEED_MPS:
+        # 雑音の多い観測では、最適化が極端な初速（数十万 m/s）を試すことがある。空気抵抗が大きすぎて
+        # 積分の刻みが極端に細かくなり、1 回の当てはめが何十分もかかるので、積分せずに NaN（罰則）にする
+        out[:] = np.nan
+        return out[:, :3], out[:, 3:]
     y0 = np.concatenate([p0, v0])
     args = (phys.g, phys.k)
     for mask, sign in ((times >= t_ref, 1.0), (times < t_ref, -1.0)):
@@ -225,6 +231,7 @@ class FitOptions:
     # 初期値にする打点時刻の位置 [m]・速度 [m/s]（打点から出る軌道の探索の結果など）。None なら観測から計算する。
     # カメラが飛行平面に近いと、視線と平面の交点（観測からの初期値）がカメラの後ろに出て計算できないため
     init_state: Any = None
+    max_nfev_per_param: int = 200    # 最適化の関数の評価の回数の上限（パラメータ 1 個あたり）
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], **overrides: Any) -> "FitOptions":
@@ -357,7 +364,8 @@ def _residuals_3d(theta: np.ndarray, model: _Model, t: np.ndarray, X: np.ndarray
     p0, v0, vt = model.unpack(theta)
     phys = PhysicsParams(base.g, vt, base.method, base.rtol, base.atol)
     pos, _ = simulate(p0, v0, t_ref, t, phys)
-    return (pos - X).ravel()
+    r = (pos - X).ravel()
+    return np.where(np.isfinite(r), r, 1e3)  # 積分できなかった場合の罰則 [m]
 
 
 def _speed_gradient(theta: np.ndarray, model: _Model) -> np.ndarray:
@@ -422,7 +430,8 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
             m1 = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity)
             stage1 = least_squares(_residuals_3d, m1.pack(p0, v0, phys.terminal_velocity),
                                    args=(m1, t3, X3, phys, t_ref), loss="soft_l1", f_scale=0.1,
-                                   diff_step=opts.diff_step, x_scale="jac", max_nfev=200 * n_par)
+                                   diff_step=opts.diff_step, x_scale="jac",
+                                   max_nfev=opts.max_nfev_per_param * n_par)
             starts.append(np.insert(stage1.x, m1.n_kin, np.zeros(model.n_plane)))
         elif not starts:
             raise ValueError("初期値の計算に使える3次元点が3点未満です")
@@ -430,7 +439,7 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
     def solve(o: list[Observations], th0: np.ndarray):
         return least_squares(_residuals, th0, args=(model, o, phys, t_ref), loss=opts.loss,
                              f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
-                             x_scale="jac", max_nfev=200 * n_par)
+                             x_scale="jac", max_nfev=opts.max_nfev_per_param * n_par)
 
     # 初期値が複数あれば（探索で選んだ軌道・観測から計算した値）、それぞれから解いてずれの小さい方を使う
     sol = min((solve(obs, th) for th in starts), key=lambda s_: s_.cost)
