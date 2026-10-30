@@ -138,5 +138,6 @@ def install(app: Flask, out_root: Callable[[], Path], state: Callable[[], dict[s
                "--model", b.get("model") or "rtmpose", "--distance", str(float(b.get("distance") or 7.0))]
         if b.get("left_handed"):
             cmd.append("--left-handed")
-        t = run_task("フォームの解析", [cmd])
+        # 続けて、1 ショット 1 行の表（E7）も作り直す
+        t = run_task("フォームの解析", [cmd, [python_exe(), "-m", "smash_speed.form_table", str(out)]])
         return jsonify(ok=True, task=t.id, dir=str(out))
