@@ -14,6 +14,20 @@
 
 ---
 
+## 2026-10-30 10:27 E1 姿勢推定の導入（途中。クラウドのセッション）
+- やったこと：
+  - `smash_speed/pose.py`：関節を COCO の 17 点にそろえ、モデルを「BGR の画像 → 人ごとの（関節 (17, 2)、信頼度 (17,)）」の形で差し替えられるようにした。
+    RTMPose（rtmlib の人の検出 + 関節。ONNX のセッションを `accel.make_session` に載せ替えて DirectML）と MediaPipe Pose Landmarker（33 点 → 17 点、
+    重みは `ckpts/pose/` に取ってくる）。打つ人の選び方（最初は関節の範囲が最大の人、次から前のコマに近い人）、信頼度 0.3 未満を欠けにして 3 コマ以下の欠けを埋める `clean`、
+    `PoseSequence`（.npz の読み書き）、手で付けた関節の CSV（1 行 1 関節、visible は COCO と同じ）と PCK@0.2（胴体の長さ）、`python -m smash_speed.pose estimate|pck`。
+  - `smash_speed/synth_pose.py`：角度・タイミングを決めた側方のスイングの 3 次元の骨格と、側方のカメラ（`side_camera`）。E 章の正解に使う。
+  - テスト `tests/test_pose.py`（10 件）：偽物のモデル（合成の骨格 + 揺れ、奥の小さい人つき）で打つ人を選ぶ・欠けの処理、揺れ σ で PCK が Rayleigh 分布の値
+    （0.5 ± 0.06）になる、MediaPipe が入っていれば実際に動く。`docs/pose_features.md` の 1 節。pyproject と README に rtmlib の入れ方（`--no-deps`）。
+- 結果（数字）：合成の骨格に揺れを足すと PCK・平均の誤差が理論の値と合う。MediaPipe（lite）はクラウドの CPU で動いた（libEGL を入れる必要があった）。
+  RTMPose は重みの配布元（download.openmmlab.com）にクラウドから届かず、試せなかった。
+- 品質チェック：通った（E1〜E7 をすべて入れた最終の状態で通した。クラウドでは 1 回 25 分かかるため、課題ごとではなく全体で通した。テスト 285 件、合成 MAPE physics/audio 30fps 3.688% / 240fps 4.193%、hitter_position 30fps 6.955% / 240fps 6.059%（基準と同じ）、check_hits 適合率 0.988 以上、check_rallies 1.000、check_shot_speeds 30fps 2.47%・120fps 1.73%、check_shot_types 1.000、実動画は飛ばした）
+- 次にやること：デスクトップで RTMPose の重みを取って DirectML で動かし、人が付けた約 200 コマで両方の PCK を出す（QUESTIONS）。
+
 ## 2026-10-30 01:35 B6b 種類の正解ラベルを付ける画面（済み。B6 も済み）
 - やったこと：
   - サーバー：`/api/shots` の各ショットに `truth`（出力の場所の `shot_labels.csv` から `match_labels` で付け直した正解）と、

@@ -78,6 +78,8 @@ python -m pip install -e ".[dev]"
 # 任意：深層学習（TrackNetV3 の推論・学習。CPU 版で可）／姿勢推定（MediaPipe）
 python -m pip install -e ".[dl]"
 python -m pip install -e ".[pose]"
+# 任意：姿勢推定（RTMPose）。onnxruntime-directml と同じ環境に入れるので、依存は入れずに入れる（docs/pose_features.md）
+python -m pip install --no-deps rtmlib tqdm
 
 # 任意：GPU での推論（onnxruntime-directml。約 33 MB）。速さの確かめ方は docs/gpu.md
 python -m pip install -e ".[gpu]"
