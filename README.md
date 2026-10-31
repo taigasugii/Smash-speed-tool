@@ -667,6 +667,24 @@ python -m smash_speed.history out      # out\history.csv・out\history.html
 スマッシュの一括解析の出力先（スマッシュだけ）は、種類の割合が偏るので入れない。前に解析した出力先には `recorded_at` がないので、
 動画のファイルの日時になる（動画を移した・コピーした日になっていることがある）。
 
+### 選手の検出と追跡（`smash_speed/players.py`）
+
+人の検出（YOLOX）で毎コマ人の枠を出し、足元（枠の下の辺の中央）を床に投影してコートの座標にする。
+手前（h）と奥（o）に分け、側ごとに近いコマの枠をつないだ軌跡のうち、時間が重ならずコートの中にいた点が最も多い組を選ぶ
+（コートの外で待っている人・隣のコートの人を外す）。0.5 秒までの抜けは前後から補う（`interpolated`）。
+
+```powershell
+python -m smash_speed.players 動画.MOV --calib outputs\動画_calibration.json --out out\players --start 80 --end 100
+# ダブルス：--doubles。軽いモデル：--model yolox_tiny。2 コマに 1 回：--stride 2
+```
+
+書き出すもの：`players.csv`（1 コマ 1 側 1 人：コートの位置 `x, y` [m]、足元の画像の位置、枠、スコア）、`people.csv`（検出したすべての人）、
+`players_preview.jpg`（真ん中のコマに枠を描いた確かめ用）、`players.json`（選手の位置が出たコマの割合・かかった時間）。
+
+IMG_4397 の 80〜100 s（4K 30fps、600 コマ）で、手前・奥とも 100% のコマで位置が出た（GPU で約 20 秒）。
+注意：跳んでいる間（ジャンプスマッシュ）は足元が床にないので、位置が前・横に 1〜2 m ずれる。奥の選手は足元が 1 px ずれると
+コートの位置が約 7 cm 動くので、手前より揺れが大きい。
+
 ## 実動画（iPhone 17, 4K 30fps）で試した結果
 
 | 動画 | カメラ | 結果 |
@@ -687,6 +705,9 @@ python -m smash_speed.history out      # out\history.csv・out\history.html
 - 各出力に、使用した設定のスナップショット（`config_used.yaml`）と実行メタデータ（バージョン・git コミット・日時・コマンドの引数）を保存する。
 
 ## 外部のモデル・データ
+
+- [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX)（Apache-2.0）の公式の ONNX（`yolox_s` 約 36 MB・`yolox_tiny` 約 20 MB）を、
+  選手の検出（`players.py`）で最初に使うときに `ckpts/` へ落とす（SHA-256 を確かめる）。COCO の「人」の種類だけを使う。
 
 - [TrackNetV3](https://github.com/qaz812345/TrackNetV3)（MIT License。学習済み重みも同ライセンスと README に記載）を
   サブプロセスとして呼び出す（コードは同梱しない）。準備：

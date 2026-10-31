@@ -91,6 +91,18 @@ def stream_gray(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
                 start_s: float | None = None, end_s: float | None = None
                 ) -> Iterator[tuple[int, float, np.ndarray]]:
     """ffmpeg で動画を縮小したグレースケールで先頭から順に読み、(番号, 実時間 [s], 画像) を返す。"""
+    return _stream(meta, width, cfg, start_s, end_s, "gray", 1)
+
+
+def stream_bgr(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
+               start_s: float | None = None, end_s: float | None = None
+               ) -> Iterator[tuple[int, float, np.ndarray]]:
+    """``stream_gray`` のカラー版（画像は BGR の (h, w, 3)。人の検出に使う）。"""
+    return _stream(meta, width, cfg, start_s, end_s, "bgr24", 3)
+
+
+def _stream(meta: VideoMeta, width: int, cfg: dict[str, Any] | None, start_s: float | None, end_s: float | None,
+            pix_fmt: str, channels: int) -> Iterator[tuple[int, float, np.ndarray]]:
     w = int(width)
     h = int(round(meta.height * w / meta.width / 2)) * 2
     ts = meta.timestamps
@@ -99,9 +111,10 @@ def stream_gray(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
     # 途中から読む（-ss）と、動画によってはフレーム番号が 1 つずれる（先頭のフレームの時刻が不規則な動画など）。
     # 縮小しながらの読み込みは実時間の数倍速いので、いつも先頭から読み、i0 より前は捨てる
     cmd = [find_tool("ffmpeg", cfg), "-v", "error", "-nostdin", "-i", str(meta.path),
-           "-vf", f"scale={w}:{h}:flags=area", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 4)
-    n = w * h
+           "-vf", f"scale={w}:{h}:flags=area", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
+    n = w * h * channels
+    shape = (h, w) if channels == 1 else (h, w, channels)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=n * 4)
     k = 0
     try:
         while True:
@@ -111,7 +124,7 @@ def stream_gray(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
             if k >= len(ts):
                 break
             if k >= i0:
-                yield k, float(ts[k]), np.frombuffer(buf, np.uint8).reshape(h, w)
+                yield k, float(ts[k]), np.frombuffer(buf, np.uint8).reshape(shape)
             if k >= i1:
                 break
             k += 1
