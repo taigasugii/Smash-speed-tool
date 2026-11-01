@@ -17,7 +17,21 @@
 得点（``score_h``・``score_o``）は、動画の始まりの得点が分からないので空欄のまま。
 
 打球音は、打球を見つけるとき（``hits.find_hits``）にもう使っているので、ここでは使わない。
-選手の動き（打った後に選手が止まる・サーブの位置に戻る）は、選手の検出（ROADMAP D1）ができてから足す。
+
+選手の位置（``players.csv``。ROADMAP D1b）があれば、短いラリー（``short_max_shots`` 本以下）を選手の動きで確かめ、
+ラリーではない打球（ラリーの間に拾って返したシャトル・となりのコートのシャトル）を落とす（``check_short_rally``）。
+落としたショットは ``rally_id`` を空欄にし、メモに理由を書く。次のどれかなら落とす。
+
+ラリーの間に選手が ``play_mps`` より速く動いていればプレーしているとみなして落とさない。そうでない（ずっと歩くくらいの
+速さの）とき、次のどれかなら落とす。
+
+- 打った側の選手の足元が、打点から ``reach_m`` より遠い（となりのコート。選手は止まって待っている）→「打った人がいない」
+- 最初の打球のとき、選手がコートの外（線から ``off_court_m`` より外）にいる（拾いに行った・外へ歩いていく）→「選手がコートの外」
+- 最初の打球がサーブらしくない（打つ前の ``still_s`` の間に 2 人とも止まっていない、または打った人が
+  サービスコートの辺りにいない）→「選手が構えていない」
+
+サーブを打つ前は 2 人とも止まって構えるので、サーブだけで終わったラリー（サービスエース・サーブのミス）は落とさない。
+選手の位置が出ていない所（``min_cover`` 未満）では確かめない。``players`` を渡さなければ今までと同じ。
 
 ``python -m smash_speed.rallies --bench`` で、続けて打った合成ラリー（``synth_rally.make_session``）での精度を、
 打球の間隔だけで分ける今までのやり方（``shots.make_rallies``）と比べる。
@@ -37,6 +51,10 @@ from smash_speed.shots import Rally, Shot, side_of
 REASON_GAP = "間隔"
 REASON_LANDED = "着地"
 REASON_END = "動画の終わり"
+# 選手の動きで落とした理由（``Shot.note`` に「ラリーの外：…」と書く）
+REASON_NO_HITTER = "打った人がいない"
+REASON_OFF_COURT = "選手がコートの外"
+REASON_NOT_READY = "選手が構えていない"
 
 
 @dataclass
@@ -47,6 +65,14 @@ class RallyOptions:
     flying_frac: float = 0.4     # 打球の間でシャトルが見えたコマの割合がこれ以上なら、飛んでいたとみなす
     singles: bool = False        # 入・出をシングルスのサイドラインで決める（偽ならダブルス）
     line_margin_m: float = 0.1   # 着地点が線からこれより近ければ「線の近く」とメモする [m]
+    # 選手の動きで短いラリーを確かめる条件（``split_rallies`` に ``players`` を渡したときだけ使う）
+    short_max_shots: int = 2     # これ以下の本数のラリーを確かめる
+    reach_m: float = 2.5         # 打った側の選手の足元が、打点からこれより遠ければ打った人がいない [m]
+    off_court_m: float = 0.6     # 選手が外側の線からこれより外にいれば、コートの外 [m]
+    play_mps: float = 2.5        # ラリーの間に選手がこれより速く動かなければ、プレーしていない [m/s]
+    still_mps: float = 1.0       # サーブの前の still_s の間、2 人ともこれより遅ければ止まって構えている [m/s]
+    still_s: float = 1.0
+    min_cover: float = 0.6       # 確かめる時間のうち、選手の位置が出ている割合がこれ未満なら確かめない
 
 
 @dataclass
@@ -128,14 +154,109 @@ def rally_outcome(last: Shot, o: RallyOptions, court: dict[str, Any] | None = No
     return "out", other, note
 
 
+def _window(tracks: pd.DataFrame, side: str, t0: float, t1: float) -> pd.DataFrame:
+    return tracks[(tracks["side"] == side) & (tracks["t"] >= t0) & (tracks["t"] <= t1)]
+
+
+def _covered(tracks: pd.DataFrame, side: str, t0: float, t1: float, o: RallyOptions) -> bool:
+    """``t0``〜``t1`` に、その側の選手の位置が ``min_cover`` 以上出ているか。"""
+    g = _window(tracks, side, t0, t1)
+    if g.empty or t1 <= t0:
+        return False
+    per_player = g.groupby("player")["dt"].sum()
+    return float(per_player.max()) >= o.min_cover * (t1 - t0)
+
+
+def _nearest(tracks: pd.DataFrame, side: str, t: float, max_dt: float = 0.2) -> pd.DataFrame:
+    """時刻 ``t`` にいちばん近いコマの、その側の選手ごとの位置（``max_dt`` より離れたコマしかなければ空）。"""
+    g = _window(tracks, side, t - max_dt, t + max_dt)
+    if g.empty:
+        return g
+    g = g.assign(_d=(g["t"] - t).abs())
+    return g.loc[g.groupby("player")["_d"].idxmin()]
+
+
+def check_short_rally(rally_shots: list[Shot], t_end: float | None, tracks: pd.DataFrame, o: RallyOptions,
+                      court: dict[str, Any] | None = None) -> str:
+    """短いラリーを選手の動き（``movement.movement_tracks`` のならした位置と速さ）で確かめ、落とす理由を返す（落とさなければ空文字）。"""
+    c = court or {}
+    half_len = c.get("half_length_m", 6.70)
+    half_w = c.get("half_width_doubles_m", 3.05)
+    first = rally_shots[0]
+    t0 = first.t_hit_s
+    t1 = max(t_end if t_end is not None else t0, rally_shots[-1].t_hit_s) + 0.1
+    pre0 = t0 - o.still_s - 0.1
+    if not all(_covered(tracks, side, pre0, t1, o) for side in ("h", "o")):
+        return ""
+    # 選手が速く動いていれば、プレーしている（打点へ間に合わず遠くても、ラリーとみなす）
+    during = tracks[(tracks["t"] >= t0 - 0.3) & (tracks["t"] <= t1)]
+    if len(during) and float(np.nanmax(during["peak_speed"].to_numpy(float))) >= o.play_mps:
+        return ""
+    # 1. 打った側の選手が打点の近くにいない（打点が分かるショットだけ）
+    for s in rally_shots:
+        if s.hit_x_m is None or s.hit_y_m is None or not s.side:
+            continue
+        near = _nearest(tracks, s.side, s.t_hit_s)
+        if near.empty:
+            continue
+        d = np.hypot(near["x"].to_numpy(float) - s.hit_x_m, near["y"].to_numpy(float) - s.hit_y_m)
+        if float(d.min()) > o.reach_m:
+            return REASON_NO_HITTER
+    # 2. 最初の打球のとき、選手がコートの外にいる
+    now = pd.concat([_nearest(tracks, side, t0) for side in ("h", "o")])
+    if len(now) and (((now["x"].abs() - half_len) > o.off_court_m) | ((now["y"].abs() - half_w) > o.off_court_m)).any():
+        return REASON_OFF_COURT
+    # 3. 最初の打球がサーブらしくない
+    if not all(_covered(tracks, side, pre0, t0 - 0.1, o) for side in ("h", "o")):
+        return ""   # 打つ前の位置がない（動画の始まりなど）ので、サーブらしいかは分からない
+    before = tracks[(tracks["t"] >= pre0) & (tracks["t"] <= t0 - 0.1)]
+    still = float(np.nanmax(before["speed"].to_numpy(float))) < o.still_mps
+    hitter = _nearest(tracks, first.side, t0) if first.side else now.iloc[:0]
+    in_service = bool(len(hitter)) and bool(((hitter["x"].abs() >= 1.98 - 0.5) & (hitter["x"].abs() <= half_len + 0.3)
+                                             & (hitter["y"].abs() <= half_w + 0.3)).any())
+    return "" if still and in_service else REASON_NOT_READY
+
+
+def drop_false_rallies(rallies: list[Rally], shots: list[Shot], players: pd.DataFrame, o: RallyOptions,
+                       court: dict[str, Any] | None = None) -> list[Rally]:
+    """短いラリーを選手の動きで確かめ（``check_short_rally``）、ラリーではないものを落として番号を付け直す。
+
+    落としたラリーのショットは ``rally_id``・``index_in_rally`` を空欄にし、``note`` の頭に「ラリーの外：理由」を書く。
+    """
+    from smash_speed.movement import movement_tracks
+
+    if players is None or players.empty:
+        return rallies
+    tracks = movement_tracks(players)
+    if tracks.empty:
+        return rallies
+    kept: list[Rally] = []
+    for r in rallies:
+        mine = sorted((s for s in shots if s.rally_id == r.rally_id), key=lambda s: s.t_hit_s)
+        why = check_short_rally(mine, r.t_end_s, tracks, o, court) if mine and r.n_shots <= o.short_max_shots else ""
+        if why:
+            for s in mine:
+                s.rally_id = s.index_in_rally = None
+                s.note = "・".join(x for x in (f"ラリーの外：{why}", s.note) if x)
+            continue
+        new_id = len(kept) + 1
+        for s in mine:
+            s.rally_id = new_id
+        r.rally_id = new_id
+        kept.append(r)
+    return kept
+
+
 def split_rallies(shots: list[Shot], det: pd.DataFrame | None = None, opts: RallyOptions | None = None,
-                  court: dict[str, Any] | None = None) -> list[Rally]:
+                  court: dict[str, Any] | None = None, players: pd.DataFrame | None = None) -> list[Rally]:
     """ショットをラリーに分け、ラリーの番号と順番をショットに付ける（``shots`` の ``rally_id``・``index_in_rally`` を書き換える）。
 
     Args:
         shots: ショット（順番は問わない）。着地の時刻（``t_land_s``）と着地点があれば、着地で区切り、終わり方を決める
         det: 動画全体のシャトルの検出結果（列 ``timestamp, visible``）。打球の間でシャトルが飛んでいたかに使う
         court: 設定の ``court``（線の位置。省略時は BWF の寸法）
+        players: 選手の位置（``players.csv`` の中身）。あれば短いラリーを選手の動きで確かめ、ラリーではない
+            打球を落とす（``drop_false_rallies``。落としたショットの ``rally_id`` は空欄）
 
     Returns:
         時刻の順のラリー。``note`` に終わった理由（間隔・着地・動画の終わり）を書く
@@ -161,6 +282,8 @@ def split_rallies(shots: list[Shot], det: pd.DataFrame | None = None, opts: Rall
         r.t_end_s = t_land if landed else float(seen[-1]) if len(seen) else s.t_hit_s
         r.end_reason, r.winner_side, note = rally_outcome(s, o, court) if landed else ("", "", "")
         r.note = "・".join(x for x in (f"終わり：{reason}", note) if x)
+    if players is not None:
+        rallies = drop_false_rallies(rallies, order, players, o, court)
     return rallies
 
 
@@ -209,7 +332,7 @@ def rally_scores(pred: list[Shot], pred_rallies: list[Rally], truth: list[Shot],
     by_reason: dict[str, list[int]] = {}
     for ta in tr:
         ps = by_true.get(ta, set())
-        ok = len(ps) == 1 and by_pred[next(iter(ps))] == {ta}
+        ok = len(ps) == 1 and None not in ps and by_pred[next(iter(ps))] == {ta}
         exact.append(ok)
         if ok:
             p = pr[next(iter(ps))]
@@ -305,6 +428,118 @@ def synthetic_benchmark(n_sessions: int = 4, n_rallies: int = 6, fps: float = 30
     return out
 
 
+def rally_precision(pred: list[Shot], pred_rallies: list[Rally], truth: list[Shot], true_rallies: list[Rally],
+                    tol_s: float = 0.05) -> dict[str, Any]:
+    """ラリー単位の適合率と、ラリーではないラリー・落としすぎたラリーの数。
+
+    - ``rally_precision``：推定したラリーのうち、正解のラリーとちょうど 1 対 1 になったものの割合
+      （正解と組にならない打球が混ざっていても、正解の打球がちょうど 1 つのラリーにまとまっていればよい）
+    - ``n_false``：正解と組になる打球が 1 本もない推定したラリー（ラリーの間の打球だけのラリー）の数
+    - ``n_lost``：組になった打球がすべてラリーの外（``rally_id`` が空欄）にされた正解のラリーの数
+    """
+    m = match_to_truth(pred, truth, tol_s)
+    by_pred: dict[int, set[int]] = {r.rally_id: set() for r in pred_rallies}
+    by_true: dict[int, set[int | None]] = {r.rally_id: set() for r in true_rallies}
+    for p, j in zip(pred, m):
+        if j is None:
+            continue
+        ta = truth[j].rally_id
+        by_true.setdefault(ta, set()).add(p.rally_id)
+        if p.rally_id is not None:
+            by_pred.setdefault(p.rally_id, set()).add(ta)
+    ok = sum(len(ts) == 1 and by_true[next(iter(ts))] == {pa} for pa, ts in by_pred.items())
+    return {"rally_precision": ok / max(len(pred_rallies), 1),
+            "n_false": sum(not ts for ts in by_pred.values()),
+            "n_lost": sum(ps == {None} for ps in by_true.values())}
+
+
+def player_benchmark(n_sessions: int = 4, n_rallies: int = 6, fps: float = 30.0, seed: int = 0, mode: str = "truth",
+                     p_pickup: float = 0.5, p_neighbor: float = 0.3, rest_s: tuple[float, float] = (7.0, 11.0),
+                     opts: RallyOptions | None = None, cfg: dict[str, Any] | None = None, workers: int = 1,
+                     ends: dict[str, float] | None = None) -> dict[str, Any]:
+    """ラリーの間に拾って返した打球・となりのコートの打球を入れた合成ラリー（``synth_rally_players``）で、
+    選手の動きを使う前（``before``）と後（``after``）のラリーの区切りの精度を比べる。
+
+    ``mode`` は ``synthetic_benchmark`` と同じ（"truth" は正解のショットに少しずれを足したもの、"fit" は動画全体の
+    検出から打球を見つけて軌道を当てはめたもの）。truth では、ラリーの間の打球もショットに入れる（打点は正解）。
+
+    Returns:
+        ``before``・``after`` ごとに、区切りの再現率・適合率（``rally_scores``）、ちょうど分かれた正解のラリーの割合
+        （``exact``。ラリー単位の再現率）、ラリー単位の適合率・ラリーではないラリーの数・落としすぎたラリーの数
+        （``rally_precision``）。``n_extra`` はラリーの間に入れた打球の数（種類ごと）
+    """
+    from smash_speed.config import load_config
+    from smash_speed.physics import PhysicsParams
+    from smash_speed.synth_rally import rally_camera
+    from smash_speed.synth_rally_players import make_player_session, observe_player_session
+
+    cfg = cfg or load_config()
+    phys = PhysicsParams.from_config(cfg)
+    camera = rally_camera(cfg)
+    o = opts or RallyOptions()
+    tot: dict[str, dict[str, list[Any]]] = {"before": {}, "after": {}}
+    n_extra: dict[str, int] = {}
+    n_shots = 0
+    for k in range(n_sessions):
+        rng = np.random.default_rng([seed, 11, k])
+        session, extras = make_player_session(rng, phys, n_rallies, rest_s=rest_s, p_pickup=p_pickup,
+                                              p_neighbor=p_neighbor, ends=ends)
+        truth: list[Shot] = []
+        true_rallies: list[Rally] = []
+        for i, r in enumerate(session, start=1):
+            truth += r.to_shots(rally_id=i, phys=phys)
+            true_rallies.append(r.to_rally(rally_id=i))
+        extra_shots = [s for e in extras for s in e.as_rally().to_shots(rally_id=0, phys=phys)]
+        for e in extras:
+            n_extra[e.kind] = n_extra.get(e.kind, 0) + 1
+        det, players, _ = observe_player_session(session, extras, camera, fps, phys,
+                                                 np.random.default_rng([seed, 12, k]), cfg["court"])
+        if mode == "truth":
+            noise = np.random.default_rng([seed, 13, k])
+            pred = [Shot(t_hit_s=s.t_hit_s + noise.normal(0, 0.005), side=s.side, speed_kmh=s.speed_kmh,
+                         hit_x_m=s.hit_x_m, hit_y_m=s.hit_y_m, land_x_m=s.land_x_m, land_y_m=s.land_y_m,
+                         t_land_s=s.t_land_s + noise.normal(0, 0.1)) for s in truth + extra_shots]
+        else:
+            from smash_speed.hits import find_hits
+            from smash_speed.shot_list import analyze_hits
+
+            onsets = [(s.t_hit_s + float(np.linalg.norm(camera.center - s.hit_point)) / 343.0, 30.0)
+                      for s in truth + extra_shots]
+            hits = find_hits(det, fps, sorted(onsets), camera=camera, rally_gap_s=o.max_gap_s)
+            pred = analyze_hits(det, hits, camera, phys, cfg, o.max_gap_s, ci=False, workers=workers,
+                                progress=lambda _: None)
+        n_shots += len(truth)
+        for name in tot:
+            shots = [Shot(**vars(s)) for s in pred]
+            rallies = split_rallies(shots, det, o, cfg["court"], players=players if name == "after" else None)
+            res = {**rally_scores(shots, rallies, truth, true_rallies),
+                   **rally_precision(shots, rallies, truth, true_rallies)}
+            for key, v in res.items():
+                tot[name].setdefault(key, []).append(v)
+    out: dict[str, Any] = {"n_sessions": n_sessions, "n_rallies": n_sessions * n_rallies, "n_shots": n_shots,
+                           "n_extra": n_extra, "fps": fps, "mode": mode}
+    for name, d in tot.items():
+        tp, fp, fn = (sum(d[f"boundary_{x}"]) for x in ("tp", "fp", "fn"))
+        n_true, n_pred = sum(d["n_true"]), sum(d["n_pred"])
+        out[name] = {"boundary_recall": tp / max(tp + fn, 1), "boundary_precision": tp / max(tp + fp, 1),
+                     "exact": float(np.dot(d["exact"], d["n_true"]) / max(n_true, 1)),
+                     "rally_precision": float(np.dot(d["rally_precision"], d["n_pred"]) / max(n_pred, 1)),
+                     "n_pred": n_pred, "n_false": sum(d["n_false"]), "n_lost": sum(d["n_lost"])}
+    return out
+
+
+def format_player_benchmark(r: dict[str, Any]) -> str:
+    """``player_benchmark`` の結果の要約（前・後の 2 行）。"""
+    lines = []
+    for name, label in (("before", "選手の動きなし"), ("after", "選手の動きあり")):
+        v = r[name]
+        lines.append(f"{r['fps']:4.0f} fps {r['mode']:5s} {label}：区切りの再現率 {v['boundary_recall']:.3f}、"
+                     f"適合率 {v['boundary_precision']:.3f}、ラリーの再現率 {v['exact']:.3f}・適合率 "
+                     f"{v['rally_precision']:.3f}（正解 {r['n_rallies']} 個、推定 {v['n_pred']} 個、"
+                     f"ラリーではないもの {v['n_false']} 個、落としすぎ {v['n_lost']} 個）")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> None:
     import argparse
     import time
@@ -317,7 +552,17 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--fps", type=float, nargs="+", default=[30.0])
     ap.add_argument("--mode", nargs="+", default=["truth", "fit"], choices=["truth", "fit"])
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--players", action="store_true",
+                    help="ラリーの間の打球を入れた合成で、選手の動きを使う前と後を比べる")
     a = ap.parse_args(argv)
+    if a.players:
+        for fps in a.fps:
+            for mode in a.mode:
+                t0 = time.time()
+                r = player_benchmark(a.sessions, a.rallies, fps, a.seed, mode, workers=a.workers)
+                print(format_player_benchmark(r))
+                print(f"  （{r['n_shots']} 本・ラリーの間の打球 {r['n_extra']}、{time.time() - t0:.0f} 秒）")
+        return
     for fps in a.fps:
         for mode in a.mode:
             t0 = time.time()

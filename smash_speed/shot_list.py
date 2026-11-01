@@ -6,6 +6,8 @@
    混ざらないよう、組の前後で検出を切り分ける。
 4. 打球の間隔・シャトルの着地・シャトルが飛んでいるかから、ラリーに区切る（``rallies.split_rallies``）。
 5. 軌道から種類を決める（``shot_types.classify_shots``。ラリーの最初のショットはサーブ）。
+6. 選手の位置も出すとき（``players=True``）は、選手の動きで短いラリーを確かめ、ラリーの間に拾って返した・
+   となりのコートのシャトルをラリーから外す（``rallies_with_players``）。
 
 結果は ``<出力先>/`` に書き出す。
 
@@ -46,7 +48,7 @@ from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.shot_fit import fit_shots, shot_fits_to_shots
 from smash_speed.shot_types import classify_shots
-from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, write_rallies,
+from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
                                write_shots)
 from smash_speed.video_io import VideoMeta, extract_audio, load_wav, probe
 
@@ -405,12 +407,40 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     }
     if o.players:
         info["players"] = players_step(o, cfg, out, progress)
+        rallies = rallies_with_players(shots, rallies, det, o, cfg, out, info, progress)
         info["elapsed_s"] = round(time.time() - t_start, 1)
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     write_stats(out, shots, rallies, cfg.get("court"))
     write_report(out, cfg.get("court"), shots, rallies)
     progress(f"[進行] 完了：{len(shots)} 本（{len(rallies)} ラリー）、{info['elapsed_s']:.0f} 秒")
     return info
+
+
+def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFrame, o: ShotListOptions,
+                         cfg: dict[str, Any], out: Path, info: dict[str, Any],
+                         progress: Callable[[str], None] = print) -> list[Rally]:
+    """選手の位置（``players.csv``）が出たら、ラリーを区切り直して短いラリーを選手の動きで確かめる
+    （``rallies.split_rallies`` の ``players``）。ラリーが変わったら ``shots.csv``・``rallies.csv`` と、ラリーごとの
+    移動距離（``movement.json`` など）を書き直し、``info`` の数を直す。選手の位置がなければ ``rallies`` をそのまま返す。
+    """
+    from smash_speed.movement import movement_brief, write_movement
+    from smash_speed.players import PLAYERS_FILE
+
+    if "error" in info.get("players", {}) or not (out / PLAYERS_FILE).exists():
+        return rallies
+    players = pd.read_csv(out / PLAYERS_FILE)
+    new = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"), players=players)
+    n_out = sum(s.rally_id is None for s in shots)
+    info["players"]["n_shots_outside_rallies"] = n_out
+    if not n_out:
+        return new
+    progress(f"[進行] 選手の動きから、ラリーではない打球 {n_out} 本をラリーから外しました（{len(rallies)} → {len(new)} ラリー）")
+    write_shots(out / SHOTS_FILE, shots)
+    write_rallies(out / RALLIES_FILE, new)
+    info["n_rallies"] = len(new)
+    if "movement" in info["players"]:
+        info["players"]["movement"] = movement_brief(write_movement(out, players, cfg.get("court"), new))
+    return new
 
 
 def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: Callable[[str], None] = print

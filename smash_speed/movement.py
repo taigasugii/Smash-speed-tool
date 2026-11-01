@@ -185,6 +185,14 @@ def heat_grid(track: pd.DataFrame, court: dict[str, Any] | None = None, o: Movem
     return grid, (-xl, xl, -yl, yl)
 
 
+def heat_brief(track: pd.DataFrame, court: dict[str, Any] | None = None, o: MovementOptions | None = None
+               ) -> dict[str, Any]:
+    """``heat_grid`` を JSON に入れる形にしたもの（マスの大きさ・範囲 [m]・マスごとの秒数。行 = y、列 = x）。"""
+    o = o or MovementOptions()
+    grid, extent = heat_grid(track, court, o)
+    return {"cell_m": o.cell_m, "extent_m": [round(v, 3) for v in extent], "seconds": np.round(grid, 2).tolist()}
+
+
 def _r(v: float | None, nd: int = 2) -> float | None:
     return None if v is None or not math.isfinite(v) else round(float(v), nd)
 
@@ -211,6 +219,7 @@ def player_movement(track: pd.DataFrame, side: str, court: dict[str, Any] | None
         "mean_x": _r(float(np.average(track["x"], weights=w)) if seconds > 0 else None),
         "mean_y": _r(float(np.average(track["y"], weights=w)) if seconds > 0 else None),
         "zones": zone_shares(track, side, court),
+        "heatmap": heat_brief(track, court, o),
     }
     if rallies:
         per = []
@@ -353,6 +362,27 @@ def write_movement(out_dir: str | Path, players: pd.DataFrame | None = None, cou
     if svg:
         (out_dir / MOVEMENT_SVG).write_text(svg, encoding="utf-8")
     return summary
+
+
+def load_movement(out_dir: str | Path) -> dict[str, Any] | None:
+    """出力先の ``movement.json``（この解析で選手の位置も出したとき＝``shot_list.json`` の ``players.movement`` が
+    あるときだけ。前の解析の ``movement.json`` が残っていても使わない）。なければ None。"""
+    out_dir = Path(out_dir)
+    info_path = out_dir / "shot_list.json"
+    info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
+    if not (info.get("players") or {}).get("movement") or not (out_dir / MOVEMENT_FILE).exists():
+        return None
+    return json.loads((out_dir / MOVEMENT_FILE).read_text(encoding="utf-8"))
+
+
+def movement_stats(summary: dict[str, Any]) -> dict[str, Any]:
+    """``stats.json`` に入れる選手の動き：選手ごと（``h0``・``o0`` など。側は ``side``）の移動距離・速さ・
+    いた区画の割合・ヒートマップ（``heat_brief``）。外れのコマの割合などの細かい数字は ``movement.json`` に残す。"""
+    keys = ("side", "player", "seconds", "distance_m", "distance_per_min_m", "mean_speed_mps", "max_speed_mps",
+            "max_speed_t", "moving_share", "fast_share", "rally_mean_distance_m", "mean_x", "mean_y", "zones", "heatmap")
+    return {"players": {k: {c: p.get(c) for c in keys} for k, p in summary.get("players", {}).items()},
+            "depth_names": summary.get("depth_names", list(DEPTH_NAMES)),
+            "width_names": summary.get("width_names", list(WIDTH_NAMES))}
 
 
 def movement_brief(summary: dict[str, Any]) -> dict[str, Any]:
