@@ -109,3 +109,27 @@ def test_hit_point_options_drop_points_on_the_wrong_side():
     b.fit.p0 = np.array([3.0, 0.0, 1.5])
     opts = hit_point_options([a, b], PHYS)
     assert len(opts[1]) == 1 and opts[1][0][0] < 1.0
+
+
+def test_serve_hit_point_moves_along_the_plane_by_uncertainty():
+    """サーブの打点は、当てはめの不確かさが大きいほど深さの目安に寄り、飛行平面の上を動く。"""
+    from smash_speed.geometry import FlightPlane
+    from smash_speed.shot_fit import serve_hit_point
+
+    d = np.array([-np.cos(0.3), -np.sin(0.3), 0.0])
+    plane = FlightPlane(np.array([3.6, 0.0, 0.0]), d)
+
+    def fit(var):
+        cov = np.zeros((6, 6))
+        cov[0, 0] = var
+        return SimpleNamespace(plane=plane, mode="plane", cov_theta=cov)
+
+    a = np.array([3.6, 0.0, 0.9])
+    far = serve_hit_point(a, fit(100.0), "o", (2.5, 0.5))      # 奥行きが決まらない（角のカメラ）→ 目安まで
+    assert abs(far[0] - 2.5) < 0.05 and far[2] == a[2]
+    assert abs(np.cross(far - a, d)[2]) < 1e-9                 # 平面に沿って動く
+    near = serve_hit_point(a, fit(1e-4), "o", (2.5, 0.5))      # よく決まっている（横のカメラ）→ ほぼ動かない
+    assert np.linalg.norm(near - a) < 0.01
+    half = serve_hit_point(a, fit((0.5 / np.cos(0.3)) ** 2), "o", (2.5, 0.5))
+    assert abs(half[0] - 3.05) < 0.01                          # 同じ不確かさなら真ん中
+    assert np.array_equal(serve_hit_point(a, fit(100.0), "", (2.5, 0.5)), a)
