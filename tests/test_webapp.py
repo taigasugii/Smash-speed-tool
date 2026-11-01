@@ -244,3 +244,65 @@ def test_shot_list_flow(client, tmp_path):
     g2 = client.get("/api/shots").get_json()
     assert g2["info"]["start_s"] == pytest.approx(t0, abs=1e-3)
     assert 0 < len(g2["shots"]) < len(truth) and all(s["t_hit_s"] >= t0 for s in g2["shots"])
+
+
+def test_not_a_hit_label_api(client, tmp_path):
+    """「打球ではない」も一覧から選べる（種類の 8 つの隣）。本数と割合は別に返す。"""
+    from smash_speed.shot_labels import NOT_A_HIT
+    from smash_speed.shots import Shot, write_shots
+
+    out = tmp_path / "IMG_3_shots"
+    out.mkdir()
+    write_shots(out / "shots.csv", [Shot(t_hit_s=1.0, shot_type="clear"), Shot(t_hit_s=2.0, shot_type="drop")])
+    (out / "shot_list.json").write_text(json.dumps({"video": "IMG_3.mp4", "by_type": {}}), encoding="utf-8")
+    client.post("/api/state", json={"shots_dir": str(out), "out_root": str(tmp_path / "out")})
+    g = client.get("/api/shots").get_json()
+    assert g["not_hit"] == NOT_A_HIT and g["not_hit_label"] == "打球ではない" and NOT_A_HIT not in g["labels"]
+    r = client.post("/api/shot_label", json={"i": 1, "label": NOT_A_HIT}).get_json()
+    assert r["ok"] and r["truth"] == NOT_A_HIT
+    client.post("/api/shot_label", json={"i": 0, "label": "clear"})
+    g = client.get("/api/shots").get_json()
+    assert [s["truth"] for s in g["shots"]] == ["clear", NOT_A_HIT]
+    st = g["label_stats"]["video"]
+    assert st["n"] == 2 and st["n_not_hit"] == 1 and st["not_hit_rate"] == pytest.approx(0.5)
+    assert st["rule_accuracy"] == pytest.approx(1.0)
+
+
+def test_report_and_history_pages(client, tmp_path):
+    """ショットの一覧のレポートと記録の推移：出力の場所の中の HTML だけを返す。"""
+    from smash_speed.shots import Shot, write_shots
+
+    root = tmp_path / "out"
+    out = root / "IMG_4_shots"
+    out.mkdir(parents=True)
+    write_shots(out / "shots.csv", [Shot(t_hit_s=1.0, shot_type="smash", speed_kmh=300.0, side="h", rally_id=1),
+                                    Shot(t_hit_s=2.0, shot_type="clear", speed_kmh=150.0, side="o", rally_id=1)])
+    (out / "shot_list.json").write_text(json.dumps({"video": "IMG_4.mp4", "recorded_at": "2026-10-01T10:00:00",
+                                                    "by_type": {}}), encoding="utf-8")
+    client.post("/api/state", json={"shots_dir": str(out), "out_root": str(root)})
+    # 記録の推移は、作る前はない
+    assert client.get("/report/history").status_code == 404
+    # レポート：古い解析で report.html がなければその場で書く
+    r = client.get("/report/shots")
+    assert r.status_code == 200 and r.mimetype == "text/html" and (out / "report.html").exists()
+    assert "IMG_4" in r.get_data(as_text=True)
+    assert client.get("/api/shots").get_json()["files"]["report"].endswith("report.html")
+    # 出力の場所の外（.. で外へ出るもの・別の場所）は返さない
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    write_shots(outside / "shots.csv", [Shot(t_hit_s=1.0, shot_type="smash")])
+    (outside / "shot_list.json").write_text(json.dumps({"video": "x.mp4"}), encoding="utf-8")
+    (outside / "report.html").write_text("<p>secret</p>", encoding="utf-8")
+    assert client.get("/report/shots", query_string={"dir": str(root / ".." / "elsewhere")}).status_code == 404
+    assert client.get("/report/shots", query_string={"dir": str(outside)}).status_code == 404
+    assert not (outside / "report.html").read_text(encoding="utf-8").startswith("<!doctype")
+    assert client.get("/report/shots", query_string={"dir": str(tmp_path / "nothing")}).status_code == 404
+    # 記録の推移：出力の場所の下の一覧を集めて書き、画面から開ける
+    h = client.post("/api/history").get_json()
+    assert h["ok"] and h["n_days"] == 1 and h["n_videos"] == 1 and (root / "history.csv").exists()
+    r = client.get("/report/history")
+    assert r.status_code == 200 and "記録の推移" in r.get_data(as_text=True)
+    # 出力の場所がまだなくても、空の記録を作れる
+    client.post("/api/state", json={"out_root": str(tmp_path / "new_out")})
+    h = client.post("/api/history").get_json()
+    assert h["ok"] and h["n_days"] == 0

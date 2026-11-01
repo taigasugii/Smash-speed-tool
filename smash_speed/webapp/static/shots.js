@@ -16,6 +16,8 @@ App.views.shots = {
     const shots = mine ? r.shots : [];
     const info = mine ? r.info : {};
     this.labels = r.labels || {};
+    this.notHit = r.not_hit || null;
+    this.notHitLabel = r.not_hit_label || "打球ではない";
     this.stats = r.label_stats || null;
     this.renderStart(el, info, shots.length > 0);
     if (!mine) return;
@@ -81,8 +83,11 @@ App.views.shots = {
       <div class="callout" style="margin-top:12px">種類は、初速・打ち出しの角度・打った高さ・落ちた所から<b>決まりに沿って</b>分けています。
         実際の試合の動画ではまだ確かめきれていないので、<b>目安</b>として見てください。</div>
       <div class="row small" style="margin-top:10px;gap:8px;flex-wrap:wrap"><span class="muted">スマッシュの初速をもっと正確に測るなら、打つ人の足元と落ちた所を確かめてから解析する</span>
-        <button class="btn sm" id="tofast">★ いちばん速いスマッシュ へ</button></div></div>`);
+        <button class="btn sm" id="tofast">★ いちばん速いスマッシュ へ</button></div>
+      <div class="row small" style="margin-top:8px;gap:8px;flex-wrap:wrap"><span class="muted">この動画の数字を、スマホでも見やすい 1 枚のページにまとめたもの（印刷して PDF にもできます）</span>
+        <button class="btn sm" id="toreport">レポートを開く</button></div></div>`);
     $("#tofast", card).onclick = () => go("fastest");
+    $("#toreport", card).onclick = () => window.open("/report/shots", "_blank");
     const tiles = $("#tiles", card);
     for (const [k, v] of Object.entries(by)) {
       const t = h(`<button class="card" style="padding:10px 14px;min-width:130px;text-align:left;cursor:pointer;margin:0;${this.filter === k ? "outline:2px solid var(--primary)" : ""}">
@@ -108,6 +113,7 @@ App.views.shots = {
         <div class="seg" id="flt"><button data-v="all">すべて</button>${types.map((k) => `<button data-v="${k}">${esc(this.labels[k] || k)}</button>`).join("")}</div>
         <div class="seg" id="srt"><button data-v="time">時刻の順</button><button data-v="speed">速い順</button></div></div>
       <p class="small" style="margin:0 0 10px">正しい種類が分かるショットは、「正しい種類」の欄か、行を押して出る詳しい所で選んでください。
+        打っていない所がショットになっていたら「${esc(this.choiceLabel(this.notHit))}」を選んでください。
         選んだ種類は、解析し直しても残り、決まりの判定を良くするのに使います。<br><span id="lstat" class="muted"></span></p>
       <div style="overflow:auto;max-height:70vh"><table class="tbl"><thead><tr><th>時刻</th><th>ラリー</th><th>打った人</th><th>種類</th>
         <th class="r">初速 km/h</th><th class="r">95% の範囲</th><th>確かさ</th><th>正しい種類</th></tr></thead><tbody></tbody></table></div>
@@ -129,7 +135,7 @@ App.views.shots = {
         <td>${s.shot_type === "unknown" ? `<span class="muted">${esc(s.label)}</span>` : `<span class="badge info">${esc(s.label)}</span>`}</td>
         <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td>
         <td><select class="input truth" style="height:30px;font-size:13px"><option value="">—</option>
-          ${this.truthTypes().map((k) => `<option value="${k}">${esc(this.labels[k] || k)}</option>`).join("")}</select></td></tr>`));
+          ${this.truthTypes().map((k) => `<option value="${k}">${esc(this.choiceLabel(k))}</option>`).join("")}</select></td></tr>`));
       tr.dataset.id = s.id;
       const sel = $("select.truth", tr);
       sel.onclick = (e) => e.stopPropagation();  // 選ぶときに行の詳しい所は開かない
@@ -149,7 +155,9 @@ App.views.shots = {
   },
 
   // ---- 種類の正解ラベル（ROADMAP B6）
-  truthTypes() { return Object.keys(this.labels).filter((k) => k !== "unknown"); },
+  // 選べるのは 8 種類と「打球ではない」（打った瞬間の見つけ間違い）
+  truthTypes() { return [...Object.keys(this.labels).filter((k) => k !== "unknown"), ...(this.notHit ? [this.notHit] : [])]; },
+  choiceLabel(k) { return k === this.notHit ? this.notHitLabel : this.labels[k] || k; },
 
   // 正解を付けた本数と、決まりの判定が合っていた割合
   renderStats() {
@@ -158,15 +166,18 @@ App.views.shots = {
     const pct = (a) => a == null ? "—" : `${fmt(a * 100, 0)}%`;
     this.lstat.textContent = !st || !st.all.n ? "まだ正しい種類を選んだショットはありません。"
       : `正しい種類を選んだショット：この動画 ${st.video.n} 本・全部で ${st.all.n} 本（動画 ${st.all.n_videos} 本）。`
-        + `決まりの判定が合っていた割合：この動画 ${pct(st.video.rule_accuracy)}・全部 ${pct(st.all.rule_accuracy)}。`;
+        + `決まりの判定が合っていた割合：この動画 ${pct(st.video.rule_accuracy)}・全部 ${pct(st.all.rule_accuracy)}。`
+        + (st.all.n_not_hit ? `「${this.choiceLabel(this.notHit)}」：この動画 ${st.video.n_not_hit} 本・全部 ${st.all.n_not_hit} 本（選んだショットの ${pct(st.all.not_hit_rate)}）。` : "");
   },
 
   // 表の行の「正しい種類」：選んだ値と、決まりの判定と違うときの色
   paintRow(tr, s) {
     const sel = $("select.truth", tr);
     sel.value = s.truth || "";
-    sel.style.borderColor = !s.truth ? "" : s.truth === s.shot_type ? "var(--ok)" : "var(--warn)";
-    sel.title = !s.truth ? "" : s.truth === s.shot_type ? "決まりの判定と同じ" : `決まりの判定（${this.labels[s.shot_type] || s.shot_type}）と違う`;
+    const not = s.truth === this.notHit;
+    sel.style.borderColor = !s.truth ? "" : not ? "var(--bad)" : s.truth === s.shot_type ? "var(--ok)" : "var(--warn)";
+    sel.title = !s.truth ? "" : not ? "打っていない所と選びました" : s.truth === s.shot_type ? "決まりの判定と同じ" : `決まりの判定（${this.labels[s.shot_type] || s.shot_type}）と違う`;
+    tr.style.opacity = not ? "0.55" : "";
   },
 
   async setTruth(s, label) {
@@ -199,7 +210,7 @@ App.views.shots = {
     const types = this.truthTypes();
     box.innerHTML = `<div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
         <b class="small">正しい種類：</b>
-        <div class="seg" id="tt">${types.map((k, i) => `<button data-v="${k}" title="キーボードの ${i + 1}">${esc(this.labels[k] || k)}</button>`).join("")}</div>
+        <div class="seg" id="tt">${types.map((k, i) => `<button data-v="${k}" title="キーボードの ${i + 1}">${esc(this.choiceLabel(k))}</button>`).join("")}</div>
         <button class="btn sm ghost" id="tclear">選び直す（消す）</button>
         <button class="btn sm" id="tnext">次のショットへ ▶</button>
         <label class="row small"><input type="checkbox" id="tauto" ${this.autoNext !== false ? "checked" : ""}> 選んだら次のショットへ進む</label></div>
@@ -223,7 +234,10 @@ App.views.shots = {
     $$("#tt button", box).forEach((b) => b.classList.toggle("on", b.dataset.v === s.truth));
     $("#tclear", box).disabled = !s.truth;
     const rule = this.labels[s.shot_type] || s.shot_type;
-    $("#tnote", box).textContent = !s.truth ? `決まりの判定は「${rule}」です。合っていればそのまま「${rule}」を、違えば正しい種類を選んでください（キーボードの 1〜${this.truthTypes().length} でも選べます）。`
+    const not = this.choiceLabel(this.notHit);
+    $("#tnote", box).textContent = !s.truth ? `決まりの判定は「${rule}」です。合っていればそのまま「${rule}」を、違えば正しい種類を選んでください。`
+        + `打っていない所なら「${not}」を選んでください（キーボードの 1〜${this.truthTypes().length} でも選べます）。`
+      : s.truth === this.notHit ? `「${not}」を選びました。種類の判定を良くするのには使わず、打った瞬間の見つけ間違いを数えるのに使います。`
       : s.truth === s.shot_type ? `決まりの判定（${rule}）と同じです。` : `決まりの判定（${rule}）と違います。`;
   },
 
@@ -332,5 +346,33 @@ App.views.shots = {
       if (e.key === "ArrowRight") { show(k + 1); e.preventDefault(); }
     };
     show(k);
+  },
+};
+
+// 記録の推移（動画をまたいだ日ごとの最高・平均の速さと、種類の割合。ROADMAP C4 の history.html を画面で開く）
+App.views.history = {
+  title: "記録の推移",
+  async render(el) {
+    const card = h(`<div class="card"><div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+        <h2 style="margin:0;flex:1">日ごとの記録</h2>
+        <button class="btn sm" id="redo">作り直す</button><button class="btn sm" id="tab">別のタブで開く</button></div>
+      <p class="desc">出力先にある「ショットの一覧」の結果をすべて集めて、撮った日ごとのスマッシュの速さ（最高・平均）と、
+        ショットの種類の割合の変わり方をまとめます。新しく解析したら「作り直す」を押してください。</p>
+      <p class="small muted" id="hmsg">集めています…</p>
+      <iframe id="hframe" title="記録の推移" style="width:100%;height:75vh;border:1px solid var(--line);border-radius:6px;background:#fff" class="hidden"></iframe></div>`);
+    el.appendChild(card);
+    const make = async () => {
+      $("#hmsg", card).textContent = "集めています…";
+      const r = await api.post("/api/history");
+      if (!r.ok) { $("#hmsg", card).textContent = r.error || "まとめられませんでした"; return; }
+      $("#hmsg", card).textContent = r.n_days ? `${r.n_days} 日分（動画 ${r.n_videos} 本）をまとめました。`
+        : "まだ「ショットの一覧」で解析した動画がありません。動画を開いて「ショットの一覧」で解析すると、ここに日ごとの記録が出ます。";
+      const f = $("#hframe", card);
+      f.classList.toggle("hidden", !r.n_days);
+      if (r.n_days) f.src = `/report/history?t=${Date.now()}`;
+    };
+    $("#redo", card).onclick = make;
+    $("#tab", card).onclick = () => window.open("/report/history", "_blank");
+    await make();
   },
 };

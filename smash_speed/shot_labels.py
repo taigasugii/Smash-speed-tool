@@ -6,6 +6,9 @@
 
 1 行には、ラベルのほかに、付けたときのショットの値（初速・打点・着地点・打点での速度など）と
 決まりで判定した種類（``predicted``）も残す。将来の学習（B7）は、このファイルだけで特徴量と正解がそろう。
+
+打った瞬間の見つけ間違い（打っていない所をショットにした）は、種類の代わりに ``NOT_A_HIT``（「打球ではない」）を付ける。
+ショットの種類（``SHOT_TYPES``）には入れず、種類の判定の学習からは外して、打った瞬間の見つけ間違いの割合を数えるのに使う。
 """
 
 from __future__ import annotations
@@ -22,6 +25,10 @@ from smash_speed.shots import SHOT_TYPES, Shot, _cell, _parse
 LABELS_FILE = "shot_labels.csv"
 MATCH_TOL_S = 0.08   # 同じショットとみなす打った時刻の差 [s]（30 fps で 2 コマほど）
 # ショットの値のうち、ラベルといっしょに残すもの（学習の特徴量になるもの）
+NOT_A_HIT = "not_hit"            # 「打球ではない」のラベル（ショットの種類ではない）
+NOT_A_HIT_LABEL = "打球ではない"
+# 画面で選べるラベル：8 種類と「打球ではない」（unknown は正解にならない）
+LABEL_CHOICES = (*(t for t in SHOT_TYPES if t != "unknown"), NOT_A_HIT)
 FEATURE_FIELDS = ("side", "speed_kmh", "hit_x_m", "hit_y_m", "hit_z_m", "land_x_m", "land_y_m", "t_land_s",
                   "v0_x_mps", "v0_y_mps", "v0_z_mps", "terminal_velocity_mps", "confidence", "rally_id", "index_in_rally")
 
@@ -32,7 +39,7 @@ class ShotLabel:
 
     video_name: str                        # 動画のファイル名（PC を移っても同じになるよう、場所は含めない）
     t_hit_s: float                         # 打った時刻（ラベルを付けたときの一覧の値）
-    label: str                             # 人が決めた種類（SHOT_TYPES のどれか）
+    label: str                             # 人が決めた種類（SHOT_TYPES のどれか、または NOT_A_HIT）
     predicted: str = ""                    # 決まりで判定した種類（ラベルを付けたとき）
     video: str = ""                        # 動画の場所（参考）
     labeled_at: str = ""                   # 付けた日時
@@ -99,8 +106,8 @@ def _find(labels: list[ShotLabel], video: str, t_hit_s: float, tol: float = MATC
 
 def set_label(path: str | Path, video: str, shot: Shot, label: str | None) -> list[ShotLabel]:
     """1 本のショットにラベルを付ける（同じショットのラベルがあれば置き換える）。``label`` が空なら消す。"""
-    if label and label not in SHOT_TYPES:
-        raise ValueError(f"ショットの種類 {label!r} は {SHOT_TYPES} のどれかにしてください")
+    if label and label not in SHOT_TYPES and label != NOT_A_HIT:
+        raise ValueError(f"ショットの種類 {label!r} は {SHOT_TYPES} か {NOT_A_HIT!r} のどれかにしてください")
     labels = read_labels(path)
     k = _find(labels, video, shot.t_hit_s)
     if k is not None:
@@ -131,12 +138,18 @@ def match_labels(labels: Iterable[ShotLabel], video: str, shots: list[Shot],
 
 
 def label_summary(labels: Iterable[ShotLabel]) -> dict[str, Any]:
-    """ラベルの本数（全部・種類ごと・動画の数）と、決まりの判定が合っていた割合。"""
+    """ラベルの本数（全部・種類ごと・動画の数・打球ではない）と、決まりの判定が合っていた割合。
+
+    決まりの判定が合っていた割合は、種類を付けたショットだけで数える（「打球ではない」は種類の判定の間違いではない）。
+    ``not_hit_rate`` は、ラベルを付けたショットのうち「打球ではない」の割合（打った瞬間の見つけ間違いの割合の目安）。
+    """
     labels = list(labels)
     by_type: dict[str, int] = {}
     for r in labels:
         by_type[r.label] = by_type.get(r.label, 0) + 1
-    judged = [r for r in labels if r.predicted]
+    judged = [r for r in labels if r.predicted and r.label != NOT_A_HIT]
     agree = sum(r.predicted == r.label for r in judged)
+    n_not = by_type.get(NOT_A_HIT, 0)
     return {"n": len(labels), "by_type": by_type, "n_videos": len({r.video_name for r in labels}),
-            "rule_accuracy": (agree / len(judged)) if judged else math.nan}
+            "rule_accuracy": (agree / len(judged)) if judged else math.nan,
+            "n_not_hit": n_not, "not_hit_rate": (n_not / len(labels)) if labels else math.nan}
