@@ -37,6 +37,7 @@ App.views.shots = {
           <input class="input" id="s0" type="number" step="0.1" min="0" style="width:90px"> 秒から
           <input class="input" id="s1" type="number" step="0.1" min="0" style="width:90px"> 秒まで</span>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す</label>` : ""}
+        <label class="row small"><input type="checkbox" id="players" ${info.players ? "checked" : ""}> 選手の立ち位置も記録する（時間が延びます）</label>
       </div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="go">${has ? "解析し直す" : "解析を始める"}</button>
         <span class="muted small" id="eta"></span></div></div>`);
@@ -47,15 +48,18 @@ App.views.shots = {
       $$("#rng button", card).forEach((b) => b.classList.toggle("on", (b.dataset.v === "part") === part));
       $("#part", card).classList.toggle("hidden", !part);
       const len = part ? Math.max(0, +$("#s1", card).value - +$("#s0", card).value) : dur;
-      $("#eta", card).textContent = `目安 約 ${minutes(len)} 分（動画 ${fmt(len, 0)} 秒）。解析中もほかの画面は使えます。`;
+      // 選手の検出は 4K 30fps の 20 秒で約 20 秒（GPU。JOURNAL D1a）
+      const extra = $("#players", card).checked ? len : 0;
+      $("#eta", card).textContent = `目安 約 ${minutes(len + extra / 3.5)} 分（動画 ${fmt(len, 0)} 秒）。解析中もほかの画面は使えます。`;
     };
     $$("#rng button", card).forEach((b) => { b.onclick = () => { part = b.dataset.v === "part"; upd(); }; });
     $("#s0", card).oninput = upd;
     $("#s1", card).oninput = upd;
+    $("#players", card).onchange = upd;
     upd();
     $("#go", card).onclick = () => {
       if (has && !confirm("解析し直すと、前回の一覧は置き換わります。よろしいですか？")) return;
-      const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked) };
+      const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked), players: $("#players", card).checked };
       if (part) {
         data.start = +$("#s0", card).value;
         data.end = +$("#s1", card).value;
@@ -68,6 +72,14 @@ App.views.shots = {
   },
 
   // ---- 種類ごとの本数と速さ
+  playersText(p) {
+    if (!p) return "";
+    if (p.error) return `選手の立ち位置は記録できませんでした（${esc(p.error)}）。`;
+    const c = p.coverage || {};
+    return `選手の立ち位置を記録しました（手前 ${fmt(100 * (c.h ?? 0), 0)}%・奥 ${fmt(100 * (c.o ?? 0), 0)}% のコマ）。`;
+  },
+
+  // ---- 種類ごとの本数と速さ
   renderSummary(el, info, shots) {
     const by = info.by_type || {};
     const n = shots.length;
@@ -76,7 +88,7 @@ App.views.shots = {
     const card = h(`<div class="card"><h2>種類ごとの本数と速さ</h2>
       <p class="desc">${range}：ショット ${n} 本（ラリー ${info.n_rallies ?? "—"} 本）、そのうち初速が出たもの ${nSpeed} 本。
         ${info.used_audio ? "打った音も使いました。" : "音がないため、シャトルの動きだけで打った瞬間を見つけました。"}
-        カードを押すと、その種類だけを下の表に出します。</p>
+        ${this.playersText(info.players)}カードを押すと、その種類だけを下の表に出します。</p>
       <div class="row" id="tiles" style="flex-wrap:wrap;gap:10px"></div>
       <div class="callout" style="margin-top:12px">種類は、初速・打ち出しの角度・打った高さ・落ちた所から<b>決まりに沿って</b>分けています。
         実際の試合の動画ではまだ確かめきれていないので、<b>目安</b>として見てください。</div>
