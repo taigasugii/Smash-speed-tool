@@ -8,6 +8,8 @@
    （コートの外で待っている人・隣のコートの人・審判などを外す）。短い抜けは前後から補う。
 4. 跳んでいるコマ：足元の位置で測った枠の高さがふだんより大きく出るコマを見つけ、床の上の位置を前後から補う。
 
+5. 動き：``movement.write_movement`` で、移動距離・速さ・いた場所の分布（``movement.json``・``movement.svg``）も書く。
+
 結果は 1 コマ 1 側 1 人の ``players.csv``（``frame, t, side, player, x, y, u, v, x0, y0, x1, y1, score, interpolated,
 airborne``）と、
 検出したすべての人の ``people.csv``、確かめ用の ``players_preview.jpg``・``players.json``。
@@ -432,6 +434,7 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
     """動画の区間で選手を検出・追跡し、``players.csv`` と確かめ用の画像を書き出す。"""
     from smash_speed.batch import stream_bgr
     from smash_speed.calibration.io import load_calibration
+    from smash_speed.movement import movement_brief, write_movement
     from smash_speed.video_io import probe
 
     o = o or PlayerOptions()
@@ -475,6 +478,7 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
     }
     if len(frame_t):
         write_preview(meta, players, people, int(frame_t.index[len(frame_t) // 2]), out_dir / PLAYERS_PREVIEW_FILE)
+    info["movement"] = movement_brief(write_movement(out_dir, players, cfg.get("court")))
     (out_dir / "players.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     return info
 
