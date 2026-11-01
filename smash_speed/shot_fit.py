@@ -38,6 +38,8 @@ from smash_speed.shots import Shot, side_of
 # 平面の当たりをつける格子（ネットを横切る位置 [m] と、コートの x 軸からの向き [deg]）
 GRID_Y_M = (-2.0, 0.0, 2.0)
 GRID_YAW_DEG = (-20.0, 0.0, 20.0)
+# 最初の当てはめが打った側から見てありえないときに試す、広い向きの格子 [deg]
+WIDE_YAW_DEG = (-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0)
 
 
 @dataclass
@@ -102,12 +104,41 @@ def _x_signs(side: str) -> list[float]:
     return [1.0, -1.0]
 
 
+def plausible_start(p0: np.ndarray, v0: np.ndarray, side: str, max_yaw_deg: float = 75.0,
+                    net_margin_m: float = 1.0) -> bool:
+    """打点 ``p0`` [m] と打ち出しの速度 ``v0`` [m/s] が、打った側 ``side`` から見てありえるか。
+
+    打点が自分の側（ネットから ``net_margin_m`` まではみ出してよい）・コートの近くにあり、水平の向きが相手側へ
+    （コートの x 軸から ``max_yaw_deg`` 以内）。打った側が分からなければ、コートの近くにあるかだけを見る。
+    角・後ろから撮ると飛ぶ向きが奥行きに近く、短いショットの当てはめが「ネットの反対側から逆向きに飛ぶ」軌道に
+    落ちることがあるので、それを見分ける。
+    """
+    p0, v0 = np.asarray(p0, float), np.asarray(v0, float)
+    if not (np.isfinite(p0).all() and np.isfinite(v0).all()):
+        return False
+    if abs(p0[0]) > 8.0 or abs(p0[1]) > 4.0 or not -0.2 < p0[2] < 4.5:
+        return False
+    if side not in ("h", "o"):
+        return True
+    sx = 1.0 if side == "h" else -1.0
+    vh = float(np.hypot(v0[0], v0[1]))
+    return sx * p0[0] < net_margin_m and vh > 0 and sx * v0[0] > vh * np.cos(np.deg2rad(max_yaw_deg))
+
+
+def _plausible_fit(f: FitResult | None, side: str) -> bool:
+    return f is not None and plausible_start(f.p0, f.v0, side)
+
+
 def initial_fit(obs: Observations, t_hit: float, side: str, phys: PhysicsParams, opts: FitOptions
                 ) -> FitResult | None:
-    """平面の格子から当たりをつけ、平面の向き・位置を大きく動かせるようにして当てはめる（``ShotFit`` の 1）。"""
+    """平面の格子から当たりをつけ、平面の向き・位置を大きく動かせるようにして当てはめる（``ShotFit`` の 1）。
+
+    いちばん合う格子から動かした結果が、打った側から見てありえない（``plausible_start``）ときは、次に合う格子から
+    動かし直し、ありえる中でいちばん合うものにする（どれもありえなければ、いちばん合うもの）。
+    """
     fast = _phys_fast(phys)
     coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
-    best: FitResult | None = None
+    cands: list[FitResult] = []
     for sx in _x_signs(side):
         for y in GRID_Y_M:
             for yaw in np.deg2rad(GRID_YAW_DEG):
@@ -116,17 +147,48 @@ def initial_fit(obs: Observations, t_hit: float, side: str, phys: PhysicsParams,
                     f = fit_trajectory(obs, t_hit, "plane", plane, fast, coarse)
                 except (ValueError, RuntimeError):
                     continue
-                if np.isfinite(f.rms_px) and (best is None or f.rms_px < best.rms_px):
-                    best = f
-    if best is None:
+                if np.isfinite(f.rms_px):
+                    cands.append(f)
+    if not cands:
         return None
+    cands.sort(key=lambda f: f.rms_px)
     loose = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
                        plane_sigma_deg=30.0, plane_sigma_m=3.0)
-    try:
-        return fit_trajectory(obs, t_hit, "plane", best.plane, phys, loose,
-                              theta0=np.r_[best.theta[:4], 0.0, 0.0])
-    except (ValueError, RuntimeError):
-        return best
+
+    def refine(g: FitResult) -> FitResult:
+        try:
+            return fit_trajectory(obs, t_hit, "plane", g.plane, phys, loose, theta0=np.r_[g.theta[:4], 0.0, 0.0])
+        except (ValueError, RuntimeError):
+            return g
+
+    first = refine(cands[0])
+    if _plausible_fit(first, side):
+        return first
+    # ありえる向きの平面を広い格子で探し、ずれの小さいものから、平面を小さく動かして当てはめる
+    # （大きく動かすと、ありえない向きに戻ってしまう）
+    wide = []
+    for sx in _x_signs(side):
+        for y in GRID_Y_M:
+            for yaw in np.deg2rad(WIDE_YAW_DEG):
+                plane = FlightPlane(np.array([0.0, y, 0.0]), sx * np.array([np.cos(yaw), np.sin(yaw), 0.0]))
+                try:
+                    f = fit_trajectory(obs, t_hit, "plane", plane, fast, coarse)
+                except (ValueError, RuntimeError):
+                    continue
+                if np.isfinite(f.rms_px) and _plausible_fit(f, side):
+                    wide.append(f)
+    wide.sort(key=lambda f: f.rms_px)
+    tight = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
+                       plane_sigma_deg=10.0, plane_sigma_m=1.0)
+    ok = []
+    for g in wide[:3]:
+        try:
+            f = fit_trajectory(obs, t_hit, "plane", g.plane, phys, tight, theta0=np.r_[g.theta[:4], 0.0, 0.0])
+        except (ValueError, RuntimeError):
+            f = g
+        if _plausible_fit(f, side):
+            ok.append(f)
+    return min(ok, key=lambda f: f.rms_px) if ok else first
 
 
 def _state_at(f: FitResult, t: float, phys: PhysicsParams) -> tuple[np.ndarray, np.ndarray] | None:
@@ -147,35 +209,59 @@ def _end_point(sf: ShotFit, phys: PhysicsParams) -> np.ndarray | None:
     return st[0]
 
 
-def joint_hit_points(fits: list[ShotFit], phys: PhysicsParams, max_jump_m: float = 3.0) -> list[np.ndarray | None]:
-    """打点 i を、ショット i の始まりとショット i − 1 の終わりから出す（``ShotFit`` の 2）。
+def hit_point_options(fits: list[ShotFit], phys: PhysicsParams, max_jump_m: float = 3.0
+                      ) -> list[list[np.ndarray]]:
+    """打点 i の候補（ショット i の始まりとショット i − 1 の終わりから。最初の候補が ``joint_hit_points`` の値）。
 
-    重みは飛行の時間の 2 乗（画像上の曲がり方 = 奥行きの決まりやすさは時間の 2 乗に比例する）。
-    2 つが ``max_jump_m`` 以上離れていたら（どちらかが外れている）、長く飛んだ方だけを使う。
-    最後の要素は、最後のショットの着地点（床の上）。
+    打った側から見てありえない所（相手側・コートから遠い）の候補は、ありえる候補があれば使わない。
+    2 つが ``max_jump_m`` 以上離れていたら（どちらかが外れている）、長く飛んだ方を最初に、もう片方を 2 番目に置く
+    （``fit_shots`` が両方で当てはめ直し、画像上のずれの小さい方を使う）。それ以外は、飛行の時間の 2 乗の重みで
+    平均した 1 つ（画像上の曲がり方 = 奥行きの決まりやすさは時間の 2 乗に比例する）。
+    最後の要素は、最後のショットの着地点（床の上）の 1 つ（なければ空）。
     """
     starts = []
     for sf in fits:
         st = None if sf.fit is None else _state_at(sf.fit, sf.t_hit, phys)
         starts.append(None if st is None else st[0])
     ends = [_end_point(sf, phys) for sf in fits]
-    out: list[np.ndarray | None] = []
+    out: list[list[np.ndarray]] = []
     for i, sf in enumerate(fits):
         cands = []
         if starts[i] is not None:
             cands.append((starts[i], sf.duration ** 2))
         if i > 0 and ends[i - 1] is not None and fits[i - 1].t_end >= sf.t_hit - 0.05:
             cands.append((ends[i - 1], fits[i - 1].duration ** 2))
+        good = [c for c in cands if _plausible_point(c[0], sf.side)]
+        if good:
+            cands = good
         if not cands:
-            out.append(None)
+            out.append([])
             continue
         if len(cands) == 2 and np.linalg.norm(cands[0][0] - cands[1][0]) > max_jump_m:
-            cands = [max(cands, key=lambda c: c[1])]
+            cands.sort(key=lambda c: -c[1])
+            out.append([c[0] for c in cands])
+            continue
         w = np.array([c[1] for c in cands])
-        out.append(np.sum([c[0] * wi for c, wi in zip(cands, w)], axis=0) / w.sum())
+        out.append([np.sum([c[0] * wi for c, wi in zip(cands, w)], axis=0) / w.sum()])
     last = ends[-1] if fits else None
-    out.append(None if last is None else np.r_[last[:2], 0.0])
+    out.append([] if last is None else [np.r_[last[:2], 0.0]])
     return out
+
+
+def _plausible_point(p: np.ndarray, side: str, net_margin_m: float = 1.0) -> bool:
+    """打点の位置だけで ``plausible_start`` を見る（自分の側・コートの近く）。"""
+    p = np.asarray(p, float)
+    if not np.isfinite(p).all() or abs(p[0]) > 8.0 or abs(p[1]) > 4.0 or not -0.2 < p[2] < 4.5:
+        return False
+    return side not in ("h", "o") or (1.0 if side == "h" else -1.0) * p[0] < net_margin_m
+
+
+def joint_hit_points(fits: list[ShotFit], phys: PhysicsParams, max_jump_m: float = 3.0) -> list[np.ndarray | None]:
+    """打点 i を、ショット i の始まりとショット i − 1 の終わりから出す（``ShotFit`` の 2）。
+
+    ``hit_point_options`` の最初の候補（なければ None）。最後の要素は、最後のショットの着地点（床の上）。
+    """
+    return [o[0] if o else None for o in hit_point_options(fits, phys, max_jump_m)]
 
 
 def crossing_time(prev: FitResult, nxt: FitResult, camera: Camera, phys: PhysicsParams, lo: float, hi: float,
@@ -347,24 +433,37 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             times = audio_hit_times(fits, t_audio, camera, phys, times, speed_of_sound_mps)
         if refine_times or any(t is not None for t in t_audio):
             split(times)
-        pts = joint_hit_points(fits, phys)
+        pts = hit_point_options(fits, phys)
         jobs, args = [], []
         for i, sf in enumerate(fits):
-            a, b = pts[i], pts[i + 1]
-            if (sf.fit is None or a is None or b is None or np.linalg.norm((b - a)[:2]) < 0.3
-                    or sf.n_obs < min_obs):
+            if sf.fit is None or sf.n_obs < min_obs:
                 continue
-            fo = FitOptions(**{**opts.__dict__, "p0_prior_m": a, "p0_prior_sigma_m": hit_sigma_m,
-                               "refine_plane": opts.refine_plane and sf.n_obs > 5,
-                               "init_state": _state_at(sf.fit, sf.t_hit, phys), "ci_method": "none",
-                               **({"max_nfev_per_param": bad_max_nfev_per_param}
-                                  if not (sf.fit.rms_px <= max_rms_px and sf.fit.speed0 * MPS_TO_KMH <= max_kmh)
-                                  else {})})
-            jobs.append((i, a))
-            args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys, fo, None))
+            fo = None
+            for a in pts[i]:
+                for b in pts[i + 1]:
+                    if np.linalg.norm((b - a)[:2]) < 0.3:
+                        continue
+                    fo = fo or FitOptions(**{
+                        **opts.__dict__, "p0_prior_sigma_m": hit_sigma_m,
+                        "refine_plane": opts.refine_plane and sf.n_obs > 5,
+                        "init_state": _state_at(sf.fit, sf.t_hit, phys), "ci_method": "none",
+                        **({"max_nfev_per_param": bad_max_nfev_per_param}
+                           if not (sf.fit.rms_px <= max_rms_px and sf.fit.speed0 * MPS_TO_KMH <= max_kmh)
+                           else {})})
+                    jobs.append((i, a))
+                    args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys,
+                                 FitOptions(**{**fo.__dict__, "p0_prior_m": a}), None))
+        best: dict[int, tuple[FitResult, np.ndarray]] = {}
         for (i, a), f in zip(jobs, _parallel_map(_try_fit, args, workers)):
-            if f is not None and f.success and np.isfinite(f.speed0):
-                fits[i].fit, fits[i].hit_point = f, a
+            if f is None or not f.success or not np.isfinite(f.speed0):
+                continue
+            # 打点の候補が 2 つあるときは、打った側から見てありえる中で、画像上のずれの小さい方。
+            # 選んだ打点から次の回の打球音の遅れを引き直すので、正しい方を選ぶと時刻も合っていく
+            key = (not _plausible_fit(f, fits[i].side), f.rms_px)
+            if i not in best or key < (not _plausible_fit(best[i][0], fits[i].side), best[i][0].rms_px):
+                best[i] = (f, a)
+        for i, (f, a) in best.items():
+            fits[i].fit, fits[i].hit_point = f, a
 
     # 最後に、平面を決めたまま信頼区間つきで当てはめ直す
     jobs, args = [], []
