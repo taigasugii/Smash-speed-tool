@@ -6,8 +6,12 @@
 3. 追跡：コートの手前（h：x < 0）と奥（o：x > 0）に分け、側ごとに近いコマどうしの検出をつないで短い軌跡にする。
    軌跡のうち、時間が重ならない組で「コートの中にいた点の数」の合計が最も多いものを選ぶ
    （コートの外で待っている人・隣のコートの人・審判などを外す）。短い抜けは前後から補う。
+4. 跳んでいるコマ：足元の位置で測った枠の高さがふだんより大きく出るコマを見つけ、床の上の位置を前後から補う。
 
-結果は 1 コマ 1 側 1 人の ``players.csv``（``frame, t, side, player, x, y, u, v, x0, y0, x1, y1, score, interpolated``）と、
+5. 動き：``movement.write_movement`` で、移動距離・速さ・いた場所の分布（``movement.json``・``movement.svg``）も書く。
+
+結果は 1 コマ 1 側 1 人の ``players.csv``（``frame, t, side, player, x, y, u, v, x0, y0, x1, y1, score, interpolated,
+airborne``）と、
 検出したすべての人の ``people.csv``、確かめ用の ``players_preview.jpg``・``players.json``。
 
 ``python -m smash_speed.players <動画> --calib <calibration.json> --out <出力先> [--start 80 --end 100]`` で動かす。
@@ -67,6 +71,13 @@ class PlayerOptions:
     gate_h: float = 0.3               # つなぐ範囲の最小（枠の揺れの分）[枠の高さ]
     max_gap_s: float = 0.5            # 軌跡の途切れをつなぎ、補ってよい長さ [s]
     min_track_s: float = 0.2          # 選ぶ軌跡の長さの下限 [s]（一瞬の誤検出を落とす）
+    # 跳んでいるコマ（``ground_jumps``）：足が浮くと枠の下の辺が上がり、床へ投影した位置がカメラから 1〜5 m 遠くへずれる。
+    # そのとき、足元の位置で測った枠の高さ [m] が、その選手のふだん（中央値）より大きく出る。
+    # ふだん 1.5〜1.7 m、腕を上げると 2.2 m ほど、跳んでいる間は 2.7〜3.5 m（IMG_3391・IMG_4397・IMG_5096 のジャンプスマッシュ）
+    jump_ratio: float = 1.5           # ふだんの高さのこの倍を超えたコマを、跳んでいる芯とみなす
+    jump_edge_ratio: float = 1.2      # 芯の前後で、この倍を超えている間（踏み切り・着地）も跳んでいるとみなす
+    jump_tail_ratio: float = 1.05     # その外も、この倍より大きく、外へ向かって下がり続ける間は含める
+    max_jump_s: float = 1.2           # これより長い区間は跳んでいるとはみなさない [s]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -347,6 +358,57 @@ def track_players(people: pd.DataFrame, frame_t: pd.Series, cfg: dict[str, Any],
     return res[PLAYER_COLUMNS].sort_values(["frame", "side", "player"]).reset_index(drop=True)
 
 
+def body_heights(players: pd.DataFrame, camera: Camera) -> np.ndarray:
+    """足元のコートの位置に立っているとしたときの、枠の高さ [m]（枠の上の辺から下の辺まで）。"""
+    if players.empty:
+        return np.zeros(0)
+    X0 = np.column_stack([players["x"].to_numpy(float), players["y"].to_numpy(float), np.zeros(len(players))])
+    ppm = camera.project(X0)[:, 1] - camera.project(X0 + [0.0, 0.0, 1.0])[:, 1]   # その位置の 1 m の縦の長さ [px]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(ppm > 0, (players["v"] - players["y0"]).to_numpy(float) / ppm, np.nan)
+
+
+def ground_jumps(players: pd.DataFrame, camera: Camera, o: PlayerOptions | None = None) -> pd.DataFrame:
+    """跳んでいるコマを見つけて ``airborne`` を真にし、その ``x, y`` を前後の床にいたコマから直線で補う。
+
+    ``u, v`` と枠は検出のまま残す（``x, y`` だけが床の上の位置の見積もりになる）。
+    """
+    o = o or PlayerOptions()
+    out = players.copy()
+    out["airborne"] = False
+    if out.empty:
+        return out
+    height = body_heights(out, camera)
+    for _, g in out.groupby(["side", "player"]):
+        g = g.sort_values("t")
+        h = height[out.index.get_indexer(g.index)]
+        ratio = h / np.nanmedian(h) if np.isfinite(h).any() else np.zeros(len(g))
+        core = np.nan_to_num(ratio) > o.jump_ratio
+        edge = np.nan_to_num(ratio) > o.jump_edge_ratio
+        air = np.zeros(len(g), bool)
+        # 芯を含む、edge の続く区間
+        start = np.flatnonzero(edge & ~np.r_[False, edge[:-1]])
+        stop = np.flatnonzero(edge & ~np.r_[edge[1:], False]) + 1
+        t = g["t"].to_numpy(float)
+        r = np.nan_to_num(ratio)
+        for a, b in zip(start, stop):
+            if not core[a:b].any():
+                continue
+            # 足が少しだけ浮いたコマ（低いカメラでは 10 cm で 1 m ずれる）も、高さが下がり続ける間は含める
+            while a > 0 and o.jump_tail_ratio < r[a - 1] < r[a]:
+                a -= 1
+            while b < len(r) and o.jump_tail_ratio < r[b] < r[b - 1]:
+                b += 1
+            if t[b - 1] - t[a] <= o.max_jump_s:
+                air[a:b] = True
+        if not air.any() or (~air).sum() < 2:
+            continue
+        out.loc[g.index[air], "airborne"] = True
+        for c in ("x", "y"):
+            out.loc[g.index[air], c] = np.interp(t[air], t[~air], g[c].to_numpy(float)[~air])
+    return out
+
+
 def coverage(players: pd.DataFrame, n_frames: int, per_side: int = 1) -> dict[str, float]:
     """側ごとの、選手の位置が出たコマの割合（補ったコマも含む）。"""
     n = max(1, n_frames * per_side)
@@ -372,6 +434,7 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
     """動画の区間で選手を検出・追跡し、``players.csv`` と確かめ用の画像を書き出す。"""
     from smash_speed.batch import stream_bgr
     from smash_speed.calibration.io import load_calibration
+    from smash_speed.movement import movement_brief, write_movement
     from smash_speed.video_io import probe
 
     o = o or PlayerOptions()
@@ -402,16 +465,20 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
     people = add_court_positions(people, camera)
     people.to_csv(out_dir / PEOPLE_FILE, index=False, float_format="%.4f")
     frame_t = pd.Series(seen, dtype=float).sort_index()
-    players = track_players(people, frame_t, cfg, o)
+    players = ground_jumps(track_players(people, frame_t, cfg, o), camera, o)
     players.to_csv(out_dir / PLAYERS_FILE, index=False, float_format="%.4f")
     info = {
         "video": str(Path(video).resolve()), "calib": str(Path(calib).resolve()),
         "start_s": start_s, "end_s": end_s, "n_frames": len(frame_t), "n_people": len(people),
-        "coverage": coverage(players, len(frame_t), o.per_side), "provider": detector.provider,
+        "coverage": coverage(players, len(frame_t), o.per_side),
+        "airborne": {s: round(float(players["airborne"][players["side"] == s].mean()), 4) if (players["side"] == s).any()
+                     else 0.0 for s in SIDES},
+        "provider": detector.provider,
         "detect_s": round(elapsed, 1), "options": o.to_dict(),
     }
     if len(frame_t):
         write_preview(meta, players, people, int(frame_t.index[len(frame_t) // 2]), out_dir / PLAYERS_PREVIEW_FILE)
+    info["movement"] = movement_brief(write_movement(out_dir, players, cfg.get("court")))
     (out_dir / "players.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     return info
 

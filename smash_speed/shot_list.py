@@ -14,6 +14,8 @@
 - ``shot_list.json``：動画・キャリブレーション・打球の見つけ方・種類ごとの本数と速さなど（GUI が読む）
 - ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
 - ``report.html``：統計をまとめた 1 枚のページ（``rally_report``。スマホでも見られる）
+- ``players.csv``・``people.csv``・``players_preview.jpg``・``players.json``：選手の位置（``players=True`` のときだけ。``players``）
+- ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -37,6 +39,7 @@ from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
+from smash_speed.players import PlayerOptions, analyze_players
 from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
@@ -66,6 +69,8 @@ class ShotListOptions:
     n_tracks: int | None = None       # 検出で残す軌道の数の上限（None なら全部。実動画では 20 秒で 1000 本ほど）
     filter_tracks: bool = True        # シャトルらしい軌道だけを残す（``shuttle_tracks``）
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
+    players: bool = False             # 選手の位置も出す（``players.analyze_players``。人の検出のモデルを使うので遅くなる）
+    player_options: PlayerOptions | None = None
 
 
 # =============================================================================
@@ -398,11 +403,31 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),
         "meta": run_metadata(),
     }
+    if o.players:
+        info["players"] = players_step(o, cfg, out, progress)
+        info["elapsed_s"] = round(time.time() - t_start, 1)
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     write_stats(out, shots, rallies, cfg.get("court"))
     write_report(out, cfg.get("court"), shots, rallies)
     progress(f"[進行] 完了：{len(shots)} 本（{len(rallies)} ラリー）、{info['elapsed_s']:.0f} 秒")
     return info
+
+
+def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: Callable[[str], None] = print
+                 ) -> dict[str, Any]:
+    """選手の位置を ``players.csv`` に書き、``shot_list.json`` に入れる要約を返す。
+
+    ショットの一覧は選手がいなくても出せるので、モデルが取れない・動かないときは一覧を止めず、``error`` に理由を残す。
+    """
+    progress("[進行] 選手を検出しています")
+    try:
+        p = analyze_players(o.video, o.calib, out, cfg, o.player_options, o.start_s, o.end_s, o.capture_fps,
+                            progress=progress)
+    except Exception as e:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
+        progress(f"[注意] 選手の位置は出せませんでした：{e}")
+        return {"error": str(e)}
+    progress(f"[進行] 選手の位置：手前 {p['coverage']['h']:.0%}・奥 {p['coverage']['o']:.0%} のコマ")
+    return {k: p[k] for k in ("n_frames", "coverage", "provider", "detect_s", "movement") if k in p}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -420,11 +445,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--audio", type=Path, default=None, help="別の音声ファイル（WAV）")
     ap.add_argument("--no-audio", action="store_true", help="打球音を使わない")
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
+    ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
-                                         use_audio=not a.no_audio, filter_tracks=not a.all_tracks), cfg)
+                                         use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
+                                         players=a.players), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

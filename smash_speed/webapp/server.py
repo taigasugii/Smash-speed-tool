@@ -679,6 +679,8 @@ def run(kind: str):
             args += ["--audio", st["audio"]]
         if b.get("use_roi") and st.get("roi"):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
+        if b.get("players"):
+            args.append("--players")
         t = start_task("すべてのショットを解析", [cli(*args)])
     elif kind == "synth":
         speed, fps = float(b.get("speed", 80)), float(b.get("fps", 240))
