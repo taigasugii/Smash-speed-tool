@@ -78,6 +78,8 @@ python -m pip install -e ".[dev]"
 # 任意：深層学習（TrackNetV3 の推論・学習。CPU 版で可）／姿勢推定（MediaPipe）
 python -m pip install -e ".[dl]"
 python -m pip install -e ".[pose]"
+# 任意：姿勢推定（RTMPose）。onnxruntime-directml と同じ環境に入れるので、依存は入れずに入れる（docs/pose_features.md）
+python -m pip install --no-deps rtmlib tqdm
 
 # 任意：GPU での推論（onnxruntime-directml。約 33 MB）。速さの確かめ方は docs/gpu.md
 python -m pip install -e ".[gpu]"
@@ -747,6 +749,25 @@ python -m smash_speed.players 動画.MOV --calib outputs\動画_calibration.json
 IMG_4397 の 80〜100 s（4K 30fps、600 コマ）で、手前・奥とも 100% のコマで位置が出た（GPU で約 20 秒）。
 注意：跳んでいる間（ジャンプスマッシュ）は足元が床にないので、位置が前・横に 1〜2 m ずれる。奥の選手は足元が 1 px ずれると
 コートの位置が約 7 cm 動くので、手前より揺れが大きい。
+
+### フォームの解析（ROADMAP E 章、`smash_speed/form.py` ほか）
+
+側方から撮ったスイング（ラケットを持つ腕の側から、打つ向きにまっすぐ横、6〜8 m、腰くらいの高さ、カメラは水平）から、
+関節の位置（姿勢推定）を出し、打った瞬間の肘・肩・膝の角度、手首の速さ、体の回る順番（腰 → 肩 → 肘 → 手首）、
+踏み込みなどを 1 ショットずつ数字にする。式と理由・合成データでの精度は `docs/pose_features.md`。GUI では「フォームを比べる」で
+2 本を選んで棒人間と数字を重ねて比べられる。
+
+```powershell
+# 姿勢推定 → 打点 → 特徴量（out\clear_01_form\form\form_features.csv）。左利きは --left-handed
+python -m smash_speed.form clear_01.mp4 --out out\clear_01_form --model rtmpose
+# お手本を作って点を付ける（DTW・コサイン）。お手本は何本でも差し替えられる
+python -m smash_speed.form_score make-ref out\ref.npz out\clear_01_form\form\poses\clear_01_001023.npz
+# 1 ショット 1 行の表（特徴量・点・打球の初速／打ち出し角／最高点／落ちた所）→ form\analysis.csv
+python -m smash_speed.form_table out\clear_01_form --ref out\ref.npz --stature 1.70 --hitter-from-net 5.5
+```
+
+手で付けた関節の位置と比べるとき（どの姿勢推定のモデルを使うか決める）は `python -m smash_speed.pose pck labels.csv a.npz b.npz`。
+実際の動画・実際のモデルでの確かめはまだ（デスクトップで行う）。
 
 ## 実動画（iPhone 17, 4K 30fps）で試した結果
 
