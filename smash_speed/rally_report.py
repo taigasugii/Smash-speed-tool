@@ -12,7 +12,8 @@
 3. ショットの種類の割合（横の棒）と、種類ごとの本数・平均と最高の初速の表（打った側ごとにも）
 4. ラリーの長さ（本数）の分布（棒）
 5. 着地点の分布図（``rally_stats.landing_svg``）
-6. 速いショット 10 本と、ラリーの一覧の表
+6. 選手の動き（選手の位置も出したときだけ。``movement`` の移動距離・速さの表と、いた場所の分布図）
+7. 速いショット 10 本と、ラリーの一覧の表
 
 ``python -m smash_speed.rally_report <ショットの一覧の出力先>`` で書き出す（``shot_list.analyze_video`` も最後に書き出す）。
 """
@@ -25,6 +26,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
+from smash_speed.movement import MOVEMENT_FILE, MOVEMENT_SVG
 from smash_speed.rally_stats import END_REASON_LABELS, landing_svg, landing_types, rally_stats
 from smash_speed.shots import RALLIES_FILE, SHOT_TYPE_LABELS, SHOTS_FILE, Rally, Shot, read_rallies, read_shots
 
@@ -121,9 +123,28 @@ def _span(info: dict[str, Any]) -> str:
     return f"{_f(a, '{:.1f}', '0')}〜{_f(b, '{:.1f}', '終わり')} 秒"
 
 
+def movement_section(movement: dict[str, Any], svg: str = "") -> str:
+    """選手の動きの節（``movement.json`` の中身と ``movement.svg``）。選手がいなければ空文字。"""
+    rows = [[SIDE_NAMES.get(p["side"], p["side"]) + (f"・{p['player'] + 1} 人目" if p["player"] else ""),
+             _f(p["seconds"]), _f(p["distance_m"]), _f(p["distance_per_min_m"]),
+             _f(p.get("rally_mean_distance_m"), "{:.1f}"), _f(p["max_speed_mps"], "{:.1f}"),
+             _f(None if p["moving_share"] is None else 100 * p["moving_share"])]
+            for p in movement.get("players", {}).values()]
+    if not rows:
+        return ""
+    return ('<section><h2>選手の動き</h2>'
+            + _table(["選手", "時間 秒", "移動距離 m", "1 分あたり m", "1 ラリーあたり m", "最高の速さ m/s",
+                      "動いていた割合 %"], rows, {1, 2, 3, 4, 5, 6})
+            + (f'<div>{svg}</div>' if svg else "")
+            + '<p class="note">足元の位置をならしてから測った目安です（揺れを強くならすほど短く出ます）。'
+              '「動いていた」は秒速 1 m より速く動いていた時間。図は色が濃いマスほど長くいた所で、十字は平均の位置。</p>'
+              '</section>')
+
+
 def build_report(shots: list[Shot], rallies: list[Rally], info: dict[str, Any] | None = None,
-                 court: dict[str, Any] | None = None, title: str | None = None) -> str:
-    """レポートの HTML（1 つのファイルで完結する）。"""
+                 court: dict[str, Any] | None = None, title: str | None = None,
+                 movement: dict[str, Any] | None = None, movement_svg: str = "") -> str:
+    """レポートの HTML（1 つのファイルで完結する）。``movement`` があれば選手の動きの節も入れる。"""
     info = info or {}
     st = rally_stats(shots, rallies, court)
     name = title or (Path(info["video"]).name if info.get("video") else "ショットの統計")
@@ -194,6 +215,8 @@ def build_report(shots: list[Shot], rallies: list[Rally], info: dict[str, Any] |
                      + '<p class="note">コートを上から見た図（左が h の側、右が o の側）。点は 1 本ずつの着地点'
                        '（打ち返されたショットは、そのまま飛んだら落ちた所）。色が濃い区画ほど多く落ちています。</p>'
                        '</section>')
+    if movement:
+        parts.append(movement_section(movement, movement_svg))
     if top_rows:
         parts.append('<section><h2>速いショット</h2>'
                      + _table(["時刻 秒", "種類", "初速 km/h", "ラリー・何本目", "打った側"], top_rows, {0, 2})
@@ -218,8 +241,14 @@ def write_report(out_dir: str | Path, court: dict[str, Any] | None = None, shots
         rallies = read_rallies(out_dir / RALLIES_FILE) if (out_dir / RALLIES_FILE).exists() else []
     info_path = out_dir / SHOT_LIST_FILE
     info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
+    # 選手の動きは、この解析で選手の位置も出したときだけ（前の解析の movement.json が残っていても使わない）
+    movement, svg = None, ""
+    if (info.get("players") or {}).get("movement") and (out_dir / MOVEMENT_FILE).exists():
+        movement = json.loads((out_dir / MOVEMENT_FILE).read_text(encoding="utf-8"))
+        svg_path = out_dir / MOVEMENT_SVG
+        svg = svg_path.read_text(encoding="utf-8") if svg_path.exists() else ""
     path = out_dir / REPORT_FILE
-    path.write_text(build_report(shots, rallies, info, court), encoding="utf-8")
+    path.write_text(build_report(shots, rallies, info, court, movement=movement, movement_svg=svg), encoding="utf-8")
     return path
 
 

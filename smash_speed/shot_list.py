@@ -15,6 +15,7 @@
 - ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
 - ``report.html``：統計をまとめた 1 枚のページ（``rally_report``。スマホでも見られる）
 - ``players.csv``・``people.csv``・``players_preview.jpg``・``players.json``：選手の位置（``players=True`` のときだけ。``players``）
+- ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -426,7 +427,7 @@ def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: C
         progress(f"[注意] 選手の位置は出せませんでした：{e}")
         return {"error": str(e)}
     progress(f"[進行] 選手の位置：手前 {p['coverage']['h']:.0%}・奥 {p['coverage']['o']:.0%} のコマ")
-    return {k: p[k] for k in ("n_frames", "coverage", "provider", "detect_s")}
+    return {k: p[k] for k in ("n_frames", "coverage", "provider", "detect_s", "movement") if k in p}
 
 
 def main(argv: list[str] | None = None) -> None:
