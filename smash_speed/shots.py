@@ -52,6 +52,8 @@ class Shot:
     hit_x_m: float | None = None           # 打点
     hit_y_m: float | None = None
     hit_z_m: float | None = None
+    hitter_x_m: float | None = None        # 打つ人の床の上の足元（選手の追跡から。``hitter.attach_hitters``）
+    hitter_y_m: float | None = None
     land_x_m: float | None = None          # 着地点（床面）
     land_y_m: float | None = None
     t_land_s: float | None = None          # 着地した時刻
