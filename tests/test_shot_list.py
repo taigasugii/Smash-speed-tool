@@ -1,11 +1,13 @@
 """動画 1 本のショットの一覧（検出 → 打球 → 軌道と初速 → 種類）のテスト。"""
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from smash_speed import shot_list
 from smash_speed.config import load_config
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import PhysicsParams
@@ -240,13 +242,35 @@ def test_analyze_video_writes_the_shot_list(rally_video, tmp_path):
     assert "recorded_at" in saved
 
 
-def test_cli_without_audio(rally_video, tmp_path, capsys):
-    """音を使わなくても（軌道だけで打球を見つけて）一覧が出る。"""
+def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):
+    """音を使わなくても（軌道だけで打球を見つけて）一覧が出る。``--players`` で選手の位置も出す（D1b）。"""
     d, truth = rally_video
-    main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio"])
+    calls = []
+
+    def fake_players(video, calib, out_dir, cfg, o, start_s, end_s, capture_fps, progress):
+        calls.append((Path(video), Path(out_dir), start_s, end_s))
+        return {"n_frames": 10, "coverage": {"h": 1.0, "o": 0.5}, "provider": "CPUExecutionProvider", "detect_s": 0.1}
+
+    monkeypatch.setattr(shot_list, "analyze_players", fake_players)
+    main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
+          "--players"])
     saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     assert not saved["used_audio"] and saved["n_onsets"] is None
+    assert calls == [(d / "rally.mp4", tmp_path.resolve(), None, None)]
+    assert saved["players"]["coverage"] == {"h": 1.0, "o": 0.5}
     shots = read_shots(tmp_path / SHOTS_FILE)
     found = _match(shots, truth)
     assert sum(f is not None for f in found) >= len(truth) - 1
     assert "本" in capsys.readouterr().out
+
+
+def test_players_step_does_not_stop_the_shot_list(tmp_path, monkeypatch):
+    """人の検出のモデルが取れなくても、ショットの一覧は止めず、理由を残す。"""
+    def broken(*a, **k):
+        raise OSError("ネットにつながりません")
+
+    monkeypatch.setattr(shot_list, "analyze_players", broken)
+    msgs = []
+    o = ShotListOptions(tmp_path / "v.mp4", tmp_path / "c.json", tmp_path, players=True)
+    assert shot_list.players_step(o, CFG, tmp_path, msgs.append) == {"error": "ネットにつながりません"}
+    assert any("選手の位置は出せませんでした" in m for m in msgs)
