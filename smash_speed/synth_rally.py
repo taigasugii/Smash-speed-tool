@@ -410,6 +410,36 @@ def rally_camera(cfg: dict[str, Any]) -> Camera:
     return look_at(np.array(c["eye_m"]), np.array(c["target_m"]), c["f_px"], c["width"], c["height"])
 
 
+def corner_rally_camera() -> Camera:
+    """コートの角の後ろ・低い位置から撮る仮想カメラ（三脚を後ろのフェンスの角に置いた実動画に近い）。
+
+    飛ぶ向き（コートの x 軸）が奥行きに近いので、1 台では打点の奥行きが決まりにくい。
+    """
+    return look_at(np.array([-10.5, -4.0, 2.2]), np.array([1.0, 0.3, 1.8]), 950.0, 1920, 1080)
+
+
+def low_rally_camera() -> Camera:
+    """コートの横・低い位置（ネットの近く、1.2 m）から撮る仮想カメラ（客席の前の段から手で構えた実動画に近い）。
+
+    遠い方のコートの低い軌道が画像の上で縮み、ネット・ドライブの山の形が分かりにくい。
+    """
+    return look_at(np.array([-1.5, -8.0, 1.2]), np.array([0.0, 0.0, 2.6]), 800.0, 1920, 1080)
+
+
+RALLY_CAMERAS = ("side", "corner", "low")
+
+
+def named_rally_camera(name: str, cfg: dict[str, Any]) -> Camera:
+    """名前（``RALLY_CAMERAS``）からラリー用の仮想カメラを作る。side は ``rally_camera``（設定の値）。"""
+    if name == "side":
+        return rally_camera(cfg)
+    if name == "corner":
+        return corner_rally_camera()
+    if name == "low":
+        return low_rally_camera()
+    raise ValueError(f"知らないカメラの名前です: {name}（{', '.join(RALLY_CAMERAS)} のどれか）")
+
+
 def observe_rally(rally: SyntheticRally, camera: Camera, fps: float, phys: PhysicsParams,
                   rng: np.random.Generator, noise_px: float = 1.5, dropout: float = 0.1,
                   phase: float | None = None) -> pd.DataFrame:
