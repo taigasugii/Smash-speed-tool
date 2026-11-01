@@ -264,6 +264,29 @@ def joint_hit_points(fits: list[ShotFit], phys: PhysicsParams, max_jump_m: float
     return [o[0] if o else None for o in hit_point_options(fits, phys, max_jump_m)]
 
 
+def serve_hit_point(a: np.ndarray, f: FitResult, side: str, depth_m: tuple[float, float],
+                    min_dir_x: float = 0.3) -> np.ndarray:
+    """サーブの打点 ``a`` [m] を、飛行平面に沿って、深さの目安 ``depth_m``（ネットからの距離の平均, 標準偏差）と
+    重みつきで平均した位置にする。
+
+    当てはめの打点の、飛行平面に沿った位置の不確かさは、当てはめの共分散（plane モードの θ の 1 つ目）から出す。
+    横から撮れば小さいので、ほとんど動かない。平面がコートの x 軸から大きく外れている・打った側が分からない・
+    共分散がないときは ``a`` のまま。
+    """
+    a = np.asarray(a, float)
+    if side not in ("h", "o") or f.plane is None or f.mode != "plane" or f.cov_theta is None:
+        return a
+    d = f.plane.direction
+    var_fit = float(f.cov_theta[0, 0])
+    if abs(d[0]) < min_dir_x or not np.isfinite(var_fit) or var_fit <= 0:
+        return a
+    x_prior = (-1.0 if side == "h" else 1.0) * depth_m[0]
+    lam_prior = (x_prior - a[0]) / d[0]
+    var_prior = (depth_m[1] / abs(d[0])) ** 2
+    lam = lam_prior * var_fit / (var_fit + var_prior)
+    return a + lam * np.array([d[0], d[1], 0.0])
+
+
 def choose_hit_points(fits: list[ShotFit], pts: list[list[np.ndarray]],
                       res: dict[tuple[int, int, int], FitResult], opts: FitOptions | None = None,
                       implausible_cost: float = 1e6) -> list[int]:
@@ -424,7 +447,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               t_last: float | None = None, refine_times: bool = True, workers: int = 1,
               max_rms_px: float = np.inf, t_audio: list[float | None] | None = None,
               speed_of_sound_mps: float = 343.0, max_kmh: float = np.inf,
-              bad_max_nfev_per_param: int = 30) -> list[ShotFit]:
+              bad_max_nfev_per_param: int = 30,
+              serve_depth_m: tuple[float, float] | None = None) -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -449,6 +473,10 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             最適化の評価の回数の上限
             （パラメータ 1 個あたり。ふつうは 200）。打点をつなぐと救われるショットもあるので飛ばさないが、
             救われないショットは積分が重く、実動画で 1 本の当てはめ直しに 20〜50 秒かかっていた
+        serve_depth_m: 最初のショットをサーブとみなすときの、打点のネットからの深さの目安（平均, 標準偏差）[m]。
+            サーブは前の軌道がないので、角・後ろのカメラでは打点の奥行きが決まらず、初速が 15〜40% ずれる。
+            最初の当てはめの打点を、飛行平面に沿ってこの目安と重みつきで平均する（``serve_hit_point``）。
+            None なら使わない（ラリーの最初の打球が見つかっていない動画では、サーブではないので）
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
@@ -486,6 +514,9 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         if refine_times or any(t is not None for t in t_audio):
             split(times)
         pts = hit_point_options(fits, phys)
+        if serve_depth_m is not None and _ == 0 and fits and fits[0].fit is not None:
+            # 1 回目だけ（2 回目からは、目安に寄せた打点を事前分布にして当てはめ直した始まりなので、重ねて寄せない）
+            pts[0] = [serve_hit_point(a, fits[0].fit, fits[0].side, serve_depth_m) for a in pts[0]]
         jobs, args = [], []
         for i, sf in enumerate(fits):
             if sf.fit is None or sf.n_obs < min_obs:
@@ -563,7 +594,8 @@ def shot_fits_to_shots(fits: list[ShotFit], phys: PhysicsParams, source: str = "
 def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, hits: str = "true",
                         noise_px: float = 1.5, dropout: float = 0.1, camera: Camera | None = None,
                         cfg: dict[str, Any] | None = None, verbose: bool = False,
-                        keep_shots: bool = False) -> dict[str, Any]:
+                        keep_shots: bool = False, serve_depth_m: tuple[float, float] | None = None
+                        ) -> dict[str, Any]:
     """合成ラリーで、ショットの種類ごとの初速の誤差を測る。
 
     Args:
@@ -608,7 +640,8 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                 j = int(np.argmin(d))
                 if d[j] <= 0.05 and j not in pairs:
                     pairs[i] = j
-        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio)
+        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio,
+                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None)
         shots = shot_fits_to_shots(fits, phys) if keep_shots else [None] * len(fits)
         for i, (sf, j) in enumerate(zip(fits, pairs)):
             if j is None:
