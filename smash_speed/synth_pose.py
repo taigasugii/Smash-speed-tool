@@ -232,3 +232,69 @@ def wrist_speed_peak_time(p: SwingParams, t: np.ndarray | None = None) -> float:
     X = joints_3d(p, t)[:, KP["right_wrist"]]
     v = np.linalg.norm(np.gradient(X, t, axis=0), axis=1)
     return float(t[int(np.argmax(v))])
+
+
+def session_joints(swings: dict[float, SwingParams], t: float) -> np.ndarray:
+    """何本かのスイング（打点の時刻 [s] → 決め方）を続けた動きの、時刻 ``t`` [s] の 3 次元の関節 (17, 3)。
+
+    スイングの前 1.5 秒〜後 1.0 秒はそのスイング、その間は前のスイングの終わりから次の構えへ直線で移る。
+    """
+    cs = sorted(swings)
+    nxt = next((c for c in cs if t <= c + 1.0), None)
+    prev = max((c for c in cs if c + 1.0 < t), default=None)
+    if nxt is not None and t >= nxt - 1.5:
+        return joints_3d(swings[nxt], np.array([t - nxt]))[0]
+    if prev is None or nxt is None:
+        c = nxt if nxt is not None else prev
+        return joints_3d(swings[c], np.array([-1.5 if nxt is not None else 1.0]))[0]
+    w = (t - prev - 1.0) / (nxt - 1.5 - prev - 1.0)
+    return ((1 - w) * joints_3d(swings[prev], np.array([1.0])) + w * joints_3d(swings[nxt], np.array([-1.5])))[0]
+
+
+def render_swing_video(path, swings: dict[float, SwingParams], camera: Camera, fps: float = 60.0,
+                       duration_s: float | None = None, audio: bool = False, sound_distance_m: float = 7.0
+                       ) -> PoseSequence:
+    """棒人間がスイングする合成の動画を書き出し、関節の正解（画像の座標）を返す（関節を付ける画面の確かめ用）。
+
+    ``audio`` なら、打点の ``sound_distance_m`` ÷ 343 秒後に打球音の代わりのクリック音を入れる（ffmpeg が要る）。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    import cv2
+
+    from smash_speed.pose import SKELETON
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    duration_s = duration_s or max(swings) + 1.5
+    n = int(round(duration_s * fps))
+    w, h = camera.width, camera.height
+    t = np.arange(n) / fps
+    X = np.stack([session_joints(swings, float(tk)) for tk in t])
+    xy = camera.project(X.reshape(-1, 3)).reshape(n, NUM_KEYPOINTS, 2)
+    tmp = Path(tempfile.mkdtemp()) / "v.mp4"
+    writer = cv2.VideoWriter(str(tmp if audio else path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    s = max(1, w // 480)
+    for k in range(n):
+        img = np.full((h, w, 3), (200, 215, 225), np.uint8)
+        cv2.line(img, (0, int(h * 0.8)), (w, int(h * 0.8)), (150, 160, 170), 2 * s)
+        P = {name: tuple(int(round(v)) for v in xy[k, KP[name]]) for name in KP}
+        for a, b in SKELETON:
+            cv2.line(img, P[a], P[b], (60, 60, 60), 3 * s, cv2.LINE_AA)
+        for name, p in P.items():
+            cv2.circle(img, p, 3 * s, (40, 90, 200) if name.startswith("right_") else (200, 90, 40), -1, cv2.LINE_AA)
+        writer.write(img)
+    writer.release()
+    if audio:
+        from smash_speed.synth import write_click_audio
+
+        wav = tmp.with_suffix(".wav")
+        write_click_audio(wav, duration_s, [(c + sound_distance_m / 343.0, 0.6) for c in swings])
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp), "-i", str(wav), "-c:v", "copy",
+                        "-c:a", "aac", "-shortest", str(path)], check=True)
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+    return PoseSequence(t=t, xy=xy, score=np.ones((n, NUM_KEYPOINTS)), width=w, height=h, fps=fps, model="truth",
+                        meta={"video": path.name})
