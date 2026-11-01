@@ -16,7 +16,8 @@
 - ``shot_list.json``：動画・キャリブレーション・打球の見つけ方・種類ごとの本数と速さなど（GUI が読む）
 - ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
 - ``report.html``：統計をまとめた 1 枚のページ（``rally_report``。スマホでも見られる）
-- ``players.csv``・``people.csv``・``players_preview.jpg``・``players.json``：選手の位置（``players=True`` のときだけ。``players``）
+- ``players.csv``・``people.csv``・``players_preview.jpg``・``players.json``：選手の位置（``players=True`` のときだけ。``players``）。
+  このときは ``shots.csv`` の ``hitter_x_m``・``hitter_y_m`` に打つ人の足元も入れる（``hitter.attach_hitters``）
 - ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
@@ -39,9 +40,10 @@ from smash_speed.calibration.io import load_calibration
 from smash_speed.camera import Camera
 from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
+from smash_speed.hitter import attach_hitters
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
-from smash_speed.players import PlayerOptions, analyze_players
+from smash_speed.players import PLAYERS_FILE, PlayerOptions, analyze_players
 from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
@@ -407,6 +409,11 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     }
     if o.players:
         info["players"] = players_step(o, cfg, out, progress)
+        if "error" not in info["players"] and (out / PLAYERS_FILE).exists():
+            n = attach_hitters(shots, pd.read_csv(out / PLAYERS_FILE))
+            write_shots(out / SHOTS_FILE, shots)
+            info["players"]["n_hitters"] = n
+            progress(f"[進行] 打つ人の足元：{n} / {len(shots)} 本")
         rallies = rallies_with_players(shots, rallies, det, o, cfg, out, info, progress)
         info["elapsed_s"] = round(time.time() - t_start, 1)
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -424,7 +431,6 @@ def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFr
     移動距離（``movement.json`` など）を書き直し、``info`` の数を直す。選手の位置がなければ ``rallies`` をそのまま返す。
     """
     from smash_speed.movement import movement_brief, write_movement
-    from smash_speed.players import PLAYERS_FILE
 
     if "error" in info.get("players", {}) or not (out / PLAYERS_FILE).exists():
         return rallies
