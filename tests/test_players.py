@@ -8,8 +8,8 @@ import pytest
 
 from smash_speed.camera import look_at
 from smash_speed.config import load_config
-from smash_speed.players import (PlayerOptions, PersonDetector, add_court_positions, choose_tracklets, coverage,
-                                 ensure_model, track_players)
+from smash_speed.players import (PlayerOptions, PersonDetector, add_court_positions, body_heights, choose_tracklets,
+                                 coverage, ensure_model, ground_jumps, track_players)
 
 FPS = 30.0
 
@@ -134,3 +134,36 @@ def test_track_players_empty():
                                  look_at(np.array([-9.0, 0.0, 3.0]), np.zeros(3), 1500.0, 1920, 1080))
     players = track_players(people, pd.Series([0.0], index=[0]), cfg)
     assert players.empty and coverage(players, 1) == {"h": 0.0, "o": 0.0}
+
+
+def test_ground_jumps_fills_the_floor_position_while_airborne():
+    """跳んでいる間は足元が浮いて床の位置が遠くへずれる。前後から補い、腕を上げただけのコマは跳んだとみなさない。"""
+    cfg = load_config()
+    cam = look_at(np.array([-12.0, -1.0, 1.3]), np.array([0.0, 0.0, 0.5]), 1500.0, 1920, 1080)   # 後ろの低い所
+    n = 90
+    t = np.arange(n) / FPS
+    foot = np.column_stack([-5.0 + 0.6 * t, -1.0 + 0.3 * t])
+    lift = np.where((t >= 1.0) & (t <= 1.5), 4 * 0.5 * (t - 1.0) * (1.5 - t) / 0.25, 0.0)   # 0.5 m 跳ぶ
+    arm = np.where((t >= 0.3) & (t <= 0.6), 0.5, 0.0)                                       # 腕を上げる（床の上）
+    rows = []
+    for i in range(n):
+        uv = cam.project(np.array([[*foot[i], lift[i]], [*foot[i], lift[i] + 1.75 + arm[i]]]))
+        h = (uv[0, 1] - uv[1, 1]) / (1.75 + arm[i]) * 1.75
+        rows.append((i, t[i], uv[0, 0] - 0.2 * h, uv[1, 1], uv[0, 0] + 0.2 * h, uv[0, 1], 0.9))
+    people = add_court_positions(pd.DataFrame(rows, columns=["frame", "t", "x0", "y0", "x1", "y1", "score"]), cam)
+    raw = track_players(people, pd.Series(t, index=np.arange(n)), cfg)
+    raw = raw[raw["side"] == "h"].reset_index(drop=True)
+    jump = (lift > 0.02)[raw["frame"]]
+    raw_err = np.hypot(raw["x"] - foot[raw["frame"], 0], raw["y"] - foot[raw["frame"], 1])
+    assert raw_err[jump].max() > 1.5                       # 補う前は、跳んだ所で 1.5 m 以上ずれる
+    assert np.median(body_heights(raw, cam)) == pytest.approx(1.75, abs=0.05)
+
+    p = ground_jumps(raw, cam)
+    err = np.hypot(p["x"] - foot[p["frame"], 0], p["y"] - foot[p["frame"], 1])
+    assert err.max() < 0.15
+    air = p["airborne"].to_numpy()
+    assert air[(lift > 0.15)[p["frame"]]].all()            # 高く跳んでいる間は必ず
+    assert not air[(arm > 0)[p["frame"]]].any()            # 腕を上げただけでは跳んだとみなさない
+    assert not air[(t < 0.9) | (t > 1.6)].any()
+    np.testing.assert_allclose(p["u"], raw["u"])            # 画像の上の足元は検出のまま
+    assert ground_jumps(raw.iloc[:0], cam).empty
