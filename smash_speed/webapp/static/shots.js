@@ -251,7 +251,7 @@ App.views.shots = {
     const card = h(`<div class="card"><h2>${fmt(s.t_hit_s, 2)} 秒の${esc(s.label)}${s.speed_kmh != null ? `（${fmt(s.speed_kmh, 0)} km/h）` : ""}</h2>
       <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">○</span> は見つけたシャトル（<span style="color:#ea580c">●</span> がこのコマ）、<span style="color:#2563eb">線</span> は計算した飛び方
         （<span style="color:#2563eb">●</span> がこのコマの時刻の位置）です。下のボタンか、キーボードの ← → でコマを前後に送れます。
-        右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所です。
+        右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所${v.hitter ? `、<span style="color:#7c3aed">■</span> が打った人の足元` : ""}です。
         ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}
         いちばん下で、このショットの正しい種類を選べます（キーボードの数字でも選べます）。</p>
       <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
@@ -278,6 +278,7 @@ App.views.shots = {
       ${v.court.map(([a, b]) => `<line x1="${a[0]}" y1="${-a[1]}" x2="${b[0]}" y2="${-b[1]}" stroke="#fff" stroke-width="${sw}"/>`).join("")}
       <line x1="0" y1="${-Y + 0.3}" x2="0" y2="${Y - 0.3}" stroke="#334155" stroke-width="${sw * 1.5}" stroke-dasharray="0.15 0.1"/>
       ${pathTop ? `<polyline points="${pathTop}" fill="none" stroke="#2563eb" stroke-width="${sw * 1.6}"/>` : ""}
+      ${v.hitter ? `<rect x="${v.hitter[0] - 0.15}" y="${-v.hitter[1] - 0.15}" width="0.3" height="0.3" fill="#7c3aed"/>` : ""}
       ${v.hit ? `<circle cx="${v.hit[0]}" cy="${-v.hit[1]}" r="0.18" fill="#16a34a"/>` : ""}
       ${v.land ? `<path d="M${v.land[0] - 0.18},${-v.land[1] - 0.18}l0.36,0.36m0,-0.36l-0.36,0.36" stroke="#dc2626" stroke-width="${sw * 1.6}"/>` : ""}</svg>
       ${v.hit ? `<p class="small muted" style="margin:6px 0 0">打った高さ ${fmt(v.hit[2], 2)} m${v.land ? `・ネットから落ちた所まで ${fmt(Math.abs(v.land[0]), 1)} m` : ""}</p>` : ""}`;

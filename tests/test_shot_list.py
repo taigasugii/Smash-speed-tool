@@ -247,8 +247,15 @@ def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):
     d, truth = rally_video
     calls = []
 
+    stand = {"h": (-4.0, 0.5), "o": (4.0, -0.5)}
+
     def fake_players(video, calib, out_dir, cfg, o, start_s, end_s, capture_fps, progress):
         calls.append((Path(video), Path(out_dir), start_s, end_s))
+        # 両側の選手が動かずに立っている players.csv（打つ人の足元は、打った側の選手の位置になる）
+        t = np.arange(0, 60, 1 / 30)
+        pd.concat([pd.DataFrame({"frame": np.arange(len(t)), "t": t, "side": side, "player": 0, "x": x, "y": y,
+                                 "airborne": False}) for side, (x, y) in stand.items()]
+                  ).to_csv(Path(out_dir) / "players.csv", index=False)
         return {"n_frames": 10, "coverage": {"h": 1.0, "o": 0.5}, "provider": "CPUExecutionProvider", "detect_s": 0.1}
 
     monkeypatch.setattr(shot_list, "analyze_players", fake_players)
@@ -261,6 +268,11 @@ def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):
     shots = read_shots(tmp_path / SHOTS_FILE)
     found = _match(shots, truth)
     assert sum(f is not None for f in found) >= len(truth) - 1
+    # 打つ人の足元（D3）
+    sided = [f for f in shots if f.side]
+    assert sided and saved["players"]["n_hitters"] == len(sided)
+    for f in sided:
+        assert (f.hitter_x_m, f.hitter_y_m) == stand[f.side]
     assert "本" in capsys.readouterr().out
 
 

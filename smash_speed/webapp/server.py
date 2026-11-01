@@ -991,6 +991,7 @@ def shot_view():
     return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end,
               hit=[r3(s.hit_x_m), r3(s.hit_y_m), r3(s.hit_z_m)] if s.hit_point is not None else None,
               land=[r3(s.land_x_m), r3(s.land_y_m)] if s.land_x_m is not None and s.land_y_m is not None else None,
+              hitter=[r3(s.hitter_x_m), r3(s.hitter_y_m)] if s.hitter_x_m is not None and s.hitter_y_m is not None else None,
               path=[[round(float(c), 3) for c in p] for p in pts], path_t=[round(float(v), 4) for v in pts_t],
               path_px=uv, detections=det, frames=frames,
               court=[[a[:2].tolist(), b[:2].tolist()] for a, b, kind in court_segments(S.cfg()) if kind == "line"],
