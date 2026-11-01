@@ -264,6 +264,58 @@ def joint_hit_points(fits: list[ShotFit], phys: PhysicsParams, max_jump_m: float
     return [o[0] if o else None for o in hit_point_options(fits, phys, max_jump_m)]
 
 
+def choose_hit_points(fits: list[ShotFit], pts: list[list[np.ndarray]],
+                      res: dict[tuple[int, int, int], FitResult], opts: FitOptions | None = None,
+                      implausible_cost: float = 1e6) -> list[int]:
+    """打点の候補（``hit_point_options``）が 2 つある所で、どちらを使うかを決める（候補の番号のリスト）。
+
+    打点 i は、ショット i − 1 の終わりとショット i の始まりの両方に効くので、候補 c ごとに
+    「ショット i − 1 を終わり c で当てはめ直したずれ」と「ショット i を始まり c で当てはめ直したずれ」
+    （どちらも画像上のずれの 2 乗の和に、平面を「打点 → 次の打点」から動かした分の罰を足したもの。相手の端の
+    候補は、いちばん合うもの）を足し、小さい方を選ぶ。平面を動かせるので、外れた終わりでも長いショットは
+    画像上では合ってしまい、ずれは平面を動かした分に出る。
+    1 本のショットのずれだけでは、短いショットの奥行きのあいまいさ（角・後ろのカメラ）で、外れた候補の方が
+    わずかに合うことがある。長く飛んだ前のショットの終わりは、外れた候補ではずれが大きく増える。
+    打った側から見てありえない当てはめは ``implausible_cost`` を足す。比べられなければ最初の候補。
+
+    Args:
+        res: (ショットの番号, 始まりの候補の番号, 終わりの候補の番号) → 当てはめ直した結果
+    """
+    opts = opts or FitOptions(refine_plane=True)
+    sig = np.array([np.deg2rad(opts.plane_sigma_deg), opts.plane_sigma_m])
+
+    def cost(f: FitResult, side: str) -> float:
+        c = f.rms_px ** 2 * f.n_obs
+        if f.mode == "plane" and len(f.theta) >= 6 and opts.refine_plane:
+            # 事前分布の 1σ は、当てはめと同じく画像上の 1 px（ずれが大きければその大きさ）に当たる
+            w = max(opts.loss_scale_px, f.rms_px)
+            c += float(np.sum((w * f.theta[4:6] / sig) ** 2))
+        return c + (0.0 if _plausible_fit(f, side) else implausible_cost)
+
+    best: dict[tuple[int, str, int], float] = {}  # (ショット, "a" | "b", 候補) → いちばん小さいずれ
+    for (i, ka, kb), f in res.items():
+        c = cost(f, fits[i].side)
+        for key in ((i, "a", ka), (i, "b", kb)):
+            best[key] = min(best.get(key, np.inf), c)
+    chosen = [0] * len(pts)
+    for i, opts_i in enumerate(pts):
+        if len(opts_i) < 2:
+            continue
+        totals = []
+        for k in range(len(opts_i)):
+            parts = [best.get((i, "a", k)) if i < len(fits) else None, best.get((i - 1, "b", k)) if i > 0 else None]
+            parts = [x for x in parts if x is not None]
+            totals.append(sum(parts) if parts else np.inf)
+        # 片方の候補でしか当てはめられていないショットがあると比べられないので、両方の候補で同じショットが
+        # 当てはめられているときだけ比べる
+        same = all((best.get((i, "a", k)) is None) == (best.get((i, "a", 0)) is None)
+                   and (best.get((i - 1, "b", k)) is None) == (best.get((i - 1, "b", 0)) is None)
+                   for k in range(len(opts_i)))
+        if same and np.isfinite(min(totals)):
+            chosen[i] = int(np.argmin(totals))
+    return chosen
+
+
 def crossing_time(prev: FitResult, nxt: FitResult, camera: Camera, phys: PhysicsParams, lo: float, hi: float,
                   step_s: float = 2.5e-4) -> tuple[float, float] | None:
     """飛んできた軌道（``prev`` を先へ）と打ち返した軌道（``nxt`` を前へ）が画像上でいちばん近づく時刻 [s] と、
@@ -439,8 +491,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             if sf.fit is None or sf.n_obs < min_obs:
                 continue
             fo = None
-            for a in pts[i]:
-                for b in pts[i + 1]:
+            for ka, a in enumerate(pts[i]):
+                for kb, b in enumerate(pts[i + 1]):
                     if np.linalg.norm((b - a)[:2]) < 0.3:
                         continue
                     fo = fo or FitOptions(**{
@@ -450,20 +502,20 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                         **({"max_nfev_per_param": bad_max_nfev_per_param}
                            if not (sf.fit.rms_px <= max_rms_px and sf.fit.speed0 * MPS_TO_KMH <= max_kmh)
                            else {})})
-                    jobs.append((i, a))
+                    jobs.append((i, ka, kb))
                     args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys,
                                  FitOptions(**{**fo.__dict__, "p0_prior_m": a}), None))
-        best: dict[int, tuple[FitResult, np.ndarray]] = {}
-        for (i, a), f in zip(jobs, _parallel_map(_try_fit, args, workers)):
-            if f is None or not f.success or not np.isfinite(f.speed0):
+        res = {job: f for job, f in zip(jobs, _parallel_map(_try_fit, args, workers))
+               if f is not None and f.success and np.isfinite(f.speed0)}
+        chosen = choose_hit_points(fits, pts, res, opts)
+        for i, sf in enumerate(fits):
+            got = [(k, f) for k, f in res.items() if k[0] == i]
+            if not got:
                 continue
-            # 打点の候補が 2 つあるときは、打った側から見てありえる中で、画像上のずれの小さい方。
-            # 選んだ打点から次の回の打球音の遅れを引き直すので、正しい方を選ぶと時刻も合っていく
-            key = (not _plausible_fit(f, fits[i].side), f.rms_px)
-            if i not in best or key < (not _plausible_fit(best[i][0], fits[i].side), best[i][0].rms_px):
-                best[i] = (f, a)
-        for i, (f, a) in best.items():
-            fits[i].fit, fits[i].hit_point = f, a
+            # 選んだ打点の組の当てはめ（なければ、ありえる中で画像上のずれの小さいもの）
+            k, f = min(got, key=lambda kf: (kf[0][1:] != (chosen[i], chosen[i + 1]),
+                                            not _plausible_fit(kf[1], sf.side), kf[1].rms_px))
+            sf.fit, sf.hit_point = f, pts[i][k[1]]
 
     # 最後に、平面を決めたまま信頼区間つきで当てはめ直す
     jobs, args = [], []
@@ -599,12 +651,19 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fps", type=float, nargs="+", default=[30.0, 120.0])
     ap.add_argument("--hits", nargs="+", default=["true", "audio", "track"], choices=["true", "audio", "track"])
+    ap.add_argument("--camera", default="side", choices=["side", "corner", "low"],
+                    help="合成のカメラの位置（side：横・遠く、corner：角の後ろ・低い、low：横・低い）")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
+    from smash_speed.config import load_config
+    from smash_speed.synth_rally import named_rally_camera
+
+    cfg = load_config()
+    camera = named_rally_camera(a.camera, cfg)
     for fps in a.fps:
         for h in a.hits:
             t0 = time.time()
-            r = synthetic_benchmark(a.rallies, fps, a.seed, h, verbose=a.verbose)
+            r = synthetic_benchmark(a.rallies, fps, a.seed, h, camera=camera, cfg=cfg, verbose=a.verbose)
             parts = [f"{SHOT_TYPE_LABELS[k]} {v['mape']:.1f}%（{v['n']} 本"
                      + (f"・失敗 {v['n_failed']}" if v["n_failed"] else "") + "）"
                      for k, v in r["by_type"].items() if v["mape"] is not None]
