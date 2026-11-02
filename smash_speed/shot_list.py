@@ -444,8 +444,8 @@ def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFr
                          cfg: dict[str, Any], out: Path, info: dict[str, Any],
                          progress: Callable[[str], None] = print) -> list[Rally]:
     """選手の位置（``players.csv``）が出たら、ラリーを区切り直して短いラリーを選手の動きで確かめる
-    （``rallies.split_rallies`` の ``players``）。ラリーが変わったら ``shots.csv``・``rallies.csv`` と、ラリーごとの
-    移動距離（``movement.json`` など）を書き直し、``info`` の数を直す。選手の位置がなければ ``rallies`` をそのまま返す。
+    （``rallies.split_rallies`` の ``players``）。ラリーが変わったら ``shots.csv``・``rallies.csv`` を書き直し、``info`` の数を直す。
+    ラリーごとの移動距離（``movement.json`` など）は、決まったラリーでいつも書き直す。選手の位置がなければ ``rallies`` をそのまま返す。
     """
     from smash_speed.movement import movement_brief, write_movement
 
@@ -455,12 +455,12 @@ def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFr
     new = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"), players=players)
     n_out = sum(s.rally_id is None for s in shots)
     info["players"]["n_shots_outside_rallies"] = n_out
-    if not n_out:
-        return new
-    progress(f"[進行] 選手の動きから、ラリーではない打球 {n_out} 本をラリーから外しました（{len(rallies)} → {len(new)} ラリー）")
-    write_shots(out / SHOTS_FILE, shots)
-    write_rallies(out / RALLIES_FILE, new)
-    info["n_rallies"] = len(new)
+    if n_out:
+        progress(f"[進行] 選手の動きから、ラリーではない打球 {n_out} 本をラリーから外しました（{len(rallies)} → {len(new)} ラリー）")
+        write_shots(out / SHOTS_FILE, shots)
+        write_rallies(out / RALLIES_FILE, new)
+        info["n_rallies"] = len(new)
+    # 選手の位置は当てはめの前（この解析のラリーが出る前）に出すので、ラリーごとの移動距離はここで、決まったラリーで書き直す
     if "movement" in info["players"]:
         info["players"]["movement"] = movement_brief(write_movement(out, players, cfg.get("court"), new))
     return new

@@ -191,3 +191,19 @@ def test_rallies_with_players_rewrites_outputs_stats_and_report(tmp_path):
     # 選手の位置を出さなかった解析：stats.json に players は入らない
     (tmp_path / "shot_list.json").write_text(json.dumps({}), encoding="utf-8")
     assert "players" not in write_stats(tmp_path, court=COURT)
+
+
+def test_rallies_with_players_rewrites_movement_with_final_rallies(tmp_path):
+    # 選手の位置は当てはめの前に出すので、movement.json のラリーは古い（ここではない）。外す打球がなくても書き直す
+    shots, players = _two_rallies_and_a_neighbor()
+    shots = [s for s in shots if s.hit_y_m < 5.0]   # となりのコートの打球なし
+    rallies = split_rallies(shots)
+    players.to_csv(tmp_path / "players.csv", index=False)
+    write_movement(tmp_path, players, COURT)
+    assert "rallies" not in json.loads((tmp_path / "movement.json").read_text("utf-8"))["players"]["h0"]
+    info = {"players": {"movement": {"h0": {}}}}
+    o = ShotListOptions(video="v.mp4", calib="c.json", out_dir=str(tmp_path))
+    new = rallies_with_players(shots, rallies, None, o, CFG, tmp_path, info, progress=lambda _: None)
+    assert len(new) == 2 and info["players"]["n_shots_outside_rallies"] == 0
+    saved = json.loads((tmp_path / "movement.json").read_text("utf-8"))["players"]["h0"]
+    assert [r["rally_id"] for r in saved["rallies"]] == [1, 2]
