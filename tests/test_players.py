@@ -56,6 +56,17 @@ def test_choose_tracklets_picks_heaviest_non_overlapping_set():
     assert choose_tracklets(spans) == [3, 2]
 
 
+def test_choose_tracklets_allows_short_overlap():
+    # 1 人に枠が 2 つ出て軌跡が分かれ、前後と 0.2〜0.3 秒重なった場合（IMG_5109_1 の奥の選手）
+    spans = pd.DataFrame({"id": [0, 1, 2], "t0": [0.0, 14.21, 16.35],
+                          "t1": [14.48, 16.58, 18.85], "weight": [348.0, 44.0, 58.0]})
+    assert choose_tracklets(spans) == [0, 2]                # 重なりを許さないと、間の 2.4 秒が落ちる
+    assert choose_tracklets(spans, 0.4) == [0, 1, 2]
+    # 長く重なる軌跡（別の人）は、許す幅を超えるので一緒には選ばない
+    spans.loc[1, "t0"] = 13.0
+    assert choose_tracklets(spans, 0.4) == [0, 2]
+
+
 def test_ensure_model_uses_existing_file_and_rejects_unknown(tmp_path):
     (tmp_path / "yolox_s.onnx").write_bytes(b"x")
     assert ensure_model("yolox_s", tmp_path) == tmp_path / "yolox_s.onnx"
@@ -111,6 +122,26 @@ def test_track_players_follows_both_sides_and_ignores_bystanders():
         assert np.median(err) < 0.1 and err.max() < 0.4, side
         assert p["interpolated"].sum() > 0       # 抜けたコマは補っている
         assert p.loc[~p["interpolated"], "score"].notna().all()
+
+
+def test_track_players_keeps_the_player_when_boxes_split():
+    # 奥の選手に、少しずれた 2 つ目の枠が数コマ出る（体とラケットの腕など）。軌跡が分かれても選手を見失わない
+    cfg, people, frame_t, truth = _scene()
+    far = people[(people["score"] == 0.85) & (people["x"] > 0)]
+    extra = []
+    for f in (50, 51, 52, 95, 96, 97):
+        r = far[far["frame"] == f]
+        if len(r):
+            r = r.iloc[0].copy()
+            h = r["y1"] - r["y0"]
+            for c in ("x0", "x1", "u"):
+                r[c] -= 0.1 * h
+            r["score"] = 0.4
+            extra.append(r)
+    people = pd.concat([people, pd.DataFrame(extra)], ignore_index=True)
+    players = track_players(people, frame_t, cfg)
+    assert coverage(players, len(frame_t))["o"] > 0.97
+    assert coverage(track_players(people, frame_t, cfg, PlayerOptions(max_overlap_s=0.0)), len(frame_t))["o"] < 0.8
 
 
 def test_track_players_doubles_finds_two_per_side():
