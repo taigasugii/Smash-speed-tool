@@ -188,5 +188,10 @@ def test_propose_uses_camera_position_for_vanishing_candidates():
     table = landmark_table(load_config())
     Hm = _camera_h(C=(-9.5, -5.2, 0.95), target=(-1.5, 0.5, 0.0), f=1000.0)
     frame = _court_image(Hm, seed=4, cross_seams=True)
-    props = propose_calibrations(frame, table, n=3, cam_xy=(-8.4, -4.2))
+    steps = []
+    props = propose_calibrations(frame, table, n=3, cam_xy=(-8.4, -4.2), progress=lambda f, m: steps.append((f, m)))
     assert props and _median_err(props[0].result.homography, Hm, table) < 2.0
+    # 進み具合は 0 → 1 に増えていき、流れすぎない（GUI の処理の欄に出す）
+    fr = [f for f, _ in steps]
+    assert fr[0] == 0.0 and fr[-1] == 1.0 and fr == sorted(fr) and 5 <= len(steps) <= 60
+    assert all(isinstance(m, str) and m for _, m in steps)

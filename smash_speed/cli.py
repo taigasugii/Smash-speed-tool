@@ -69,6 +69,31 @@ def cmd_calibrate(a: argparse.Namespace, cfg: dict) -> int:
     return 0
 
 
+def cmd_propose_calib(a: argparse.Namespace, cfg: dict) -> int:
+    """クリックなしでキャリブレーションの候補を出し、JSON に保存する（GUI の手順 2 が読む）。"""
+    from smash_speed.calibration import landmark_table
+    from smash_speed.calibration.propose import propose_calibrations
+    from smash_speed.video_io import VideoReader, probe
+
+    meta = probe(a.video, a.capture_fps, cfg)
+    with VideoReader(meta) as r:
+        i, frame = r.read_at(a.time)
+    cam = _xy(a.cam) if a.cam else None
+    props = propose_calibrations(frame, landmark_table(cfg), n=a.n, cam_xy=cam,
+                                 progress=lambda f, msg: print(f"{100 * f:3.0f}%  {msg}", flush=True))
+    out = {"video": str(a.video), "frame": i, "time": float(meta.timestamps[i]), "cam_xy": cam,
+           "proposals": [{"points": {n: [float(u), float(v)] for n, (u, v) in p.result.points.items()},
+                          "status": p.result.status, "score": p.score, "n_snapped": p.n_snapped,
+                          "line_rms_px": None if not np.isfinite(p.result.line_rms_px) else p.result.line_rms_px}
+                         for p in props]}
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"候補 {len(props)} 個を保存しました: {a.out}")
+    for k, p in enumerate(props, 1):
+        print(f"  {k}. ラインで測れた点 {p.n_snapped}  ラインらしさ {p.score:.3f}")
+    return 0
+
+
 def cmd_check_calib(a: argparse.Namespace, cfg: dict) -> int:
     """保存済みのキャリブレーションを別の動画に重ね描きして確認する（カメラ固定の撮影で再利用するとき）。"""
     import cv2
@@ -334,6 +359,7 @@ def cmd_summarize(a: argparse.Namespace, cfg: dict) -> int:
 # =============================================================================
 SUBCOMMANDS: dict[str, str] = {
     "calibrate": "コート・ネットをクリックしてカメラパラメータを推定する",
+    "propose-calib": "クリックなしでコートの合わせ方の候補を出す（JSON。GUI の手順 2 で選ぶ）",
     "check-calib": "保存済みのキャリブレーションを別の動画に重ね描きして確認する",
     "plane": "打者の足元と着地点をクリックして飛行平面を指定する",
     "onsets": "打球音の候補時刻を一覧する（スマッシュを探す）",
@@ -381,6 +407,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k1", action="store_true", help="放射歪み k1 も推定する")
     p.add_argument("--preview", help="再投影の確認画像の保存先")
     p.set_defaults(func=cmd_calibrate)
+
+    p = add("propose-calib")
+    video_args(p, time=True)
+    p.add_argument("--cam", help="カメラのおおよその位置 x,y [m]（解析の座標、上から見た位置）")
+    p.add_argument("--n", type=int, default=3, help="候補の数")
+    p.add_argument("--out", required=True, help="候補の保存先 JSON")
+    p.set_defaults(func=cmd_propose_calib)
 
     p = add("check-calib")
     video_args(p, time=True)

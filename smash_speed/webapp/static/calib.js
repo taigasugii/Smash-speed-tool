@@ -188,6 +188,13 @@ App.views.calib = {
     const fv = new FrameView(left, {
       width: 2560, loupe: true,
       draw: (ctx, f) => {
+        const prop = this.proposals && this.proposals[this.propSel];
+        if (prop) {
+          // クリックなしの候補を選んでいる間は、その候補のコートだけを重ねる
+          drawCourtOverlay(ctx, f, prop.overlay, 0.95);
+          for (const p of Object.values(prop.points)) drawMarker(ctx, f, p[0], p[1], "#06b6d4");
+          return;
+        }
         if (this.solved && Object.keys(this.points).length >= 6) drawCourtOverlay(ctx, f, this.solved.overlay, 0.35);
         if (this.solved) for (const [n, p] of Object.entries(this.solved.predicted)) {
           if (this.points[n] || this.skipped.has(n) || this.autoSkipped.has(n)) continue;
@@ -212,6 +219,7 @@ App.views.calib = {
         }
       },
       onClick: async (u, v) => {
+        if (this.proposals) return toast("候補を選ぶか、「候補を閉じる」を押してからクリックしてください。");
         if (!this.cur) return toast("全部の点が終わりました。「確認へ」を押してください。");
         const placed = this.cur;
         this.suspect = this.checkClick(placed, u, v);
@@ -229,6 +237,7 @@ App.views.calib = {
     this.history = this.history || [];
     this.fv = fv;
     const tl = new Timeline(left, { onSeek: (t, i) => { this.frameIdx = i; fv.show(i); }, keys: false });
+    this.tl = tl;
     left.appendChild(h(`<p class="muted small" style="margin:8px 2px">選手でラインが隠れているときは、下の時間軸で見やすいコマに動かしてください。
       拡大：マウスホイール　移動：右ドラッグ（またはスペース＋ドラッグ）　ルーペで角をよく見てクリック</p>`));
 
@@ -308,11 +317,57 @@ App.views.calib = {
     };
     window.addEventListener("keydown", this.keyh);
     this.solve().then(refresh);
-    tl.seek(App.state.start != null ? +App.state.start : 0);
+    // 候補を見ているときは、候補を出したコマを見せる（ほかのコマでは選手の位置などが違う）
+    tl.seek(this.proposals && this.propTime != null ? this.propTime : App.state.start != null ? +App.state.start : 0);
+  },
+
+  /** クリックなしで候補を出す（1 コマ 1〜1.5 分。進み具合は下の処理の欄に出る）。 */
+  async propose(refresh) {
+    const frame = this.frameIdx ?? nearestFrame(App.state.start ?? 0);
+    const started = await Task.start("propose_calib", { frame, view: this.view }, async (okk) => {
+      this.proposing = false;
+      if (!okk) { toast("候補を出せませんでした（下のログを見てください）", "bad"); if (this.fv && this.fv.el.isConnected) refresh(); return; }
+      const r = await api.get("/api/calib/proposals");
+      const list = (r.ok && r.proposals) || [];
+      if (!list.length) {
+        toast("コートの候補が見つかりませんでした。コートの角を 1 点クリックして合わせてください。", "warn");
+        this.proposals = null;
+      } else {
+        this.proposals = list; this.propSel = 0; this.propTime = r.time;
+        toast(`コートの候補が ${list.length} 個見つかりました`, "ok");
+      }
+      if (this.fv && this.fv.el.isConnected) this.step("points");
+    }, "コートの候補を探しています");
+    if (started) { this.proposing = true; refresh(); }
+  },
+
+  /** 候補の一覧（押すと動画の上に重ねる）。選んだら、その点で手順 ③ の確認へ。 */
+  renderProposals(card, refresh) {
+    card.innerHTML = `<b>コートの候補が ${this.proposals.length} 個見つかりました</b>
+      <p class="muted small" style="margin:6px 0">候補を押すと、動画の上に黄色の線で重ねます。<b>線が実際のコートのラインに重なっている候補</b>を選んでください。
+      どれも合わないときは「候補を閉じる」で、コートの角をクリックして合わせます。</p><div class="stack" id="props"></div>
+      <div class="row" style="margin-top:8px"><button class="btn primary" id="use" style="flex:1">この候補を使う（確認へ）</button><button class="btn ghost" id="close">候補を閉じる</button></div>`;
+    this.proposals.forEach((p, i) => {
+      // 点の少ない候補は、違うコートでも「ずれ」が小さく出るので、ずれは見せず、点の数と並び順だけを出す
+      const b = h(`<button class="btn ${i === this.propSel ? "primary" : ""}" style="justify-content:space-between">候補 ${i + 1}${i === 0 ? "（いちばん合っていそう）" : ""}<span class="badge">${p.n_points} 点</span></button>`);
+      b.onclick = () => { this.propSel = i; refresh(); };
+      $("#props", card).appendChild(b);
+    });
+    $("#use", card).onclick = () => {
+      const p = this.proposals[this.propSel];
+      this.points = { ...p.points };
+      this.auto = Object.fromEntries(Object.keys(p.points).map((n) => [n, "snapped"]));
+      this.skipped = new Set(); this.unconfirmed = []; this.history = [];
+      this.proposals = null;
+      this.saveDraft();
+      this.step("check");
+    };
+    $("#close", card).onclick = () => { this.proposals = null; refresh(); };
   },
 
   /** 自動で合わせる：コートの角を 1 点（または床の点を 4 点）クリックしたら、残りの点をコートのラインに吸い付けて自動で置く。 */
   renderSnap(card, lmByName, refresh) {
+    if (this.proposals) return this.renderProposals(card, refresh);
     const floor = Object.keys(this.points).filter((n) => lmByName[n].xyz[2] === 0);
     const corners = floor.filter((n) => !n.startsWith("post_base"));   // ラインの交点（支柱の根元はラインの角ではない）
     const nAuto = Object.keys(this.auto).length;
@@ -341,6 +396,16 @@ App.views.calib = {
         1 点で合わないときは、床の点を 4 点（だいたいの位置でよい・なるべく離れた 4 点）クリックして合わせます。</p>`;
     }
     card.innerHTML = body + (btn ? `<button class="btn ${btn[2]} block" id="snap">${btn[1]}</button>` : "");
+    // クリックなしで候補を出す（手順 ① のカメラの位置を使う。角が見えにくいときなど）
+    if (!nAuto) {
+      const hasCam = !!(this.view && this.view.camXY);
+      const pb = h(`<div style="margin-top:8px"><button class="btn ${btn ? "ghost" : ""} block" id="propose" ${hasCam && !this.proposing ? "" : "disabled"}>${
+        this.proposing ? "候補を探しています…（下の欄に進み具合）" : "クリックなしで候補を出す（1〜1.5 分）"}</button>
+        <p class="muted small" style="margin:4px 0 0">${hasCam ? "今のコマの映像と、手順 ① のカメラの位置から、コートの合わせ方の候補を出します。選手でラインが隠れていないコマで押してください。"
+          : "使うには、手順 ① でカメラを置いた場所をクリックしてください。"}</p></div>`);
+      $("#propose", pb).onclick = () => this.propose(refresh);
+      card.appendChild(pb);
+    }
     if (!btn) return;
     $("#snap", card).onclick = async (e) => {
       e.target.disabled = true; e.target.textContent = "ラインを探しています…";

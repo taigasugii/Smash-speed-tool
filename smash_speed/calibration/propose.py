@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import cv2
@@ -222,7 +223,8 @@ def _joint_score(L: dict[str, np.ndarray], lines, z: float, Cn: np.ndarray, Ca: 
 
 def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_candidates: int = 6,
                          cam_sigma_m: float = 3.0, heights_m: np.ndarray | None = None,
-                         n_peaks: int = 6, n_check: int = 40) -> list[tuple[np.ndarray, np.ndarray]]:
+                         n_peaks: int = 6, n_check: int = 40,
+                         progress: Callable[[float, str], None] | None = None) -> list[tuple[np.ndarray, np.ndarray]]:
     """消失点から決めたカメラの向きと、手順 ① のカメラの位置から、コートの候補を作る。
 
     1. 床の線分から消失点を求め、2 方向が直交する条件で焦点距離とカメラの向きの候補を作る（1 点クリックと同じ）
@@ -232,6 +234,9 @@ def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_can
        （手順 ① の位置から離れるほど減らす）
     4. 点の高い ``n_check`` 個を、カメラの位置・向き・焦点距離を少し動かして画像のラインに合わせ（``_polish``）、
        線分の点数の上位と、合わせた後の点数の上位を交互に ``max_candidates`` 個返す
+
+    Args:
+        progress: 進み具合（0〜1, 説明）を受け取る関数
 
     Returns:
         (解析の座標 → 元の解像度の画像 [px] のホモグラフィ, 内部パラメータ K) のよい順の一覧
@@ -280,7 +285,11 @@ def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_can
     # 大きくぼかした画像で大まかに合わせてから、ぼかしを小さくして詰める（ずれが大きいと細かいぼかしでは引き寄せられない）
     levels = [(cv2.GaussianBlur(lab, (0, 0), b * k) * snapper.LAB_W, b * k) for b in (6.0, 3.0, 1.5)]
     model = [(XY[::3], d) for XY, d in snapper._model_points()]
-    polished = [_polish(snapper, levels, model, hyps[hi], Cw) for hi, Cw in picked]
+    polished = []
+    for j, (hi, Cw) in enumerate(picked):
+        if progress is not None:
+            progress(j / len(picked), "カメラの位置の候補を画像に合わせています")
+        polished.append(_polish(snapper, levels, model, hyps[hi], Cw))
     # 微調整は、レンズのゆがみがあると正しい候補を崩すこともあるので、線分の点数の上位（微調整しない）と
     # 微調整した後の点数の上位を交互に取る
     out: list[tuple[np.ndarray, np.ndarray]] = []
@@ -357,7 +366,8 @@ def _orient_by_camera(Hm: np.ndarray, shape: tuple[int, int], cam_xy: tuple[floa
 
 def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int = 3,
                          cam_xy: tuple[float, float] | None = None,
-                         max_candidates: int = 6, max_cam_dist_m: float = 6.0) -> list[Proposal]:
+                         max_candidates: int = 6, max_cam_dist_m: float = 6.0,
+                         progress: Callable[[float, str], None] | None = None) -> list[Proposal]:
     """クリックなしで、キャリブレーションの候補をよい順に最大 ``n`` 個返す（見つからなければ空）。
 
     Args:
@@ -366,7 +376,17 @@ def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int
             どちらの端を打つ人の側にするかと、消失点からの候補（``vanishing_candidates``）に使う
         max_candidates: ラインに吸い付けて詰める候補の数（全自動・消失点からの候補それぞれ）
         max_cam_dist_m: ``cam_xy`` があるとき、カメラの位置がこれより離れる候補は除く [m]
+        progress: 進み具合（0〜1, 説明）を受け取る関数（1 コマ 1〜1.5 分かかるので、画面に出す）
     """
+    last = [-1.0, ""]
+
+    def report(frac: float, msg: str) -> None:
+        # 同じ説明が続くときは 5% ごとにだけ知らせる（画面のログが流れすぎないように）
+        frac = float(np.clip(frac, 0.0, 1.0))
+        if progress is not None and (msg != last[1] or frac >= last[0] + 0.05 or frac == 1.0):
+            last[:] = [frac, msg]
+            progress(frac, msg)
+
     h, w = frame.shape[:2]
     k = max(h, w) / 1920.0
     snapper = CourtSnapper()
@@ -374,14 +394,19 @@ def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int
     img1 = cv2.GaussianBlur(lab, (0, 0), 1.0 * k) * snapper.LAB_W
     full = snapper._model_points()
     found: list[Proposal] = []
+    report(0.0, "コートのラインの組を探しています")
     # (はじめのホモグラフィ, 内部パラメータ)。全自動の候補は内部パラメータが分からないので None
     starts: list[tuple[np.ndarray, np.ndarray | None]] = [
         (_orient(H0, (h, w), cam_xy), None) for H0 in candidate_homographies(frame, max_candidates)]
     if cam_xy is not None:
         starts = [(_orient_by_camera(H0, (h, w), cam_xy), K) for H0, K in starts]
     if cam_xy is not None:
-        starts += vanishing_candidates(frame, cam_xy, max_candidates)
-    for H0, K in starts:
+        report(0.1, "線の向きからカメラの向きを求めています")
+        starts += vanishing_candidates(frame, cam_xy, max_candidates,
+                                       progress=lambda f, m: report(0.1 + 0.25 * f, m))
+    # かかる時間の大半は吸い付け（1 つ約 5 秒）なので、残りの割合はその数で配る
+    for i, (H0, K) in enumerate(starts):
+        report(0.35 + 0.65 * i / max(len(starts), 1), f"候補をコートのラインに合わせています（{i + 1} / {len(starts)}）")
         P = _apply_h(H0, _CORNERS)
         if not np.isfinite(P).all():
             continue
@@ -401,6 +426,7 @@ def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int
                 continue
         score = snapper._court_score(img1, res.homography, full, res.color, k)
         found.append(Proposal(res, float(score), sum(s == "snapped" for s in res.status.values())))
+    report(1.0, f"候補を {len(found)} 個見つけました")
     # 詰めたら同じコートになったものは、よい方だけ残す
     found.sort(key=lambda p: -p.score)
     inv = np.linalg.inv(_TO_AUTO)
