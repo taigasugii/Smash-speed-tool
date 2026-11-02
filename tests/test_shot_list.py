@@ -266,6 +266,11 @@ def test_analyze_video_writes_the_shot_list(rally_video, tmp_path):
     # 1 枚のレポート（C3）
     assert "<h2>ラリーの一覧</h2>" in (out / "report.html").read_text(encoding="utf-8")
     assert "recorded_at" in saved
+    # 段階ごとの時間（F3）：足すと全体の時間とほぼ同じ
+    t = saved["timings_s"]
+    assert {"probe", "audio", "shuttle_detect", "shuttle_tracks", "hits", "fit", "write"} <= set(t)
+    assert all(v >= 0 for v in t.values())
+    assert sum(t.values()) == pytest.approx(saved["elapsed_s"], abs=1.0)
 
 
 def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):

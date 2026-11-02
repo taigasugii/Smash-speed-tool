@@ -496,6 +496,46 @@ def calib_snap():
               line_rms=None if not np.isfinite(res.line_rms_px) else round(res.line_rms_px, 2), message=res.message)
 
 
+def view_cam_xy(view: dict[str, Any]) -> tuple[float, float] | None:
+    """手順 ① のカメラの位置（上から見た図）を解析の座標にする（選んでいなければ None）。"""
+    if not view.get("camXY"):
+        return None
+    # 図は「打つ人が左」の向きで描くので、打つ人が右なら 180° 回して解析の座標にする
+    x, y = view["camXY"]
+    return (-x, -y) if view.get("hitter") == "right" else (x, y)
+
+
+@app.get("/api/calib/proposals")
+def calib_proposals():
+    """「クリックなしで候補を出す」の結果を、候補ごとのずれ・重ね描き用の線つきで返す（まだなければ空）。
+
+    手順 2 の点として使うのは、2 本のラインとも測れた点（"snapped"）だけ（自動で合わせるときと同じ）。
+    """
+    p = S.state.get("calib_proposals")
+    if S.meta is None or not p or not Path(p).exists():
+        return ok(proposals=[])
+    data = json.loads(Path(p).read_text(encoding="utf-8"))
+    if Path(data.get("video", "")).resolve() != Path(S.meta.path).resolve():
+        return ok(proposals=[])
+    cfg = S.cfg()
+    table = landmark_table(cfg)
+    out = []
+    for i, q in enumerate(data.get("proposals", [])):
+        pts = {n: q["points"][n] for n in table if q["status"].get(n) == "snapped" and n in q["points"]}
+        if len(pts) < 4:
+            continue
+        names = list(pts)
+        try:
+            res = calibrate(names, np.array([table[n] for n in names]), np.array([pts[n] for n in names]),
+                            S.meta.width, S.meta.height, warn_px=cfg["calibration"]["reproj_warn_px"])
+        except (RuntimeError, ValueError):
+            continue
+        out.append({"rank": i + 1, "points": {n: [round(float(v), 1) for v in uv] for n, uv in pts.items()},
+                    "n_points": len(pts), "rmse": res.rmse_px, "overlay": project_court(res.camera, cfg),
+                    "camera_center": res.camera.center.round(2).tolist()})
+    return ok(proposals=out, frame=data.get("frame"), time=data.get("time"))
+
+
 @app.post("/api/calib/oneclick")
 def calib_oneclick():
     """コートの角を 1 点クリックしただけで、コートのラインに合わせて全ランドマークの位置を返す。
@@ -516,12 +556,7 @@ def calib_oneclick():
         S.pos = i if img is not None else -1
     if img is None:
         return err("コマを読めませんでした")
-    view = b.get("view") or S.state.get("calib_view") or {}
-    cam = None
-    if view.get("camXY"):
-        # 図は「打つ人が左」の向きで描くので、打つ人が右なら 180° 回して解析の座標にする
-        x, y = view["camXY"]
-        cam = (-x, -y) if view.get("hitter") == "right" else (x, y)
+    cam = view_cam_xy(b.get("view") or S.state.get("calib_view") or {})
     try:
         res = OneClickCalibrator().calibrate(img, name, tuple(pt), landmark_table(S.cfg()), cam_xy=cam)
     except ValueError as e:
@@ -711,6 +746,18 @@ def run(kind: str):
         if b.get("players"):
             args.append("--players")
         t = start_task("すべてのショットを解析", [cli(*args)])
+    elif kind == "propose_calib":
+        if S.meta is None:
+            return err("動画を開いてください")
+        cam = view_cam_xy(b.get("view") or st.get("calib_view") or {})
+        if cam is None:
+            return err("手順 ① でカメラを置いた場所をクリックしてから押してください。")
+        i = int(np.clip(int(b.get("frame", 0)), 0, S.meta.n_frames - 1))
+        out = root / f"{Path(st['video']).stem}_calib_proposals.json"
+        st["calib_proposals"] = str(out)
+        S.save()
+        t = start_task("コートの候補を出す", [cli("propose-calib", *video_args(), "--time", f"{S.meta.timestamps[i]:.5f}",
+                                                 f"--cam={cam[0]:.2f},{cam[1]:.2f}", "--out", out)])
     elif kind == "synth":
         speed, fps = float(b.get("speed", 80)), float(b.get("fps", 240))
         out = root / f"synthetic_{speed:g}mps_{fps:g}fps"

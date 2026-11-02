@@ -28,8 +28,10 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -280,11 +282,53 @@ def audio_hit_times(fits: list[ShotFit], t_audio: list[float | None], camera: Ca
     return out
 
 
+# 並べて動かすプロセスでは、numpy・scipy の行列計算（OpenBLAS）を 1 スレッドにする。プロセスの数だけで並べているので
+# スレッドを増やしても速くならず、28 スレッドの PC では読み込むだけで 1 プロセス 1.5 GB を確保する（1 スレッドなら 0.1 GB。
+# 15 プロセスで 23 GB になり、ほかのアプリが動いていると確保に失敗して 1 つずつの計算に戻っていた）
+_WORKER_ENV = {"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+_shared_pool: list[Any] = []     # ``worker_pool`` の中で使い回すプロセスの組（[組, プロセスの数]）
+
+
+@contextmanager
+def _worker_env() -> Iterator[None]:
+    """この中で起動したプロセスに ``_WORKER_ENV`` を渡す（すでに決めてある値はそのまま）。"""
+    old = {k: os.environ.get(k) for k in _WORKER_ENV}
+    os.environ.update({k: v for k, v in _WORKER_ENV.items() if old[k] is None})
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+
+
+@contextmanager
+def worker_pool(workers: int) -> Iterator[None]:
+    """この中の ``_parallel_map``（``fit_shots`` の当てはめ）で、同じプロセスの組を使い回す。
+
+    Windows ではプロセスの起動に 1 組 4〜5 秒（15 プロセス）かかり、``fit_shots`` は 1 回に 4 組を起動するので、
+    ラリーごとに呼ぶショットの一覧では起動の時間が積み重なる（ROADMAP F3）。
+    """
+    if workers <= 1 or _shared_pool:
+        yield
+        return
+    from concurrent.futures import ProcessPoolExecutor
+
+    with _worker_env():
+        ex = ProcessPoolExecutor(workers)
+        _shared_pool[:] = [ex, workers]
+        try:
+            yield
+        finally:
+            _shared_pool.clear()
+            ex.shutdown(cancel_futures=True)
+
+
 def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: int) -> list[Any]:
     """``fn(*a)`` を ``args`` の順に計算する。``workers`` が 2 以上なら別々のプロセスで並べて計算する（結果は同じ）。
 
-    プロセスを起動できなかったとき（Windows で、``if __name__ == "__main__":`` のないスクリプトから呼んだ、など）は
-    1 つずつ計算する。
+    ``worker_pool`` の中なら、そのプロセスの組を使う。プロセスを起動できなかったとき（Windows で、
+    ``if __name__ == "__main__":`` のないスクリプトから呼んだ、など）は 1 つずつ計算する。
     """
     workers = min(workers, len(args))
     if workers > 1:
@@ -292,10 +336,13 @@ def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: 
         from concurrent.futures.process import BrokenProcessPool
 
         try:
-            with ProcessPoolExecutor(workers) as ex:
+            if _shared_pool:
+                with _worker_env():
+                    return list(_shared_pool[0].map(fn, *zip(*args)))
+            with _worker_env(), ProcessPoolExecutor(workers) as ex:
                 return list(ex.map(fn, *zip(*args)))
         except (BrokenProcessPool, OSError):
-            pass
+            _shared_pool.clear()     # 壊れた組は使わない（``worker_pool`` の終わりで片付ける）
     return [fn(*a) for a in args]
 
 
