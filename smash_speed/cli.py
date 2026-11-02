@@ -189,7 +189,7 @@ def cmd_find_smashes(a: argparse.Namespace, cfg: dict) -> int:
     o = BatchOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
                      start_s=a.start, end_s=a.end, min_strength=a.min_strength, n_select=a.select,
                      roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
-                     audio=Path(a.audio) if a.audio else None)
+                     audio=Path(a.audio) if a.audio else None, players=a.players)
     cands = find_candidates(o, cfg, progress=lambda m: print(m, flush=True))
     ok = sorted([c for c in cands if c.rough_kmh is not None and not c.doubtful], key=lambda c: -c.rough_kmh)
     print()
@@ -498,6 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--select", type=int, default=8, help="最初から詳しく解析する候補にしておく数（速い順）")
     p.add_argument("--roi", help="シャトルを検出する範囲 x0,y0,x1,y1（元解像度 px）")
     p.add_argument("--audio", help="音声ファイル（動画の音声の代わりに使う）")
+    p.add_argument("--players", action="store_true", help="打つ人の足元の初めの値を、選手の位置から入れる（遅くなる）")
     p.set_defaults(func=cmd_find_smashes)
 
     p = add("analyze-smashes")

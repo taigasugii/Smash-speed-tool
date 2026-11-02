@@ -126,6 +126,22 @@ def attach_hitters(shots: list[Shot], players: pd.DataFrame, o: HitterOptions | 
     return n
 
 
+def hitter_from_video(meta: Any, camera: Any, cfg: dict[str, Any], t_hit: float, detector: Any,
+                      side: str = "h", near_xy: Any = None, window_s: float = 1.0, o_players: Any = None,
+                      o: HitterOptions | None = None) -> HitterEstimate | None:
+    """動画の ``t_hit`` の前後 ``window_s`` だけ選手を検出・追跡し、打った人の足元を出す（1 本の解析の画面で使う）。
+
+    ``side`` は打った側（1 本の解析では打つ人の側を x < 0 にしているので "h"）、``near_xy`` は分かっていれば
+    打つ人のだいたいの位置（ダブルスで 2 人のどちらかを選ぶのに使う）。
+    """
+    from smash_speed.players import detect_in_windows, track_between
+
+    a, b = t_hit - window_s, t_hit + window_s
+    people, frame_t = detect_in_windows(meta, camera, detector, [(a, b)], cfg, o_players)
+    players = track_between(people, frame_t, a, b, camera, cfg, o_players)
+    return hitter_at(players, t_hit, side, near_xy, o)
+
+
 # =============================================================================
 # 合成の足の動きでの精度
 # =============================================================================
