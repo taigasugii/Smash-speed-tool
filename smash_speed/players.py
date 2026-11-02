@@ -71,6 +71,9 @@ class PlayerOptions:
     gate_h: float = 0.3               # つなぐ範囲の最小（枠の揺れの分）[枠の高さ]
     max_gap_s: float = 0.5            # 軌跡の途切れをつなぎ、補ってよい長さ [s]
     min_track_s: float = 0.2          # 選ぶ軌跡の長さの下限 [s]（一瞬の誤検出を落とす）
+    # 1 人に 2 つの枠（体と、ラケットの腕など）が出ると、軌跡が 2 本に分かれて前後の軌跡と少し重なる。
+    # 重なりを許さないと、間の軌跡がまるごと落ちる（IMG_5109_1 の 14.2〜16.6 s、ネットの近くの奥の選手が 1.8 秒抜けた）
+    max_overlap_s: float = 0.4        # 選ぶ軌跡どうしの時間の重なりの上限 [s]（重なったコマは重みの大きい方）
     # 跳んでいるコマ（``ground_jumps``）：足が浮くと枠の下の辺が上がり、床へ投影した位置がカメラから 1〜5 m 遠くへずれる。
     # そのとき、足元の位置で測った枠の高さ [m] が、その選手のふだん（中央値）より大きく出る。
     # ふだん 1.5〜1.7 m、腕を上げると 2.2 m ほど、跳んでいる間は 2.7〜3.5 m（IMG_3391・IMG_4397・IMG_5096 のジャンプスマッシュ）
@@ -340,7 +343,7 @@ def track_players(people: pd.DataFrame, frame_t: pd.Series, cfg: dict[str, Any],
             g = cand.groupby("tid")
             spans = pd.DataFrame({"t0": g["t"].min(), "t1": g["t"].max(), "weight": g["weight"].sum()})
             spans = spans[spans["t1"] - spans["t0"] >= o.min_track_s].rename_axis("id").reset_index()
-            chosen = choose_tracklets(spans)
+            chosen = choose_tracklets(spans, o.max_overlap_s)
             if not chosen:
                 break
             pick = cand["tid"].isin(chosen)
