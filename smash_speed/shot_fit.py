@@ -117,21 +117,41 @@ def initial_fit(obs: Observations, t_hit: float, side: str, phys: PhysicsParams,
     ``hitter_xy``（打つ人の足元 [m]）があれば、格子の平面を足元を通るものにし、当てはめ直しで足元を
     打点の水平の位置の目安（不確かさ ``hitter_sigma_m``（水平, 高さ））にする。
     """
-    fast = _phys_fast(phys)
-    coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
-    best: FitResult | None = None
+    grid = [grid_fit(obs, t_hit, plane, phys, opts) for plane in grid_planes(side, hitter_xy)]
+    return loose_fit(obs, t_hit, best_grid_fit(grid), phys, opts, hitter_xy, hitter_sigma_m)
+
+
+def grid_planes(side: str, hitter_xy: np.ndarray | None = None) -> list[FlightPlane]:
+    """``initial_fit`` で試す平面の格子（試す順。足元があれば足元を通るものだけ）。"""
     origins = ([np.array([0.0, y, 0.0]) for y in GRID_Y_M] if hitter_xy is None
                else [np.r_[np.asarray(hitter_xy, float)[:2], 0.0]])
-    for sx in _x_signs(side):
-        for origin in origins:
-            for yaw in np.deg2rad(GRID_YAW_DEG):
-                plane = FlightPlane(origin, sx * np.array([np.cos(yaw), np.sin(yaw), 0.0]))
-                try:
-                    f = fit_trajectory(obs, t_hit, "plane", plane, fast, coarse)
-                except (ValueError, RuntimeError):
-                    continue
-                if np.isfinite(f.rms_px) and (best is None or f.rms_px < best.rms_px):
-                    best = f
+    return [FlightPlane(origin, sx * np.array([np.cos(yaw), np.sin(yaw), 0.0]))
+            for sx in _x_signs(side) for origin in origins for yaw in np.deg2rad(GRID_YAW_DEG)]
+
+
+def grid_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions
+             ) -> FitResult | None:
+    """格子の平面 1 つで、粗い積分で当てはめる（計算できなければ None）。"""
+    coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
+    try:
+        return fit_trajectory(obs, t_hit, "plane", plane, _phys_fast(phys), coarse)
+    except (ValueError, RuntimeError):
+        return None
+
+
+def best_grid_fit(grid: list[FitResult | None]) -> FitResult | None:
+    """格子の当てはめのうち、画像の上のずれがいちばん小さいもの（同じなら先のもの）。"""
+    best: FitResult | None = None
+    for f in grid:
+        if f is not None and np.isfinite(f.rms_px) and (best is None or f.rms_px < best.rms_px):
+            best = f
+    return best
+
+
+def loose_fit(obs: Observations, t_hit: float, best: FitResult | None, phys: PhysicsParams, opts: FitOptions,
+              hitter_xy: np.ndarray | None = None, hitter_sigma_m: tuple[float, float] = (0.5, 2.0)
+              ) -> FitResult | None:
+    """格子でいちばん合った ``best`` から、平面の向き・位置を大きく動かせるようにして当てはめ直す（``initial_fit`` の後半）。"""
     if best is None:
         return None
     loose = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
@@ -286,7 +306,7 @@ def audio_hit_times(fits: list[ShotFit], t_audio: list[float | None], camera: Ca
 # スレッドを増やしても速くならず、28 スレッドの PC では読み込むだけで 1 プロセス 1.5 GB を確保する（1 スレッドなら 0.1 GB。
 # 15 プロセスで 23 GB になり、ほかのアプリが動いていると確保に失敗して 1 つずつの計算に戻っていた）
 _WORKER_ENV = {"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
-_shared_pool: list[Any] = []     # ``worker_pool`` の中で使い回すプロセスの組（[組, プロセスの数]）
+_shared_pool: list[Any] = []     # ``worker_pool`` の中で使い回すプロセスの組（[組, プロセスの数]。壊れたら組は None）
 
 
 @contextmanager
@@ -324,6 +344,11 @@ def worker_pool(workers: int) -> Iterator[None]:
             ex.shutdown(cancel_futures=True)
 
 
+def pool_active() -> bool:
+    """``worker_pool`` のプロセスの組が使える（壊れていない）か。"""
+    return bool(_shared_pool) and _shared_pool[0] is not None
+
+
 def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: int) -> list[Any]:
     """``fn(*a)`` を ``args`` の順に計算する。``workers`` が 2 以上なら別々のプロセスで並べて計算する（結果は同じ）。
 
@@ -337,12 +362,16 @@ def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: 
 
         try:
             if _shared_pool:
-                with _worker_env():
-                    return list(_shared_pool[0].map(fn, *zip(*args)))
-            with _worker_env(), ProcessPoolExecutor(workers) as ex:
-                return list(ex.map(fn, *zip(*args)))
+                # 壊れた組は使わず 1 つずつ計算する（ラリーを並べて動かしているとき、それぞれが新しい組を作らないように）
+                if _shared_pool[0] is not None:
+                    with _worker_env():
+                        return list(_shared_pool[0].map(fn, *zip(*args)))
+            else:
+                with _worker_env(), ProcessPoolExecutor(workers) as ex:
+                    return list(ex.map(fn, *zip(*args)))
         except (BrokenProcessPool, OSError):
-            _shared_pool.clear()     # 壊れた組は使わない（``worker_pool`` の終わりで片付ける）
+            if _shared_pool:
+                _shared_pool[0] = None     # ``worker_pool`` の終わりで片付ける
     return [fn(*a) for a in args]
 
 
@@ -417,8 +446,14 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
     for sf in fits:
         if sf.n_obs < min_obs:
             sf.message = f"打った後のシャトルが {sf.n_obs} コマしか見えていません"
-    first = _parallel_map(initial_fit, [(fits[i].obs, fits[i].t_hit, sides[i], phys, opts, feet[i], hitter_sigma_m)
-                                        for i in todo], workers)
+    # ``initial_fit`` を、格子の平面ごと（互いに関係しない）と当てはめ直しに分けて並べる。1 本の格子は 9〜18 回の
+    # 当てはめで、実動画では 1 本に 1 分かかることがあり、ほかのプロセスが空いたまま待っていた（ROADMAP F3b）
+    planes = {i: grid_planes(sides[i], feet[i]) for i in todo}
+    grid_jobs = [(i, p) for i in todo for p in planes[i]]
+    grid = _parallel_map(grid_fit, [(fits[i].obs, fits[i].t_hit, p, phys, opts) for i, p in grid_jobs], workers)
+    best = {i: best_grid_fit([f for (j, _), f in zip(grid_jobs, grid) if j == i]) for i in todo}
+    first = _parallel_map(loose_fit, [(fits[i].obs, fits[i].t_hit, best[i], phys, opts, feet[i], hitter_sigma_m)
+                                      for i in todo], workers)
     for i, f in zip(todo, first):
         fits[i].fit = f
         if f is None:

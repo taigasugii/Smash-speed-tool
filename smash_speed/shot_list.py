@@ -47,7 +47,7 @@ from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
-from smash_speed.shot_fit import fit_shots, shot_fits_to_shots, worker_pool
+from smash_speed.shot_fit import fit_shots, pool_active, shot_fits_to_shots, worker_pool
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, write_rallies,
                                write_shots)
@@ -280,7 +280,7 @@ def rally_groups(hits: list[Hit], gap_s: float) -> list[list[int]]:
 def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: PhysicsParams, cfg: dict[str, Any],
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
-                 players: pd.DataFrame | None = None) -> list[Shot]:
+                 players: pd.DataFrame | None = None, rally_threads: int = 4) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -293,24 +293,44 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
             （4K で 38 px。合成ラリーでは 1〜2 px、実動画の正しい当てはめも数 px）
         workers: 当てはめを並べて動かすプロセスの数（``fit_shots``）
         players: 選手の位置（``players.csv``）。あれば打球ごとの打つ人の足元（``hitter_at``）を打点の手がかりにする
+        rally_threads: 同時に当てはめを進めるラリーの数（``workers`` が 2 以上のとき。結果は 1 つずつと同じ）
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
     vis_t = det.timestamp.to_numpy(float)
     groups = rally_groups(hits, rally_gap_s)
     shots: list[Shot] = []
-    # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）
+
+    def one(g: int) -> list[Shot]:
+        return _analyze_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
+                              max_rms_frac, workers, players)
+
+    # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）。
+    # ラリーどうしは関係しないので、``rally_threads`` 個のラリーを同時に進めて同じプロセスの組に仕事を渡す
+    # （1 つのラリーの中では段階ごとに全部の当てはめの終わりを待つので、その間ほかのプロセスが空いていた。F3b）
     with worker_pool(workers):
-        for g in range(len(groups)):
-            shots += _analyze_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
-                                    max_rms_frac, workers, progress, players)
+        n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
+        by_group: dict[int, list[Shot]] = {}
+        if n_threads > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(n_threads) as ex:
+                futs = {ex.submit(one, g): g for g in range(len(groups))}
+                for fut in as_completed(futs):
+                    by_group[futs[fut]] = fut.result()
+                    _rally_progress(progress, futs[fut], len(groups), by_group[futs[fut]], len(by_group))
+        else:
+            for g in range(len(groups)):
+                by_group[g] = one(g)
+                _rally_progress(progress, g, len(groups), by_group[g], g + 1)
+    for g in range(len(groups)):
+        shots += by_group[g]
     split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
 
 
 def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
                    camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
-                   max_kmh: float, max_rms_frac: float, workers: int, progress: Callable[[str], None],
-                   players: pd.DataFrame | None) -> list[Shot]:
+                   max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None) -> list[Shot]:
     """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）の ``Shot`` の列。"""
     hs = [hits[i] for i in groups[g]]
     lo = hs[0].t - 0.5
@@ -342,9 +362,13 @@ def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], 
         s.note = f"{h.method}・{s.note}" if s.note else h.method
         if s.confidence is None:
             s.confidence = round(h.confidence, 3)  # 初速の信頼区間がなければ、打球の見つけ方の信頼度
-    n_ok = sum(s.speed_kmh is not None for s in rally_shots)
-    progress(f"[進行] ラリー {g + 1}/{len(groups)}：{len(hs)} 本（速さが出たもの {n_ok} 本）")
     return rally_shots
+
+
+def _rally_progress(progress: Callable[[str], None], g: int, n_groups: int, shots: list[Shot], n_done: int) -> None:
+    """1 ラリーの当てはめが終わったことを知らせる（並べて動かすと、終わる順はラリーの順と違う）。"""
+    n_ok = sum(s.speed_kmh is not None for s in shots)
+    progress(f"[進行] ラリー {g + 1}/{n_groups}：{len(shots)} 本（速さが出たもの {n_ok} 本、済み {n_done}/{n_groups}）")
 
 
 def recorded_at(meta: VideoMeta) -> str | None:

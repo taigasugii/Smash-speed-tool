@@ -541,7 +541,7 @@ python -m smash_speed.shot_list data\IMG_4397.MOV --calib out\calibration.json -
 
 出力先には `shots.csv`・`rallies.csv`（ショットとラリー）、`detections.csv`（全コマの検出）、
 `shot_list.json`（動画・打球の見つけ方の内訳・種類ごとの本数と平均・最高の初速・かかった時間と段階ごとの内訳 `timings_s`。
-かかる時間の目安は `docs/speed.md`。4K 30 fps の 2 分の動画で約 13 分）、
+かかる時間の目安は `docs/speed.md`。4K 30 fps の 2 分の動画で約 7〜8 分）、
 `stats.json`・`landing.svg`（ラリーの統計と着地点の分布図、下の「ラリーの統計」）、
 `report.html`（1 枚のレポート、下の「1 本の動画のレポート」）を書き出す。
 `smash-speed shots --video <動画> --calib <calibration.json> --out <出力先>` でも同じことができる（GUI はこれを裏で動かす）。
