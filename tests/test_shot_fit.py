@@ -174,3 +174,23 @@ def test_hitter_feet_keep_speeds_and_pull_hit_points(cam):
     assert len(errs) >= len(segs) - 1 and np.mean(errs) < 0.05
     gaps = [np.hypot(*(sf.fit.p0[:2] - f)) for sf, f in zip(fits, feet) if sf.fit is not None]
     assert np.median(gaps) < 1.0
+
+
+def test_worker_pool_is_reused_with_single_thread_blas(monkeypatch):
+    """``worker_pool`` の中では同じプロセスの組を使い回し、子のプロセスの行列計算は 1 スレッドにする（ROADMAP F3）。"""
+    import os
+
+    from smash_speed import shot_fit
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    args = [("OPENBLAS_NUM_THREADS",)] * 3
+    with shot_fit.worker_pool(2):
+        ex = shot_fit._shared_pool[0]
+        assert shot_fit._parallel_map(os.getenv, args, 2) == ["1"] * 3
+        assert shot_fit._parallel_map(os.getenv, args, 2) == ["1"] * 3
+        assert shot_fit._shared_pool[0] is ex
+    assert not shot_fit._shared_pool
+    # 親のプロセスの設定は元に戻す
+    assert os.getenv("OPENBLAS_NUM_THREADS") is None
+    # 1 つずつの計算は親のプロセスで行う
+    assert shot_fit._parallel_map(os.getenv, args, 1) == [None] * 3

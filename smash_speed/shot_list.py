@@ -47,7 +47,7 @@ from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
-from smash_speed.shot_fit import fit_shots, shot_fits_to_shots
+from smash_speed.shot_fit import fit_shots, shot_fits_to_shots, worker_pool
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Shot, write_rallies,
                                write_shots)
@@ -298,42 +298,53 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
     vis_t = det.timestamp.to_numpy(float)
     groups = rally_groups(hits, rally_gap_s)
     shots: list[Shot] = []
-    for g, idx in enumerate(groups):
-        hs = [hits[i] for i in idx]
-        lo = hs[0].t - 0.5
-        hi = hs[-1].t + tail_s
-        if g + 1 < len(groups):
-            hi = min(hi, hits[groups[g + 1][0]].t - 0.05)
-        part = det[(vis_t >= lo) & (vis_t <= hi)]
-        feet = None
-        if players is not None and not players.empty:
-            feet = [None if e is None else np.array([e.x, e.y])
-                    for e in (hitter_at(players, h.t, h.side) for h in hs)]
-        fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
-                         max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
-                         speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0),
-                         hitter_xy=feet)
-        rally_shots = shot_fits_to_shots(fits, phys, source="shot_list")
-        for s, h, sf in zip(rally_shots, hs, fits):
-            # ありえない速さ・画像の上で軌道が検出と合わない（別の物の検出が混ざった軌道など）ものは、
-            # 速さが出なかったものとして扱う
-            why = None
-            if s.speed_kmh is not None and s.speed_kmh > max_kmh:
-                why = f"ありえない速さ {s.speed_kmh:.0f} km/h"
-            elif sf.fit is not None and sf.fit.rms_px > max_rms_frac * camera.width:
-                why = "軌道が検出と合わない"
-            if why:
-                s.note = f"{why}・{s.note}"
-                s.speed_kmh = s.speed_ci_low_kmh = s.speed_ci_high_kmh = s.confidence = None
-                s.v0_x_mps = s.v0_y_mps = s.v0_z_mps = None
-            s.note = f"{h.method}・{s.note}" if s.note else h.method
-            if s.confidence is None:
-                s.confidence = round(h.confidence, 3)  # 初速の信頼区間がなければ、打球の見つけ方の信頼度
-        shots += rally_shots
-        n_ok = sum(s.speed_kmh is not None for s in rally_shots)
-        progress(f"[進行] ラリー {g + 1}/{len(groups)}：{len(hs)} 本（速さが出たもの {n_ok} 本）")
+    # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）
+    with worker_pool(workers):
+        for g in range(len(groups)):
+            shots += _analyze_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
+                                    max_rms_frac, workers, progress, players)
     split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
+
+
+def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
+                   camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
+                   max_kmh: float, max_rms_frac: float, workers: int, progress: Callable[[str], None],
+                   players: pd.DataFrame | None) -> list[Shot]:
+    """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）の ``Shot`` の列。"""
+    hs = [hits[i] for i in groups[g]]
+    lo = hs[0].t - 0.5
+    hi = hs[-1].t + tail_s
+    if g + 1 < len(groups):
+        hi = min(hi, hits[groups[g + 1][0]].t - 0.05)
+    part = det[(vis_t >= lo) & (vis_t <= hi)]
+    feet = None
+    if players is not None and not players.empty:
+        feet = [None if e is None else np.array([e.x, e.y])
+                for e in (hitter_at(players, h.t, h.side) for h in hs)]
+    fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
+                     max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
+                     speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0),
+                     hitter_xy=feet)
+    rally_shots = shot_fits_to_shots(fits, phys, source="shot_list")
+    for s, h, sf in zip(rally_shots, hs, fits):
+        # ありえない速さ・画像の上で軌道が検出と合わない（別の物の検出が混ざった軌道など）ものは、
+        # 速さが出なかったものとして扱う
+        why = None
+        if s.speed_kmh is not None and s.speed_kmh > max_kmh:
+            why = f"ありえない速さ {s.speed_kmh:.0f} km/h"
+        elif sf.fit is not None and sf.fit.rms_px > max_rms_frac * camera.width:
+            why = "軌道が検出と合わない"
+        if why:
+            s.note = f"{why}・{s.note}"
+            s.speed_kmh = s.speed_ci_low_kmh = s.speed_ci_high_kmh = s.confidence = None
+            s.v0_x_mps = s.v0_y_mps = s.v0_z_mps = None
+        s.note = f"{h.method}・{s.note}" if s.note else h.method
+        if s.confidence is None:
+            s.confidence = round(h.confidence, 3)  # 初速の信頼区間がなければ、打球の見つけ方の信頼度
+    n_ok = sum(s.speed_kmh is not None for s in rally_shots)
+    progress(f"[進行] ラリー {g + 1}/{len(groups)}：{len(hs)} 本（速さが出たもの {n_ok} 本）")
+    return rally_shots
 
 
 def recorded_at(meta: VideoMeta) -> str | None:
@@ -366,17 +377,28 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     from smash_speed.pipeline import _camera_for_video
 
     t_start = time.time()
+    timings: dict[str, float] = {}    # 段階ごとにかかった時間 [s]（F3 の速さの計測。``shot_list.json`` の ``timings_s``）
+    t_mark = [t_start]
+
+    def lap(name: str) -> None:
+        now = time.time()
+        timings[name] = round(timings.get(name, 0.0) + now - t_mark[0], 2)
+        t_mark[0] = now
+
     out = Path(o.out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     meta = probe(o.video, o.capture_fps, cfg)
     camera, _ = load_calibration(o.calib)
     camera = _camera_for_video(camera, meta)
     phys = PhysicsParams.from_config(cfg)
+    lap("probe")
 
     onsets = hit_onsets(meta, cfg, out, o.audio, o.start_s, o.end_s) if o.use_audio else None
     if onsets is not None:
         progress(f"[進行] 打球音の候補 {len(onsets)} 個")
+    lap("audio")
     det = detect_all(meta, cfg, o.start_s, o.end_s, o.roi, o.n_tracks, exclusive=False, progress=progress)
+    lap("shuttle_detect")
     tracks = None
     if o.filter_tracks:
         det, tracks = shuttle_tracks(det, camera, cfg)
@@ -390,9 +412,11 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         raise AnalysisError("シャトルがほとんど見つかりませんでした。",
                             ["コートとシャトルが写っている動画か、検出する範囲が正しいかを確かめてください。"])
     progress(f"[進行] シャトルが見えたコマ {n_vis} / {len(det)}")
+    lap("shuttle_tracks")
 
     hits = find_hits(det, meta.capture_fps, onsets, camera=camera, rally_gap_s=o.rally_gap_s)
     progress(f"[進行] 打球 {len(hits)} 本")
+    lap("hits")
     workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
     # 選手の位置は当てはめの前に出し、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     players_info = players = None
@@ -400,8 +424,10 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         players_info = players_step(o, cfg, out, progress)
         if "error" not in players_info and (out / PLAYERS_FILE).exists():
             players = pd.read_csv(out / PLAYERS_FILE)
+        lap("players")
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
                          players=players if o.hitter_prior else None)
+    lap("fit")
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
     write_rallies(out / RALLIES_FILE, rallies)
@@ -429,10 +455,15 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
             info["players"]["n_hitters"] = n
             info["players"]["hitter_prior"] = o.hitter_prior
             progress(f"[進行] 打つ人の足元：{n} / {len(shots)} 本")
-        info["elapsed_s"] = round(time.time() - t_start, 1)
+    info["elapsed_s"] = round(time.time() - t_start, 1)
+    # レポートは shot_list.json を読むので先に書き、書き出しの時間を足して書き直す
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     write_stats(out, shots, rallies, cfg.get("court"))
     write_report(out, cfg.get("court"), shots, rallies)
+    lap("write")
+    info["elapsed_s"] = round(time.time() - t_start, 1)
+    info["timings_s"] = timings
+    (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     progress(f"[進行] 完了：{len(shots)} 本（{len(rallies)} ラリー）、{info['elapsed_s']:.0f} 秒")
     return info
 

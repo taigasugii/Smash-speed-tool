@@ -14,6 +14,30 @@
 
 ---
 
+## 2026-11-03 06:30 F3a 段階ごとの時間を測る・当てはめのプロセス（済み。F3 は途中）
+- 選んだ理由：D1c の残りは PR #9 待ち、F1 は A2b の答え待ちなので、ROADMAP の次の F3。大きいので F3a〜F3c に分けた。
+- やったこと：
+  - `shot_list.analyze_video`：段階ごとの時間を `shot_list.json` の `timings_s` に入れる（probe・audio・shuttle_detect・shuttle_tracks・hits・players・fit・write）。
+  - 最初に IMG_4397 の全体を流したら、シャトルの検出の 90% で OpenCV がメモリの確保に失敗した。調べると、numpy・scipy を読み込むだけで
+    1 プロセスが 1.5 GB を確保する（OpenBLAS が 28 スレッド分の作業領域を取る。1 スレッドなら 0.1 GB）。そのとき同時に動かしていた
+    プロセスの起動の計測（15 プロセス）で PC のコミットの上限（38.8 GB、ほかのアプリで 30 GB 使用）を超えていた。
+    当てはめの 15 プロセスも同じで、ほかのアプリが動いているとプロセスの起動に失敗し（`OpenBLAS error: Memory allocation still failed`）、
+    何も知らせずに 1 つずつの計算に戻っていた。
+  - `shot_fit._parallel_map`：子のプロセスの行列計算を 1 スレッドに（`OPENBLAS_NUM_THREADS` などを起動の間だけ 1 にする。親は変えない）。
+  - `shot_fit.worker_pool`：この中では同じプロセスの組を使い回す（Windows で 15 プロセスの起動に 4〜5 秒、`fit_shots` は 1 回に 4 回起動していた）。
+    `shot_list.analyze_hits` はラリーの当てはめ全体をこの中で動かす（1 ラリー分は `_analyze_rally` に分けた。中身は同じ）。
+  - テスト：`test_worker_pool_is_reused_with_single_thread_blas`（子では 1、組を使い回す、親の設定は元に戻る）、
+    `test_analyze_video_writes_the_shot_list` に `timings_s` の確かめ。`docs/speed.md` に結果、README に目安。
+- 結果（数字、`.agent/tmp/f3/ab.py`・`cmp.py`）：
+  - IMG_5109（40 秒、2.5K）：直す前 853 秒（当てはめ 827 秒、OpenBLAS の確保の失敗 22 回）→ 直した後 206 秒（当てはめ 181 秒・検出 23 秒）。
+    `shots.csv` は 49 本の種類・初速・打点がすべて同じ（差 0）。D1c の時の出力（297 秒）とも同じ。
+  - IMG_4397 全体（113 秒、4K、`--players`）：760 秒（当てはめ 532・シャトルの検出 159・選手 57・そのほか 11 秒）、141 本・6 ラリー。
+    30 分の動画なら約 3.4 時間（当てはめ 2.4 時間・検出 42 分・選手 15 分）。
+- 品質チェック：通った（合成 MAPE 30fps 3.688% / 240fps 4.193%、hitter_position 6.955% / 6.059%、check_hits 0.988 以上、check_hitter 0.18 m、
+  check_movement・check_rallies・check_shot_types 変わらず、実動画 4 本 最大のずれ 0.00%、check_shot_speeds 2.47%・1.73%。どれも前回と同じ。
+  テスト 1309 秒。件数の表示は「0 件通過」と出たが [OK]）。
+- 次にやること：F3b（当てはめを速くする。1 本ごとの時間のばらつきと、段階ごとに全部の終わりを待つ所を測ってから）。
+
 ## 2026-11-03 03:50 F2c クリックなしの候補を GUI の手順 2 に（済み。F2 も済み）
 - 選んだ理由：D1c の残りは PR #9 待ち、F1 は A2b の答え待ちなので、ROADMAP の次の F2c。
 - やったこと：
