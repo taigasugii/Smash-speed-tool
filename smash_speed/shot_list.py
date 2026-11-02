@@ -17,7 +17,8 @@
 - ``stats.json``・``landing.svg``：ラリーの統計と、着地点の分布図（``rally_stats``）
 - ``report.html``：統計をまとめた 1 枚のページ（``rally_report``。スマホでも見られる）
 - ``players.csv``・``people.csv``・``players_preview.jpg``・``players.json``：選手の位置（``players=True`` のときだけ。``players``）。
-  このときは ``shots.csv`` の ``hitter_x_m``・``hitter_y_m`` に打つ人の足元も入れる（``hitter.attach_hitters``）
+  このときは ``shots.csv`` の ``hitter_x_m``・``hitter_y_m`` に打つ人の足元も入れ（``hitter.attach_hitters``）、
+  当てはめの前に出して打点の手がかりにもする（``hitter_prior``。``shot_fit.fit_shots`` の ``hitter_xy``）
 - ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
@@ -40,7 +41,7 @@ from smash_speed.calibration.io import load_calibration
 from smash_speed.camera import Camera
 from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
-from smash_speed.hitter import attach_hitters
+from smash_speed.hitter import attach_hitters, hitter_at
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
 from smash_speed.players import PLAYERS_FILE, PlayerOptions, analyze_players
@@ -75,6 +76,7 @@ class ShotListOptions:
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
     players: bool = False             # 選手の位置も出す（``players.analyze_players``。人の検出のモデルを使うので遅くなる）
     player_options: PlayerOptions | None = None
+    hitter_prior: bool = True         # 選手の位置があれば、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
 
 
 # =============================================================================
@@ -279,7 +281,8 @@ def rally_groups(hits: list[Hit], gap_s: float) -> list[list[int]]:
 
 def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: PhysicsParams, cfg: dict[str, Any],
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
-                 max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print) -> list[Shot]:
+                 max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
+                 players: pd.DataFrame | None = None) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -291,6 +294,7 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         max_rms_frac: 画像の上のずれ（RMS）が画像の幅のこの割合を超えたら、当てはめに失敗したとみなす
             （4K で 38 px。合成ラリーでは 1〜2 px、実動画の正しい当てはめも数 px）
         workers: 当てはめを並べて動かすプロセスの数（``fit_shots``）
+        players: 選手の位置（``players.csv``）。あれば打球ごとの打つ人の足元（``hitter_at``）を打点の手がかりにする
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
     vis_t = det.timestamp.to_numpy(float)
@@ -303,9 +307,14 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         if g + 1 < len(groups):
             hi = min(hi, hits[groups[g + 1][0]].t - 0.05)
         part = det[(vis_t >= lo) & (vis_t <= hi)]
+        feet = None
+        if players is not None and not players.empty:
+            feet = [None if e is None else np.array([e.x, e.y])
+                    for e in (hitter_at(players, h.t, h.side) for h in hs)]
         fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
                          max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
-                         speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0))
+                         speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0),
+                         hitter_xy=feet)
         rally_shots = shot_fits_to_shots(fits, phys, source="shot_list")
         for s, h, sf in zip(rally_shots, hs, fits):
             # ありえない速さ・画像の上で軌道が検出と合わない（別の物の検出が混ざった軌道など）ものは、
@@ -387,7 +396,14 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     hits = find_hits(det, meta.capture_fps, onsets, camera=camera, rally_gap_s=o.rally_gap_s)
     progress(f"[進行] 打球 {len(hits)} 本")
     workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
-    shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress)
+    # 選手の位置は当てはめの前に出し、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
+    players_info = players = None
+    if o.players:
+        players_info = players_step(o, cfg, out, progress)
+        if "error" not in players_info and (out / PLAYERS_FILE).exists():
+            players = pd.read_csv(out / PLAYERS_FILE)
+    shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
+                         players=players if o.hitter_prior else None)
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
     write_rallies(out / RALLIES_FILE, rallies)
@@ -407,12 +423,13 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),
         "meta": run_metadata(),
     }
-    if o.players:
-        info["players"] = players_step(o, cfg, out, progress)
-        if "error" not in info["players"] and (out / PLAYERS_FILE).exists():
-            n = attach_hitters(shots, pd.read_csv(out / PLAYERS_FILE))
+    if players_info is not None:
+        info["players"] = players_info
+        if players is not None:
+            n = attach_hitters(shots, players)
             write_shots(out / SHOTS_FILE, shots)
             info["players"]["n_hitters"] = n
+            info["players"]["hitter_prior"] = o.hitter_prior
             progress(f"[進行] 打つ人の足元：{n} / {len(shots)} 本")
         rallies = rallies_with_players(shots, rallies, det, o, cfg, out, info, progress)
         info["elapsed_s"] = round(time.time() - t_start, 1)
@@ -482,12 +499,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-audio", action="store_true", help="打球音を使わない")
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
+    ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
-                                         players=a.players), cfg)
+                                         players=a.players, hitter_prior=not a.no_hitter_prior), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

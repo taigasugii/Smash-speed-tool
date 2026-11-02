@@ -586,6 +586,33 @@ def floor():
     return ok(x=round(float(X[0]), 3), y=round(float(X[1]), 3))
 
 
+_PERSON_DETECTOR: list = []   # 人の検出のモデル（最初に使うときに読み込み、使い回す）
+
+
+@app.post("/api/hitter/auto")
+def hitter_auto():
+    """今のコマ（打った瞬間）の前後 1 秒で選手を検出し、打つ人（x < 0 の側）の足元のコート座標を返す。"""
+    from smash_speed.hitter import hitter_from_video
+    from smash_speed.players import PersonDetector, PlayerOptions, ensure_model
+
+    if S.camera is None or S.meta is None:
+        return err("先に動画を開き、キャリブレーションをしてください")
+    b = body()
+    t = float(b.get("t", 0.0))
+    near = S.state.get("hitter")
+    try:
+        if not _PERSON_DETECTOR:
+            po = PlayerOptions()
+            _PERSON_DETECTOR.append(PersonDetector(ensure_model(po.model, progress=lambda m: None), po.min_score, po.nms_iou))
+        e = hitter_from_video(S.meta, S.camera, S.cfg(), t, _PERSON_DETECTOR[0],
+                              near_xy=(near["x"], near["y"]) if near else None)
+    except Exception as ex:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
+        return err(f"選手の位置を出せませんでした：{ex}")
+    if e is None or e.ambiguous:
+        return err("打つ人を見つけられませんでした。打った瞬間のコマに動かしてから押すか、足元をクリックしてください。")
+    return ok(x=round(e.x, 3), y=round(e.y, 3), airborne=e.airborne, n_frames=e.n_frames)
+
+
 @app.post("/api/project")
 def project_points():
     """コート座標 [m] の点 → 画像座標（飛行平面の表示用）。"""
@@ -657,6 +684,8 @@ def run(kind: str):
             args += ["--audio", st["audio"]]
         if b.get("use_roi") and st.get("roi"):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
+        if b.get("players"):
+            args.append("--players")
         t = start_task("スマッシュの候補を探す", [cli(*args)])
     elif kind == "batch_analyze":
         d = st.get("batch_dir") or str(root / f"{Path(st['video']).stem}_smashes")
@@ -843,6 +872,8 @@ def batch_update():
             continue
         for k in ("hitter", "landing"):
             if u.get(k):
+                if k == "hitter" and u[k] != c.hitter:
+                    c.hitter_source = ""  # 手で直した
                 setattr(c, k, {"x": float(u[k]["x"]), "y": float(u[k]["y"])})
         for k in ("selected", "confirmed"):
             if k in u:

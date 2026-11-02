@@ -129,3 +129,34 @@ def test_one_click_rejects_non_floor_point():
         assert "床の点" in str(e)
     else:
         raise AssertionError("支柱の先端で通った")
+
+
+def test_propose_finds_court_without_clicks():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    table = landmark_table(load_config())
+    Hm = _side_view_h()
+    frame = _court_image(Hm)
+    props = propose_calibrations(frame, table, n=3)
+    assert props and props[0].n_snapped >= 15
+    err = [np.linalg.norm(np.array(props[0].result.points[n]) - _apply_h(Hm, table[n][None, :2])[0])
+           for n in props[0].result.points]
+    assert np.median(err) < 1.5
+    assert [p.score for p in props] == sorted((p.score for p in props), reverse=True)
+
+
+def test_propose_puts_hitter_on_the_camera_end():
+    from smash_speed.calibration.propose import _orient
+
+    Hm = _camera_h()                                         # カメラは x < 0 の端の後ろ
+    flipped = Hm @ np.diag([-1.0, -1.0, 1.0])
+    assert np.allclose(_orient(flipped, (1080, 1920), None), Hm)
+    assert np.allclose(_orient(Hm, (1080, 1920), None), Hm)
+    # 手順 ① でカメラを x > 0 の側に置いたなら入れ替える
+    assert np.allclose(_orient(Hm, (1080, 1920), (8.0, -8.0)), flipped)
+
+
+def test_propose_returns_nothing_for_blank_frame():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    assert propose_calibrations(np.zeros((360, 640, 3), np.uint8), landmark_table(load_config())) == []
