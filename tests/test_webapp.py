@@ -266,3 +266,54 @@ def test_hitter_auto_from_players(client, session, monkeypatch):
     monkeypatch.setattr(server, "_PERSON_DETECTOR", [_FakePeople(camera, [(4.0, 0.5)])])
     r = client.post("/api/hitter/auto", json={"t": info["t_impact_video_s"]}).get_json()
     assert not r["ok"] and "見つけられません" in r["error"]
+
+
+def test_calib_proposals_api(client, session, tmp_path):
+    """手順 2 の「クリックなしで候補を出す」：候補の JSON（propose-calib の出力）を、測れた点で合わせたずれ・線つきで返す（F2c）。"""
+    d, _ = session
+    video = str(d / "synthetic.mp4")
+    client.post("/api/video", json={"path": video})
+    # 手順 ① のカメラの位置がないと始めない
+    r = client.post("/api/run/propose_calib", json={"frame": 5, "view": {"theta": 0}}).get_json()
+    assert not r["ok"] and "手順 ①" in r["error"]
+    assert client.get("/api/calib/proposals").get_json()["proposals"] == []
+    pts = {p["name"]: p["image_px"] for p in json.loads((d / "calibration.json").read_text(encoding="utf-8"))["points"]}
+    good = {n: "snapped" for n in pts}
+    good["post_top_n"] = "predicted"                          # 予想位置のままの点は使わない
+    pts_bad = dict(pts, post_top_n=[5.0, 5.0])
+    data = {"video": video, "frame": 12, "time": 0.1, "cam_xy": [-1.0, -9.5],
+            "proposals": [{"points": pts_bad, "status": good, "score": 2.0, "n_snapped": len(pts) - 1},
+                          {"points": pts, "status": {**{n: "predicted" for n in pts}, "back_corner_h_n": "snapped"},
+                           "score": 1.0, "n_snapped": 1}]}
+    path = tmp_path / "props.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    client.post("/api/state", json={"calib_proposals": str(path)})
+    g = client.get("/api/calib/proposals").get_json()
+    assert g["ok"] and g["frame"] == 12 and len(g["proposals"]) == 1   # 測れた点が 4 点未満の候補は出さない
+    p = g["proposals"][0]
+    assert "post_top_n" not in p["points"] and p["n_points"] == len(pts) - 1
+    assert p["rmse"] < 1.5 and p["overlay"]
+    # 別の動画の候補は返さない
+    path.write_text(json.dumps(dict(data, video=str(tmp_path / "other.mp4"))), encoding="utf-8")
+    assert client.get("/api/calib/proposals").get_json()["proposals"] == []
+
+
+def test_propose_calib_task(client, session):
+    """「クリックなしで候補を出す」を処理として動かし（propose-calib）、進み具合を出して、候補を返す。"""
+    d, _ = session
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    # 手順 ① の図は「打つ人が左」の向き。合成のカメラは (−1, −9.5)、高さ 4 m で、手順 ① は 1.8 m ずらした
+    r = client.post("/api/run/propose_calib", json={"frame": 12, "view": {"camXY": [0.5, -8.5], "hitter": "left"}}).get_json()
+    assert r["ok"]
+    st = _wait(client, r["task"])
+    lines = client.get(f"/api/task/{r['task']}").get_json()["lines"]
+    assert st["status"] == "done", "\n".join(lines)
+    assert any("100%" in ln for ln in lines) and any("--cam=0.50,-8.50" in ln for ln in lines)
+    g = client.get("/api/calib/proposals").get_json()
+    assert g["frame"] == 12 and g["proposals"]
+    best = g["proposals"][0]
+    calib = json.loads((d / "calibration.json").read_text(encoding="utf-8"))
+    pts = {p["name"]: np.array(p["image_px"]) for p in calib["points"]}
+    common = [n for n in best["points"] if n in pts]
+    assert len(common) >= 6 and best["rmse"] < 5.0
+    assert np.median([np.linalg.norm(np.array(best["points"][n]) - pts[n]) for n in common]) < 5.0
