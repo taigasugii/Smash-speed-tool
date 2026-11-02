@@ -75,6 +75,32 @@ def test_two_rallies_are_fitted_separately():
     assert len(err) >= len(truth) - 2 and np.median(err) < 0.05
 
 
+def test_hitter_feet_from_players_are_used(monkeypatch):
+    """選手の位置（``players.csv`` の形）を渡すと、打球ごとの打つ人の足元を ``fit_shots`` に渡す（ROADMAP D3c）。"""
+    rally = make_rally(np.random.default_rng(2), PHYS, n_shots=3, t_start=0.5)
+    det = observe_rally(rally, CAM, 30.0, PHYS, np.random.default_rng(0))
+    hits = [Hit(s.t_hit, s.side) for s in rally.segments]
+    t = np.arange(0.0, rally.t_end + 0.5, 1 / 30)
+    first = {side: next(s for s in rally.segments if s.side == side) for side in ("h", "o")}
+    players = pd.DataFrame([{"t": ti, "side": side, "player": 0, "x": seg.p0[0], "y": seg.p0[1]}
+                            for side, seg in first.items() for ti in t])
+    seen = []
+    real_fit_shots = shot_list.fit_shots
+
+    def spy(*a, **kw):
+        seen.append(kw.get("hitter_xy"))
+        return real_fit_shots(*a, **kw)
+
+    monkeypatch.setattr(shot_list, "fit_shots", spy)
+    shots = analyze_hits(det, hits, CAM, PHYS, CFG, ci=False, progress=lambda m: None, players=players)
+    assert len(seen[0]) == len(hits)
+    for h, f in zip(hits, seen[0]):
+        assert np.allclose(f, first[h.side].p0[:2])
+    assert all(s.speed_kmh is not None for s in shots)
+    analyze_hits(det, hits, CAM, PHYS, CFG, ci=False, progress=lambda m: None)
+    assert seen[1] is None
+
+
 @pytest.mark.parametrize("kw, why", [({"max_kmh": 1.0}, "ありえない速さ"), ({"max_rms_frac": 0.0}, "合わない")])
 def test_failed_fits_are_dropped(kw, why):
     """ありえない初速・画像の上で検出と合わない軌道は、速さが出なかったもの（種類は不明）として扱う。"""

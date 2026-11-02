@@ -244,3 +244,25 @@ def test_shot_list_flow(client, tmp_path):
     g2 = client.get("/api/shots").get_json()
     assert g2["info"]["start_s"] == pytest.approx(t0, abs=1e-3)
     assert 0 < len(g2["shots"]) < len(truth) and all(s["t_hit_s"] >= t0 for s in g2["shots"])
+
+
+def test_hitter_auto_from_players(client, session, monkeypatch):
+    """手順 3 の「① を選手の立ち位置から入れる」：今のコマの前後で選手を検出し、x < 0 の側の選手の足元を返す（D3b）。"""
+    from smash_speed.calibration.io import load_calibration
+    from smash_speed.webapp import server
+    from tests.test_batch import _FakePeople
+
+    d, info = session
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    client.post("/api/state", json={"calib": str(d / "calibration.json"), "calib_video": str(d / "synthetic.mp4")})
+    client.post("/api/calib/load", json={})
+    camera, _ = load_calibration(d / "calibration.json")
+    hx, hy = info["hitter_xy"]
+    assert hx < 0   # 1 本の解析では打つ人の側を x < 0 にしている
+    monkeypatch.setattr(server, "_PERSON_DETECTOR", [_FakePeople(camera, [(hx, hy), (4.0, 0.5)])])
+    r = client.post("/api/hitter/auto", json={"t": info["t_impact_video_s"]}).get_json()
+    assert r["ok"] and r["x"] == pytest.approx(hx, abs=0.05) and r["y"] == pytest.approx(hy, abs=0.05)
+    # 打つ側に人がいなければ、見つからないと返す
+    monkeypatch.setattr(server, "_PERSON_DETECTOR", [_FakePeople(camera, [(4.0, 0.5)])])
+    r = client.post("/api/hitter/auto", json={"t": info["t_impact_video_s"]}).get_json()
+    assert not r["ok"] and "見つけられません" in r["error"]

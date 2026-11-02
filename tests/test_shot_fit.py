@@ -6,7 +6,7 @@ import pytest
 
 from smash_speed.config import load_config
 from smash_speed.physics import MPS_TO_KMH, FitOptions, PhysicsParams
-from smash_speed.shot_fit import (audio_hit_times, fit_shots, refine_hit_times, shot_fits_to_shots,
+from smash_speed.shot_fit import (audio_hit_times, fit_shots, joint_hit_points, refine_hit_times, shot_fits_to_shots,
                                   split_observations)
 from smash_speed.shots import read_shots, write_shots
 from smash_speed.synth_rally import make_rally, observe_rally, rally_camera
@@ -147,3 +147,30 @@ def test_parallel_fits_give_the_same_result(cam):
     # 打点をつないだ後もずれが大きいショットは、信頼区間つきの当てはめ直しをしない
     loose = fit_shots(det, t_hits, cam, PHYS, sides, opts, max_rms_px=0.0)
     assert all(f.fit is not None and f.fit.speed0_ci is None for f in loose)
+
+
+def test_joint_hit_points_use_hitter_feet(rally_fit):
+    """足元から離れた打点は捨て、どちらも捨てたら足元の真上にする。足元に近い打点はそのまま（ROADMAP D3c）。"""
+    rally, _, fits = rally_fit
+    plain = joint_hit_points(fits, PHYS)
+    near = joint_hit_points(fits, PHYS, feet=[None if p is None else p[:2] + 0.3 for p in plain[:-1]])
+    for a, b in zip(plain[:-1], near[:-1]):
+        assert a is not None and np.allclose(a, b)
+    far = [s.p0[:2] + np.array([0.0, 6.0]) for s in rally.segments]
+    moved = joint_hit_points(fits, PHYS, feet=far)
+    for p, f in zip(moved[:-1], far):
+        assert np.allclose(p[:2], f) and 0.3 <= p[2] <= 3.5
+
+
+def test_hitter_feet_keep_speeds_and_pull_hit_points(cam):
+    """打つ人の足元を渡しても初速は正解に近いまま。打点は足元の近くに出る。"""
+    rally = make_rally(np.random.default_rng(4), PHYS, n_shots=5)
+    det = observe_rally(rally, cam, 30.0, PHYS, np.random.default_rng(0))
+    segs = rally.segments
+    feet = [s.p0[:2] + np.random.default_rng(k).normal(0.0, 0.3, 2) for k, s in enumerate(segs)]
+    fits = fit_shots(det, [s.t_hit for s in segs], cam, PHYS, [s.side for s in segs],
+                     FitOptions(refine_plane=True, ci_method="none"), hitter_xy=feet)
+    errs = [abs(sf.speed_kmh / (s.speed0 * MPS_TO_KMH) - 1) for s, sf in zip(segs, fits) if sf.fit is not None]
+    assert len(errs) >= len(segs) - 1 and np.mean(errs) < 0.05
+    gaps = [np.hypot(*(sf.fit.p0[:2] - f)) for sf, f in zip(fits, feet) if sf.fit is not None]
+    assert np.median(gaps) < 1.0

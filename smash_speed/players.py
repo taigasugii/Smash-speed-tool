@@ -486,6 +486,43 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
     return info
 
 
+def detect_in_windows(meta: Any, camera: Camera, detector: PersonDetector, windows: list[tuple[float, float]],
+                      cfg: dict[str, Any] | None = None, o: PlayerOptions | None = None
+                      ) -> tuple[pd.DataFrame, pd.Series]:
+    """動画のいくつかの短い区間（[始まり, 終わり] [s]）だけで人を検出する（動画は 1 回だけ読む）。
+
+    区間が重なっても、検出はコマごとに 1 回だけ。``add_court_positions`` の後の人と、検出したコマの番号 → 時刻を返す。
+    区間ごとの選手は ``track_between`` で選ぶ。
+    """
+    from smash_speed.batch import stream_bgr
+
+    o = o or PlayerOptions()
+    if not windows:
+        return add_court_positions(detect_people(iter(()), detector), camera), pd.Series(dtype=float)
+    scale = min(1.0, o.process_width / meta.width)
+    t_first = min(a for a, _ in windows)
+    t_last = max(b for _, b in windows)
+    frames = ((i, t, img) for i, t, img in stream_bgr(meta, int(round(meta.width * scale)), cfg,
+                                                      max(0.0, t_first - 0.1), t_last + 0.1)
+              if i % o.stride == 0 and any(a <= t <= b for a, b in windows))
+    seen: dict[int, float] = {}
+
+    def remember(it: Iterator[tuple[int, float, np.ndarray]]) -> Iterator[tuple[int, float, np.ndarray]]:
+        for i, t, img in it:
+            seen[i] = t
+            yield i, t, img
+
+    people = add_court_positions(detect_people(remember(frames), detector, scale), camera)
+    return people, pd.Series(seen, dtype=float).sort_index()
+
+
+def track_between(people: pd.DataFrame, frame_t: pd.Series, start_s: float, end_s: float, camera: Camera,
+                  cfg: dict[str, Any], o: PlayerOptions | None = None) -> pd.DataFrame:
+    """``detect_in_windows`` の結果のうち、区間 [start_s, end_s] のコマだけで選手を追跡する（跳んだコマは床に直す）。"""
+    ft = frame_t[(frame_t >= start_s) & (frame_t <= end_s)]
+    return ground_jumps(track_players(people[people["frame"].isin(ft.index)], ft, cfg, o), camera, o)
+
+
 def write_preview(meta: Any, players: pd.DataFrame, people: pd.DataFrame, frame: int, path: Path,
                   width: int = 1280) -> None:
     """1 コマに、検出した人（細い灰色）と選んだ選手（手前 青・奥 橙）の枠とコートの位置を描いて保存する。"""

@@ -89,3 +89,61 @@ def test_probe_ignores_discarded_packets(monkeypatch, tmp_path):
     f.write_bytes(b"")
     m = video_io.probe(f)
     assert m.n_frames == 10 and m.timestamps[0] == 0.0 and m.timestamps[3] == pytest.approx(0.1)
+
+
+class _FakePeople:
+    """合成動画の打つ人（と相手）が、決まった足元に立っているように枠を返す人の検出。"""
+
+    def __init__(self, camera, feet):
+        self.camera = camera
+        self.feet = [np.array([x, y], float) for x, y in feet]
+
+    def detect(self, img):
+        s = img.shape[1] / self.camera.width
+        rows = []
+        for xy in self.feet:
+            foot, head = self.camera.project(np.array([[*xy, 0.0], [*xy, 1.7]]))
+            hgt = foot[1] - head[1]
+            rows.append([foot[0] - 0.2 * hgt, head[1], foot[0] + 0.2 * hgt, foot[1], 0.9])
+        return np.array(rows) * np.array([s, s, s, s, 1.0])
+
+
+def test_find_candidates_takes_the_hitter_from_players(session, tmp_path, monkeypatch):
+    """``players=True`` では、打つ人の足元の初めの値を、打点に近い選手の足元にする（D3b）。"""
+    from smash_speed import players
+    from smash_speed.calibration.io import load_calibration
+
+    cfg, d, info = session
+    camera, _ = load_calibration(d / "calibration.json")
+    hx, hy = info["hitter_xy"]
+    opponent = (-np.sign(hx) * 4.0, 0.5)
+    monkeypatch.setattr(players, "ensure_model", lambda *a, **k: "yolox_s.onnx")
+    monkeypatch.setattr(players, "PersonDetector", lambda *a, **k: _FakePeople(camera, [(hx, hy), opponent]))
+    o = BatchOptions(video=d / "synthetic.mp4", calib=d / "calibration.json", out_dir=tmp_path / "b",
+                     audio=d / "synthetic.wav", players=True)
+    cands = find_candidates(o, cfg, progress=lambda m: None)
+    c, = [c for c in cands if c.status == "ok"]
+    assert c.hitter_source == "players"
+    assert np.hypot(c.hitter["x"] - hx, c.hitter["y"] - hy) < 0.05   # 大まかな推定（2.5 m 以内）より近い
+    assert c.hitter_rough is not None and c.hitter_rough != c.hitter
+    back, binfo = load_candidates(tmp_path / "b")
+    assert back[c.id - 1].hitter_source == "players" and binfo["players"]["n_hitters"] == 1
+
+
+def test_find_candidates_keeps_the_rough_hitter_when_players_fail(session, tmp_path, monkeypatch):
+    """人の検出が動かないときは、候補探しを止めずに大まかな推定のまま残す。"""
+    from smash_speed import players
+
+    cfg, d, info = session
+
+    def broken(*a, **k):
+        raise RuntimeError("モデルを取れません")
+
+    monkeypatch.setattr(players, "ensure_model", broken)
+    o = BatchOptions(video=d / "synthetic.mp4", calib=d / "calibration.json", out_dir=tmp_path / "b",
+                     audio=d / "synthetic.wav", players=True)
+    cands = find_candidates(o, cfg, progress=lambda m: None)
+    c, = [c for c in cands if c.status == "ok"]
+    assert c.hitter_source == "" and c.hitter_rough is None and c.hitter is not None
+    _, binfo = load_candidates(tmp_path / "b")
+    assert "モデル" in binfo["players"]["error"]
