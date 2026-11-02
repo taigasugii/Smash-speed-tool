@@ -160,3 +160,33 @@ def test_propose_returns_nothing_for_blank_frame():
     from smash_speed.calibration.propose import propose_calibrations
 
     assert propose_calibrations(np.zeros((360, 640, 3), np.uint8), landmark_table(load_config())) == []
+
+
+def _median_err(Hm: np.ndarray, Ht: np.ndarray, table) -> float:
+    """床のランドマークの、2 つのホモグラフィでの画像の位置のずれの中央値 [px]（180° 回したコートも同じとみなす）。"""
+    W = np.array([v[:2] for v in table.values() if abs(v[2]) < 1e-6])
+    ref = _apply_h(Ht, W)
+    return min(float(np.median(np.linalg.norm(_apply_h(H, W) - ref, axis=1)))
+               for H in (Hm, Hm @ np.diag([-1.0, -1.0, 1.0])))
+
+
+def test_vanishing_candidates_find_low_corner_camera():
+    from smash_speed.calibration.propose import vanishing_candidates
+
+    table = landmark_table(load_config())
+    # 低い位置（0.95 m）・手前の角から撮った画像。手順 ① のカメラの位置は 1.5 m ずれている
+    Hm = _camera_h(C=(-9.5, -5.2, 0.95), target=(-1.5, 0.5, 0.0), f=1000.0)
+    frame = _court_image(Hm, seed=4, cross_seams=True)
+    cands = vanishing_candidates(frame, (-8.4, -4.2))
+    assert cands
+    assert min(_median_err(H, Hm, table) for H, _ in cands[:3]) < 5.0
+
+
+def test_propose_uses_camera_position_for_vanishing_candidates():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    table = landmark_table(load_config())
+    Hm = _camera_h(C=(-9.5, -5.2, 0.95), target=(-1.5, 0.5, 0.0), f=1000.0)
+    frame = _court_image(Hm, seed=4, cross_seams=True)
+    props = propose_calibrations(frame, table, n=3, cam_xy=(-8.4, -4.2))
+    assert props and _median_err(props[0].result.homography, Hm, table) < 2.0
