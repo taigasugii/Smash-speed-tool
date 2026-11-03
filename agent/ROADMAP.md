@@ -107,9 +107,9 @@ ShuttleSet / CoachAI（ショットの種類の分類体系と、ラリー単位
 - [x] **C2 ラリーの統計**（`smash_speed/rally_stats.py`）：ラリーの長さ（本数・秒）、ショットの種類の割合、種類ごとの平均・最高速度、着地点の分布図。
   （`stats.json`・`landing.svg` を `analyze_video` の最後に書く。分布図は種類ごとのコートの図を並べ、区画の本数を色の濃さで出す）
 - [x] **C3 レポート**（`smash_speed/rally_report.py`）：1 本の動画の統計を、スマホでも見やすい 1 枚のページ（HTML / PDF）にまとめて書き出す。
-  （`report.html` を `analyze_video` の最後に書く。PDF はブラウザの印刷から。GUI からレポートを開くつなぎは、B5c2 と取り合わないよう入れていない）
+  （`report.html` を `analyze_video` の最後に書く。PDF はブラウザの印刷から。GUI からレポートを開くつなぎは C5b で足した）
 - [x] **C4 セッションをまたいだ記録**（`smash_speed/history.py`）：日付ごとの最高速度・平均速度の推移、ショットの割合の変化。
-  （出力の場所の下のショットの一覧を撮った日ごとにまとめ、`history.csv`・`history.html` を書く。GUI へのつなぎはまだ）
+  （出力の場所の下のショットの一覧を撮った日ごとにまとめ、`history.csv`・`history.html` を書く。GUI へのつなぎは C5b）
 - [x] **C5 外・ネットで終わる合成ラリー**（提案から。`synth_rally.make_rally(end=...)`・`fault_shot`）：合成ラリーの最後のショットを
   線の外・ネットの手前に落とせるようにし、C1 の終わり方と得点した側の判定を測る。
   （in・out・net をまぜた合成で、終わり方と得点した側は truth 20 個・fit 5 個とも全部合った。`check_rallies` でも確かめる）
