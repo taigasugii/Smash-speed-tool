@@ -134,3 +134,35 @@ def test_fit_benchmark_on_a_short_session():
     r = synthetic_benchmark(n_sessions=1, n_rallies=3, fps=30.0, seed=1, mode="fit", rest_s=(1.0, 2.0), workers=2)
     assert r["new"]["boundary_recall"] == 1.0 and r["new"]["boundary_precision"] == 1.0
     assert r["new"]["exact"] == 1.0 and r["new"]["outcome_acc"] >= 0.6
+
+
+@pytest.mark.parametrize("end", ["out", "net"])
+def test_synthetic_rally_can_end_out_or_in_the_net(end):
+    from smash_speed.synth_rally import make_rally
+
+    rng = np.random.default_rng(4)
+    rally = make_rally(rng, PHYS, n_shots=4, end=end)
+    while rally.end != end:  # 打点がネットに近すぎると作れないので、作れるまで引き直す
+        rally = make_rally(rng, PHYS, n_shots=4, end=end)
+    last = rally.to_shots(phys=PHYS)[-1]
+    truth = rally.to_rally()
+    # 外・ネットなら相手の得点。split_rallies の終わり方の判定とも合う
+    assert truth.end_reason == end and truth.winner_side != last.side
+    assert rally_outcome(last, RallyOptions(), CFG["court"])[:2] == (end, truth.winner_side)
+    if end == "net":
+        assert np.sign(last.land_x_m) == np.sign(last.hit_x_m)
+
+
+def test_session_server_is_the_rally_winner():
+    session = make_session(np.random.default_rng(5), PHYS, n_rallies=5, ends={"in": 0.3, "out": 0.4, "net": 0.3})
+    assert {r.end for r in session} - {"in"}  # 外・ネットで終わるラリーがある
+    for a, b in zip(session[:-1], session[1:]):
+        assert b.segments[0].side == a.to_rally().winner_side
+
+
+def test_truth_benchmark_judges_how_rallies_end():
+    r = synthetic_benchmark(n_sessions=2, n_rallies=5, fps=30.0, seed=2, mode="truth", rest_s=(1.0, 3.0),
+                            ends={"in": 0.3, "out": 0.4, "net": 0.3})
+    by = r["new"]["by_reason"]
+    assert set(by) >= {"out", "net"}
+    assert all(ok == n for ok, n in by.values())

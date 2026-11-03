@@ -125,6 +125,7 @@ class SyntheticRally:
     """合成ラリー 1 つの正解（ショットの並び）。"""
 
     segments: list[FlightSegment] = field(default_factory=list)
+    end: str = "in"   # 終わり方：in（相手のコートの中）| out（外）| net（ネットを越えずに自分の側）
 
     @property
     def t_start(self) -> float:
@@ -155,10 +156,11 @@ class SyntheticRally:
         return out
 
     def to_rally(self, time_offset: float = 0.0, rally_id: int = 1) -> Rally:
-        """``smash_speed.shots.Rally`` の形の正解。得点は最後に打った側（相手のコートに落ちた）にする。"""
-        last = self.segments[-1]
+        """``smash_speed.shots.Rally`` の形の正解。得点は、中に落ちれば最後に打った側、外・ネットなら相手。"""
+        last = self.segments[-1].side
+        winner = last if self.end == "in" else ("o" if last == "h" else "h")
         return Rally(rally_id=rally_id, t_start_s=self.t_start + time_offset, t_end_s=self.t_end + time_offset,
-                     n_shots=len(self.segments), winner_side=last.side, end_reason="in")
+                     n_shots=len(self.segments), winner_side=winner, end_reason=self.end)
 
 
 # =============================================================================
@@ -296,7 +298,7 @@ def intercept(seg: FlightSegment, hit_z_m: tuple[float, float], rng: np.random.G
 
 
 def make_rally(rng: np.random.Generator, phys: PhysicsParams, n_shots: int = 8, server_side: str = "h",
-               serve: str | None = None, t_start: float = 0.0, max_tries: int = 12) -> SyntheticRally:
+               serve: str | None = None, t_start: float = 0.0, max_tries: int = 12, end: str = "in") -> SyntheticRally:
     """サーブから始まる最大 ``n_shots`` 本の合成ラリーを作る。
 
     次のショットは ``NEXT_TYPES`` から重みで引き、前の軌道が相手側で下りてきて、その種類の打点の高さの
@@ -305,6 +307,8 @@ def make_rally(rng: np.random.Generator, phys: PhysicsParams, n_shots: int = 8, 
 
     Args:
         serve: serve_short | serve_long（省略時はどちらかを引く）
+        end: 最後のショットの落ち方。"in" は相手のコートの中（今までどおり）、"out" は線の外、
+            "net" はネットを越えずに自分の側（``fault_shot``）。外・ネットにできなければ "in" のまま
     """
     serve = serve or ("serve_short" if rng.uniform() < 0.6 else "serve_long")
     segs = [make_typed_shot(serve, rng, phys, side=server_side, t_hit=t_start)]
@@ -316,7 +320,51 @@ def make_rally(rng: np.random.Generator, phys: PhysicsParams, n_shots: int = 8, 
         t_hit, p, profile, v0 = nxt
         prev.t_end, prev.intercepted = t_hit, True
         segs.append(_segment(profile, p, v0, t_hit, phys))
-    return SyntheticRally(segs)
+    if end != "in":
+        last = segs[-1]
+        v0 = fault_shot(end, last.profile, last.p0, rng, phys)
+        if v0 is None:
+            end = "in"
+        else:
+            segs[-1] = _segment(last.profile, last.p0, v0, last.t_hit, phys)
+    return SyntheticRally(segs, end)
+
+
+def fault_shot(end: str, profile: str, p0: np.ndarray, rng: np.random.Generator, phys: PhysicsParams,
+               n_tries: int = 12) -> np.ndarray | None:
+    """打点 ``p0`` から、外（"out"）かネットの手前（"net"）に落ちる初速度。作れなければ None。
+
+    out：相手側の線の外（バックバウンダリーラインの 0.15〜0.9 m 先か、サイドラインの 0.15〜0.8 m 外）を狙う。
+    打ち出し角は種類の範囲から引き、初速は 1〜120 m/s から求める（ネットを越えること）。
+    net：自分の側のネットの手前 0.1〜0.8 m を狙う遅いショット（ネットに掛かって落ちたものの代わり。網は物理モデルにない）。
+    """
+    pr = SHOT_PROFILES[profile]
+    sign = np.sign(p0[0])
+    sp = _solver_phys(phys)
+    for _ in range(n_tries):
+        if end == "out":
+            if rng.uniform() < 0.5:
+                target = np.array([-sign * (HALF_LENGTH_M + rng.uniform(0.15, 0.9)), rng.uniform(-2.0, 2.0)])
+            else:
+                target = np.array([-sign * rng.uniform(1.0, HALF_LENGTH_M - 0.3),
+                                   rng.choice([-1, 1]) * (3.05 + rng.uniform(0.15, 0.8))])
+            el = rng.uniform(*pr.elevation_deg)
+        else:
+            if abs(p0[0]) < 0.4:
+                return None
+            target = np.array([sign * rng.uniform(0.1, min(0.8, abs(p0[0]) - 0.2)), p0[1] + rng.uniform(-0.5, 0.5)])
+            el = rng.uniform(-10.0, 30.0)
+        d = target - p0[:2]
+        dist = float(np.linalg.norm(d))
+        d /= dist
+        speed = _bisect(lambda v: _range(p0, d, v, el, sp), 1.0, 120.0, dist)
+        if speed is None:
+            continue
+        v0 = _velocity(d, speed, el)
+        if end == "out" and not _clears_net(p0, v0, max(pr.max_apex_m, 4.0), sp):
+            continue
+        return v0
+    return None
 
 
 def _continue(prev: FlightSegment, rng: np.random.Generator, phys: PhysicsParams,
@@ -357,20 +405,21 @@ def rally_positions(rally: SyntheticRally, times: np.ndarray, phys: PhysicsParam
 
 def make_session(rng: np.random.Generator, phys: PhysicsParams, n_rallies: int = 6,
                  n_shots: tuple[int, int] = (2, 12), rest_s: tuple[float, float] = (1.0, 8.0),
-                 t_start: float = 0.5) -> list[SyntheticRally]:
+                 t_start: float = 0.5, ends: dict[str, float] | None = None) -> list[SyntheticRally]:
     """続けて打った ``n_rallies`` 個の合成ラリー（1 本の動画の中の練習・試合）。
 
     ラリーの本数は ``n_shots`` の範囲から引く（つなげなくなればそれより短い）。前のラリーのシャトルが
     床に落ちてから ``rest_s`` の範囲の間だけ休んで、次のラリーのサーブを打つ。サーブは前のラリーで
-    得点した側（最後に打った側）が打つ。
+    得点した側が打つ。``ends`` は終わり方の割合（例 ``{"in": 0.5, "out": 0.3, "net": 0.2}``。省略時はすべて in）。
     """
     out: list[SyntheticRally] = []
     t, server = t_start, "h"
     for _ in range(n_rallies):
-        r = make_rally(rng, phys, n_shots=int(rng.integers(n_shots[0], n_shots[1] + 1)), server_side=server,
-                       t_start=t)
+        n = int(rng.integers(n_shots[0], n_shots[1] + 1))
+        end = "in" if not ends else str(rng.choice(list(ends), p=np.array(list(ends.values())) / sum(ends.values())))
+        r = make_rally(rng, phys, n_shots=n, server_side=server, t_start=t, end=end)
         out.append(r)
-        server = r.segments[-1].side
+        server = r.to_rally().winner_side
         t = r.t_end + float(rng.uniform(*rest_s))
     return out
 

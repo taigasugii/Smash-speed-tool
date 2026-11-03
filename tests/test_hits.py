@@ -82,6 +82,26 @@ def test_audio_sets_the_time_and_drops_clicks_without_a_hit(cam, tmp_path):
             assert h.t_audio is None
 
 
+def test_audio_before_a_late_track_start_keeps_the_audio_time(cam):
+    """サーブのように打つ前の軌道がなく、打った直後のコマが抜けて検出の始まりが遅れても、打球音の時刻を使う
+    （音の時刻は shot_fit が打点からの距離で引き直す）。"""
+    rally = make_rally(np.random.default_rng(3), PHYS, n_shots=6)
+    fps = 30.0
+    det = observe_rally(rally, cam, fps, PHYS, np.random.default_rng(1), dropout=0.0)
+    segs = rally.segments
+    hide = (det.timestamp >= segs[0].t_hit) & (det.timestamp < segs[0].t_hit + 0.08)
+    det.loc[hide, ["x_px", "y_px"]] = np.nan
+    det.loc[hide, "visible"] = 0
+    onsets = [(s.t_hit + float(np.linalg.norm(cam.center - s.p0)) / 343.0, 30.0) for s in segs]
+    serve = [h for h in find_hits(det, fps, onsets, camera=cam) if abs(h.t - segs[0].t_hit) < 0.12]
+    assert len(serve) == 1 and serve[0].t_track - segs[0].t_hit > 0.06
+    assert abs(serve[0].t - segs[0].t_hit) < 0.01 and serve[0].t_audio is not None
+    # 前のやり方：軌道の時刻（遅れた始まり）になり、音の時刻は捨てる
+    old = [h for h in find_hits(det, fps, onsets, camera=cam, audio_before_start=False)
+           if abs(h.t - segs[0].t_hit) < 0.12]
+    assert len(old) == 1 and old[0].t == old[0].t_track and old[0].t_audio is None
+
+
 def test_audio_only_without_detections(tmp_path, cam):
     rally = make_rally(np.random.default_rng(4), PHYS, n_shots=5)
     onsets = _rally_audio(rally, cam, tmp_path, rally.t_start - 0.4)

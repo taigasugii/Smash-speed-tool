@@ -27,7 +27,8 @@ gpu = [
     "onnxruntime>=1.17; sys_platform != 'win32'",
     "onnx>=1.15",
 ]
-# 打点推定の補助（任意）
+# 姿勢推定（任意。ROADMAP E 章）。RTMPose（rtmlib）は onnxruntime を一緒に入れようとし、Windows で
+# onnxruntime-directml と両方入ると壊れるので、ここには入れず pip install --no-deps rtmlib tqdm で入れる
 pose = ["mediapipe>=0.10"]
 dev = ["pytest>=8.0"]
 
