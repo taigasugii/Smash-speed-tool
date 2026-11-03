@@ -11,6 +11,9 @@ TrackNet との比較対象、およびアノテーションの初期値とし�
 
 from __future__ import annotations
 
+import math
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -24,6 +27,8 @@ from smash_speed.video_io import VideoMeta, VideoReader
 DETECTOR_VERSION = 3
 
 DETECTION_COLUMNS = ["frame", "timestamp", "x_px", "y_px", "visible", "confidence"]
+
+CANDIDATE_THREADS = 4   # 差分の候補を並べて求めるスレッドの数（``detect_frames``）
 
 
 @dataclass
@@ -105,6 +110,9 @@ def candidates_from_frames(prev: np.ndarray, cur: np.ndarray, nxt: np.ndarray, p
     return out[: p.max_candidates]
 
 
+_MAX_TURN_RAD = float(np.radians(30))  # 予測で引き継ぐ向きの変化の上限（1 コマあたり）
+
+
 @dataclass
 class _Track:
     ids: list[int]          # 候補の通し番号
@@ -122,26 +130,31 @@ class _Track:
         遠ざかるシャトルは画面上で 1 コマごとに半分近くまで減速し、近づくシャトルは加速して見えるので、
         2 次式（等加速度）の外挿では逆向きに戻ったり行き過ぎたりする。
         """
+        # 速さのため、2 次元の値は Python の数で計算する（numpy の配列の式と 1 ビットも同じ。F3c）。
+        # 回転の行列の掛け算だけは、numpy（中で FMA を使う）と同じにならないので numpy のまま
         if len(self.t) == 1:
             return self.xy[-1]
         p1, p2 = self.xy[-2], self.xy[-1]
+        x1, y1, x2, y2 = float(p1[0]), float(p1[1]), float(p2[0]), float(p2[1])
         dt1 = self.t[-1] - self.t[-2]
-        v1 = (p2 - p1) / max(dt1, 1e-9)
-        steps = (t - self.t[-1]) / max(dt1, 1e-9)  # 直前の間隔の何倍先か
+        d1 = max(dt1, 1e-9)
+        v1x, v1y = (x2 - x1) / d1, (y2 - y1) / d1
+        steps = (t - self.t[-1]) / d1  # 直前の間隔の何倍先か
         if len(self.t) == 2:
-            return p2 + v1 * dt1 * steps
+            return np.array([x2 + v1x * dt1 * steps, y2 + v1y * dt1 * steps])
         p0 = self.xy[-3]
-        v0 = (p1 - p0) / max(self.t[-2] - self.t[-3], 1e-9)
-        n0, n1 = np.linalg.norm(v0), np.linalg.norm(v1)
+        d0 = max(self.t[-2] - self.t[-3], 1e-9)
+        v0x, v0y = (x1 - float(p0[0])) / d0, (y1 - float(p0[1])) / d0
+        n0, n1 = math.sqrt(v0x * v0x + v0y * v0y), math.sqrt(v1x * v1x + v1y * v1y)
         if n0 < 1e-9 or n1 < 1e-9:
-            return p2 + v1 * dt1 * steps
-        r = float(np.clip(n1 / n0, 0.3, 1.6))
-        ang = np.arctan2(v0[0] * v1[1] - v0[1] * v1[0], v0 @ v1)
-        ang = float(np.clip(ang, -np.radians(30), np.radians(30)))
-        c, s_ = np.cos(ang), np.sin(ang)
+            return np.array([x2 + v1x * dt1 * steps, y2 + v1y * dt1 * steps])
+        r = min(max(n1 / n0, 0.3), 1.6)
+        ang = math.atan2(v0x * v1y - v0y * v1x, v0x * v1x + v0y * v1y)
+        ang = min(max(ang, -_MAX_TURN_RAD), _MAX_TURN_RAD)
+        c, s_ = math.cos(ang), math.sin(ang)
         rot = np.array([[c, -s_], [s_, c]])
         # 等比級数で steps 個先まで足す（1 コマなら v1 * dt1 * r）
-        pos, v = p2.copy(), v1 * dt1
+        pos, v = np.array([x2, y2]), np.array([v1x * dt1, v1y * dt1])
         k = 0.0
         while k < steps - 1e-9:
             frac = min(1.0, steps - k)
@@ -157,9 +170,19 @@ def _recent_resid(tr: _Track, n: int = 5) -> float:
         return 0.0
     t, xy = np.array(tr.t[-n:]), np.array(tr.xy[-n:])
     deg = 2 if len(t) >= 4 else 1
-    c = [np.polyfit(t - t[-1], xy[:, j], deg) for j in range(2)]
-    fit = np.column_stack([np.polyval(cj, t - t[-1]) for cj in c])
+    fit = _polyfit_xy(t - t[-1], xy, deg)
     return float(np.sqrt(np.mean(np.sum((fit - xy) ** 2, axis=1))))
+
+
+def _polyfit_xy(t: np.ndarray, xy: np.ndarray, deg: int, at: np.ndarray | float | None = None) -> np.ndarray:
+    """x・y を t の deg 次式に当てはめ、``at``（省略なら t）での値を返す。
+
+    2 列まとめて 1 回の ``np.polyfit`` にする（列ごとに当てはめたときと 1 ビットも同じで、呼ぶ回数が半分。F3c）。
+    """
+    c = np.polyfit(t, xy, deg)
+    if at is None:
+        return np.polyval(c, t[:, None])
+    return np.polyval(c, at)
 
 
 def link_tracks(cands: pd.DataFrame, p: BaselineParams) -> list[_Track]:
@@ -207,13 +230,14 @@ def link_tracks(cands: pd.DataFrame, p: BaselineParams) -> list[_Track]:
         # 重複（最後の 3 点が同じ）の整理
         best: dict[tuple[int, int, int], _Track] = {}
         rest = []
+        resid: dict[int, float] = {}   # このコマの間は軌道が変わらないので、残差は 1 本 1 回だけ計算する（F3c）
         for tr in active:
             if len(tr.ids) < 3 or tr.misses:
                 rest.append(tr)
                 continue
             key = (tr.ids[-3], tr.ids[-2], tr.ids[-1])
             cur = best.get(key)
-            if cur is None or _better(tr, cur, p):
+            if cur is None or _better(tr, cur, p, resid):
                 best[key] = tr
         active = rest + list(best.values())
         for j in range(len(pts)):
@@ -224,15 +248,20 @@ def link_tracks(cands: pd.DataFrame, p: BaselineParams) -> list[_Track]:
     return _drop_subsumed([tr for tr in tracks if len(tr.t) >= 2])
 
 
-def _better(a: _Track, b: _Track, p: BaselineParams) -> bool:
-    """重複した 2 本の軌道のうち a を残すべきか。
+def _better(a: _Track, b: _Track, p: BaselineParams, resid: dict[int, float] | None = None) -> bool:
+    """重複した 2 本の軌道のうち a を残すべきか（``resid`` は軌道の ``id`` → ``_recent_resid`` の使い回し）。
 
     長い方を残す。ただし長い方の直近の当てはめの残差が大きい（無関係な動きから飛び移ってきた）ときは
     短い方を残す。短い軌道は点が少なく残差が小さく出るので、単純に残差を比べると長い軌道が負ける。
     """
     long_, short = (a, b) if len(a.t) >= len(b.t) else (b, a)
     step = float(np.linalg.norm(long_.xy[-1] - long_.xy[-2]))
-    keep_long = _recent_resid(long_) <= p.gate_px + 0.3 * step
+    r = None if resid is None else resid.get(id(long_))
+    if r is None:
+        r = _recent_resid(long_)
+        if resid is not None:
+            resid[id(long_)] = r
+    keep_long = r <= p.gate_px + 0.3 * step
     winner = long_ if keep_long else short
     return winner is a
 
@@ -260,6 +289,9 @@ def merge_tracks(tracks: list[_Track], p: BaselineParams) -> list[_Track]:
     by_start: dict[int, list[_Track]] = {}
     for tr in tracks:
         by_start.setdefault(tr.frames[0], []).append(tr)
+    # 始まりの速さは軌道ごとに 1 回だけ計算する（F3c）
+    v_start = {id(tr): np.linalg.norm(tr.xy[1] - tr.xy[0]) / max(tr.t[1] - tr.t[0], 1e-9)
+               for tr in tracks if len(tr.xy) >= 2}
     used: set[int] = set()
     out: list[_Track] = []
     for a in tracks:
@@ -270,16 +302,20 @@ def merge_tracks(tracks: list[_Track], p: BaselineParams) -> list[_Track]:
             best, best_d = None, np.inf
             step = np.linalg.norm(a.xy[-1] - a.xy[-2]) if len(a.xy) >= 2 else p.gate_px
             va = step / max(a.t[-1] - a.t[-2], 1e-9) if len(a.xy) >= 2 else None
+            preds: dict[float, np.ndarray] = {}   # 同じ時刻に始まる軌道には同じ予測を使う
             for gap in range(1, p.max_gap_frames + 2):
                 for b in by_start.get(a.frames[-1] + gap, []):
                     if id(b) in used:
                         continue
                     if va is not None and len(b.xy) >= 2:
                         # つなぎ目の前後で速さが大きく変わるもの（ゆっくり動く人に、シャトルがつながるなど）はつながない
-                        vb = np.linalg.norm(b.xy[1] - b.xy[0]) / max(b.t[1] - b.t[0], 1e-9)
+                        vb = v_start[id(b)]
                         if not 0.4 <= (vb + 1e-9) / (va + 1e-9) <= 2.5:
                             continue
-                    d = float(np.linalg.norm(a.predict(b.t[0]) - b.xy[0]))
+                    pred = preds.get(b.t[0])
+                    if pred is None:
+                        pred = preds[b.t[0]] = a.predict(b.t[0])
+                    d = float(np.linalg.norm(pred - b.xy[0]))
                     if d <= (p.gate_px + p.gate_step_ratio * step) * gap and d < best_d:
                         best, best_d = b, d
             if best is None:
@@ -301,14 +337,12 @@ def _local_resid(t: np.ndarray, xy: np.ndarray, w: int = 5) -> float:
     同じシャトルの短い一部分の方が高いスコアになってしまうため、局所的に測る。
     """
     if len(t) < w:
-        c = [np.polyfit(t - t[0], xy[:, j], 1) for j in range(2)]
-        fit = np.column_stack([np.polyval(cj, t - t[0]) for cj in c])
+        fit = _polyfit_xy(t - t[0], xy, 1)
         return float(np.sqrt(np.mean(np.sum((fit - xy) ** 2, axis=1))))
     rs = []
     for k in range(len(t) - w + 1):
         tt, pp = t[k:k + w] - t[k], xy[k:k + w]
-        c = [np.polyfit(tt, pp[:, j], 2) for j in range(2)]
-        fit = np.column_stack([np.polyval(cj, tt) for cj in c])
+        fit = _polyfit_xy(tt, pp, 2)
         rs.append(np.sqrt(np.mean(np.sum((fit - pp) ** 2, axis=1))))
     return float(np.median(rs))
 
@@ -342,17 +376,26 @@ def split_at_jumps(tracks: list[_Track], min_len: int = 3, max_ratio: float = 3.
     return out
 
 
-def _dedupe_overlapping(tracks: list[_Track], share: float = 0.5) -> list[_Track]:
+def _dedupe_overlapping(tracks: list[_Track], share: float = 0.5,
+                        scores: dict[int, float] | None = None) -> list[_Track]:
     """候補の半分以上を共有する軌道は同じものとみなし、スコアの高い方だけを残す。
 
     長さで選ぶと、遠くの選手などのゆっくりした動きに、途中からシャトルがつながった軌道が残ってしまう。
+    ``scores`` は軌道の ``id`` → ``track_score``（計算済みなら渡す）。
     """
+    def score(a: _Track) -> float:
+        return scores[id(a)] if scores is not None else track_score(a)
+
     out: list[_Track] = []
     sets: list[set[int]] = []
-    for tr in sorted(tracks, key=lambda a: (-track_score(a), a.t[0])):
+    owners: dict[int, list[int]] = {}   # 候補の番号 → それを含む残した軌道（共有のない軌道とは比べない。F3c）
+    for tr in sorted(tracks, key=lambda a: (-score(a), a.t[0])):
         ids = set(tr.ids)
-        if any(len(ids & o) >= share * min(len(ids), len(o)) for o in sets):
+        near = {k for i in ids for k in owners.get(i, ())}
+        if any(len(ids & sets[k]) >= share * min(len(ids), len(sets[k])) for k in near):
             continue
+        for i in ids:
+            owners.setdefault(i, []).append(len(sets))
         out.append(tr)
         sets.append(ids)
     return out
@@ -408,7 +451,7 @@ def remove_outliers(t: np.ndarray, xy: np.ndarray, thr: float, n_neighbors: int 
             nb = others[np.argsort(np.abs(others - i), kind="stable")[:n_neighbors]]
             nb.sort()
             tt = t[nb] - t[i]
-            pred = np.array([np.polyval(np.polyfit(tt, xy[nb, j], 2), 0.0) for j in range(2)])
+            pred = _polyfit_xy(tt, xy[nb], 2, at=0.0)
             near = [k for k in (pos - 1, pos + 1) if 0 <= k < len(idx)]
             step = max(np.linalg.norm(xy[i] - xy[idx[k]]) / max(abs(idx[k] - i), 1) for k in near)
             extrap = 2.0 if (tt.min() > 0 or tt.max() < 0) else 1.0
@@ -478,18 +521,30 @@ def detect_frames(frames: Iterable[tuple[int, float, np.ndarray]], scale: float,
     rows: list[dict[str, float]] = []
     frames_meta: list[tuple[int, float]] = []
     buf: list[tuple[int, float, np.ndarray]] = []
-    for i, t, g in frames:
-        g = cv2.GaussianBlur(g, (3, 3), 0)
-        if roi_mask is None:
-            roi_mask = make_roi_mask(p, g.shape[:2], scale)
-        buf.append((i, t, g))
-        frames_meta.append((i, t))
-        if len(buf) < 3:
-            continue
-        (_, _, a), (fi, ft, b), (_, _, c) = buf[-3:]
-        for cand in candidates_from_frames(a, b, c, p, roi_mask):
-            rows.append({"frame": fi, "timestamp": ft, **cand})
-        buf = buf[-2:]
+    # 差分の候補はコマごとに関係しないので、いくつかのスレッドで並べて求める（OpenCV の処理の間は
+    # ほかのスレッドが動ける）。結果はコマの順に受け取るので、1 つずつ求めたときと同じ（F3c）
+    pending: deque[tuple[int, float, Future]] = deque()
+
+    def collect(n_left: int) -> None:
+        while len(pending) > n_left:
+            fi, ft, fut = pending.popleft()
+            for cand in fut.result():
+                rows.append({"frame": fi, "timestamp": ft, **cand})
+
+    with ThreadPoolExecutor(max_workers=CANDIDATE_THREADS) as pool:
+        for i, t, g in frames:
+            g = cv2.GaussianBlur(g, (3, 3), 0)
+            if roi_mask is None:
+                roi_mask = make_roi_mask(p, g.shape[:2], scale)
+            buf.append((i, t, g))
+            frames_meta.append((i, t))
+            if len(buf) < 3:
+                continue
+            (_, _, a), (fi, ft, b), (_, _, c) = buf[-3:]
+            pending.append((fi, ft, pool.submit(candidates_from_frames, a, b, c, p, roi_mask)))
+            collect(2 * CANDIDATE_THREADS)
+            buf = buf[-2:]
+        collect(0)
     cands = pd.DataFrame(rows)
     out = pd.DataFrame({"frame": [f for f, _ in frames_meta], "timestamp": [t for _, t in frames_meta]})
     for col, val in (("x_px", np.nan), ("y_px", np.nan), ("visible", 0), ("confidence", 0.0),
@@ -499,26 +554,37 @@ def detect_frames(frames: Iterable[tuple[int, float, np.ndarray]], scale: float,
         return (out, cands) if return_candidates else out
     cands["cid"] = np.arange(len(cands))
     tracks = split_at_jumps(merge_tracks(link_tracks(cands, p), p))
-    tracks = _dedupe_overlapping([tr for tr in tracks if len(tr.t) >= p.min_track_len])
-    tracks = sorted(tracks, key=track_score, reverse=True)[:n_tracks]
+    tracks = [tr for tr in tracks if len(tr.t) >= p.min_track_len]
+    scores = {id(tr): track_score(tr) for tr in tracks}   # スコアは 1 本 1 回だけ計算する（F3c）
+    tracks = _dedupe_overlapping(tracks, scores=scores)
+    tracks = sorted(tracks, key=lambda tr: scores[id(tr)], reverse=True)[:n_tracks]
     idx_of = {f: k for k, f in enumerate(out["frame"])}
+    cand_vals = cands[["x", "y", "length", "angle", "area"]].to_numpy()
     extra_rows = []
+    first: dict[int, list[float]] = {}   # コマの行 → そのコマのいちばんスコアの高い軌道の点（最後にまとめて書く。F3c）
     for tid, tr in enumerate(tracks):
         t, xy = np.array(tr.t), np.array(tr.xy)
         keep = remove_outliers(t, xy, p.outlier_px)
-        score = track_score(tr)
+        score = scores[id(tr)]
         for k, cid in enumerate(tr.ids):
             if not keep[k]:
                 continue
-            c = cands.iloc[cid]
-            vals = [c.x / scale, c.y / scale, 1, min(1.0, score / (score + 1000.0)), tid,
-                    c.length / scale, c.angle, c.area / scale**2]
+            cx, cy, clen, cang, carea = cand_vals[cid]
+            vals = [cx / scale, cy / scale, 1, min(1.0, score / (score + 1000.0)), tid,
+                    clen / scale, cang, carea / scale**2]
             r = idx_of[tr.frames[k]]
-            if out.at[r, "visible"]:
+            if r in first:
                 if not exclusive:
                     extra_rows.append([tr.frames[k], tr.t[k], *vals])
                 continue
-            out.loc[r, ["x_px", "y_px", "visible", "confidence", "track_id", "length_px", "angle_deg", "area_px"]] = vals
+            first[r] = vals
+    if first:
+        rows_at = np.fromiter(first.keys(), int, len(first))
+        vals_at = list(first.values())
+        for j, col in enumerate(["x_px", "y_px", "visible", "confidence", "track_id", "length_px", "angle_deg", "area_px"]):
+            col_vals = out[col].to_numpy().copy()
+            col_vals[rows_at] = [v[j] for v in vals_at]
+            out[col] = col_vals
     if extra_rows:
         out = pd.concat([out, pd.DataFrame(extra_rows, columns=out.columns)], ignore_index=True)
         out = out.sort_values(["frame", "track_id"], kind="stable").reset_index(drop=True)

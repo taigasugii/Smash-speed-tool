@@ -75,6 +75,26 @@ def test_two_rallies_are_fitted_separately():
     assert len(err) >= len(truth) - 2 and np.median(err) < 0.05
 
 
+def test_rallies_in_parallel_give_the_same_shots():
+    """ラリーを同時に当てはめても（``rally_threads``）、1 ラリーずつと同じショットになる（ROADMAP F3b）。"""
+    rng = np.random.default_rng(5)
+    rallies = [make_rally(rng, PHYS, n_shots=3, t_start=0.5)]
+    rallies.append(make_rally(rng, PHYS, n_shots=3, server_side="o", t_start=rallies[0].t_end + 5.0))
+    fps = 30.0
+    det = pd.concat([observe_rally(r, CAM, fps, PHYS, np.random.default_rng(k)) for k, r in enumerate(rallies)],
+                    ignore_index=True)
+    det["frame"] = np.arange(len(det))
+    hits = find_hits(det, fps, None, camera=CAM)
+    msgs: list[str] = []
+    kw = dict(ci=False, workers=2)
+    one = analyze_hits(det, hits, CAM, PHYS, CFG, progress=lambda m: None, rally_threads=1, **kw)
+    two = analyze_hits(det, hits, CAM, PHYS, CFG, progress=msgs.append, rally_threads=2, **kw)
+    assert len({s.rally_id for s in two}) == 2
+    assert [(s.t_hit_s, s.shot_type, s.speed_kmh, s.hit_x_m) for s in two] == \
+        [(s.t_hit_s, s.shot_type, s.speed_kmh, s.hit_x_m) for s in one]
+    assert sum("ラリー" in m for m in msgs) == 2 and any("済み 2/2" in m for m in msgs)
+
+
 def test_hitter_feet_from_players_are_used(monkeypatch):
     """選手の位置（``players.csv`` の形）を渡すと、打球ごとの打つ人の足元を ``fit_shots`` に渡す（ROADMAP D3c）。"""
     rally = make_rally(np.random.default_rng(2), PHYS, n_shots=3, t_start=0.5)

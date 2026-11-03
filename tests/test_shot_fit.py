@@ -194,3 +194,41 @@ def test_worker_pool_is_reused_with_single_thread_blas(monkeypatch):
     assert os.getenv("OPENBLAS_NUM_THREADS") is None
     # 1 つずつの計算は親のプロセスで行う
     assert shot_fit._parallel_map(os.getenv, args, 1) == [None] * 3
+
+
+def test_broken_pool_falls_back_one_by_one(monkeypatch):
+    """``worker_pool`` の組が壊れたら、新しい組を作らず 1 つずつ計算する（ラリーを並べて動かしているときのため。F3b）。"""
+    import os
+    from concurrent.futures.process import BrokenProcessPool
+
+    from smash_speed import shot_fit
+
+    class Broken:
+        def map(self, *a):
+            raise BrokenProcessPool("test")
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.setattr(shot_fit, "_shared_pool", [Broken(), 2])
+    assert shot_fit.pool_active()
+    args = [("OPENBLAS_NUM_THREADS",)] * 3
+    assert shot_fit._parallel_map(os.getenv, args, 2) == [None] * 3   # 親のプロセスで計算した
+    assert not shot_fit.pool_active() and shot_fit._shared_pool[0] is None
+    assert shot_fit._parallel_map(os.getenv, args, 2) == [None] * 3
+
+
+def test_parallel_grid_fits_match_initial_fit(cam):
+    """格子の平面ごとに並べた当てはめ（``fit_shots`` の 1 段目）は、``initial_fit`` を 1 本ずつ動かしたときと同じ（F3b）。"""
+    from smash_speed.shot_fit import initial_fit
+
+    rally = make_rally(np.random.default_rng(4), PHYS, n_shots=3)
+    det = observe_rally(rally, cam, 30.0, PHYS, np.random.default_rng(0))
+    segs = rally.segments
+    t_hits = [s.t_hit for s in segs]
+    feet = [None, segs[1].p0[:2] + 0.2, None]
+    opts = FitOptions(refine_plane=True, ci_method="none")
+    fits = fit_shots(det, t_hits, cam, PHYS, [s.side for s in segs], opts, n_rounds=0, refine_times=False,
+                     hitter_xy=feet, workers=2)
+    for k, s in enumerate(segs):
+        one = initial_fit(fits[k].obs, fits[k].t_hit, s.side, PHYS, opts, feet[k])
+        assert np.array_equal(fits[k].fit.theta, one.theta)
+        assert np.array_equal(fits[k].fit.plane.direction, one.plane.direction)
