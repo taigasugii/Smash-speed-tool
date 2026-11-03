@@ -26,8 +26,8 @@ App.views.shots = {
   // ---- 解析を始める
   renderStart(el, info, has) {
     const dur = App.meta.duration;
-    // 実動画（4K 30fps）の 20 秒で約 70 秒かかった（JOURNAL B5a3）
-    const minutes = (s) => Math.max(1, Math.round(s * 3.5 / 60));
+    // 選手なしで動画の長さの 1.4〜2.2 倍、練習の動画（打球が多くラリーが少ない）は約 3 倍（docs/speed.md、F3d）
+    const minutes = (s) => Math.max(1, Math.round(s * 2.5 / 60));
     const card = h(`<div class="card"><h2>動画の中のすべてのショットを、種類と初速つきで並べます</h2>
       <p class="desc">打った音とシャトルの向きが変わる所から打った瞬間を見つけ、1 本ずつ初速と種類（スマッシュ・クリア・ドロップなど）を出します。
         手順 2 の<b>コートの合わせ込みをそのまま使う</b>ので、動画の途中でカメラを動かしていないことが前提です。</p>
@@ -48,9 +48,9 @@ App.views.shots = {
       $$("#rng button", card).forEach((b) => b.classList.toggle("on", (b.dataset.v === "part") === part));
       $("#part", card).classList.toggle("hidden", !part);
       const len = part ? Math.max(0, +$("#s1", card).value - +$("#s0", card).value) : dur;
-      // 選手の検出は 4K 30fps の 20 秒で約 20 秒（GPU。JOURNAL D1a）
-      const extra = $("#players", card).checked ? len : 0;
-      $("#eta", card).textContent = `目安 約 ${minutes(len + extra / 3.5)} 分（動画 ${fmt(len, 0)} 秒）。解析中もほかの画面は使えます。`;
+      // 選手の検出は 4K 30fps で動画の長さの約 0.4 倍（GPU。F3d）
+      const extra = $("#players", card).checked ? len * 0.5 : 0;
+      $("#eta", card).textContent = `目安 約 ${minutes(len + extra / 2.5)} 分（動画 ${fmt(len, 0)} 秒）。解析中もほかの画面は使えます。`;
     };
     $$("#rng button", card).forEach((b) => { b.onclick = () => { part = b.dataset.v === "part"; upd(); }; });
     $("#s0", card).oninput = upd;
