@@ -14,6 +14,30 @@
 
 ---
 
+## 2026-11-03 10:30 F3c シャトルの検出を速くする（済み。F3 は F3d が残る）
+- 選んだ理由：D1c の残りは PR #9 待ち、F1 は A2b の答え待ちなので、ROADMAP の次の F3c。
+- やったこと：
+  - 検出を段階ごとに測る道具（`.agent/tmp/f3c/prof.py`）。IMG_4397 全体で、読み込み（ffmpeg の縮小）だけなら 15 秒（動画の 0.13 倍）、
+    差分の候補 27 秒、残りの約 100 秒が候補をつないで軌道にする Python の計算（`link_tracks`・`merge_tracks`・`track_score`・`remove_outliers`）。
+    ROADMAP の「読み込みと差分のどちらが遅いか」は、どちらでもなく軌道づくりだった。
+  - `detection/baseline.py`（どれも結果を変えない）：`_Track.predict` を Python の数で（2×2 の回転だけは numpy が FMA を使っていて合わないので
+    numpy のまま。それ以外は 20 万通りで 1 ビットも同じ）、`merge_tracks` は同じ時刻に始まる軌道に同じ予測を使い始まりの速さは 1 回だけ、
+    `_dedupe_overlapping` は候補を共有する軌道とだけ比べる（`scores=` で計算済みのスコアを使う）、`track_score` は 1 本 1 回、
+    `_better` の残差はそのコマの間 1 本 1 回、x・y の 2 次式をまとめて 1 回の `np.polyfit`（`_polyfit_xy`。10 万通りで 1 ビットも同じ）、
+    表は最後に列ごとにまとめて書く、差分の候補は 4 スレッド（`CANDIDATE_THREADS`、コマの順に受け取る）。
+  - テスト 4 件：予測が numpy の式と同じ、重なりの整理がすべての組を比べたときと同じ、スレッド 1 つと 4 つで検出が同じ、`_polyfit_xy` が列ごとと同じ。
+  - `docs/speed.md` に F3c の節、README の目安（2 分の 4K で約 7〜8 分 → 約 6 分）、ROADMAP に F3d（全体を通して測る）を足した。
+- 結果（数字、前のコード `.agent/tmp/f3c/baseline_old.py` と同じコマで比べる `cmp.py`。読み込みを除く）：
+  - IMG_4397 全体 148 → 60 秒、IMG_5109 全体 21 → 10 秒、IMG_3391 0〜30 s 4.1 → 1.9 秒、IMG_5096 0〜30 s（240 fps・6014 コマ）90 → 40 秒、
+    IMG_4521 40〜70 s 41 → 18 秒。5 本とも出力の表はすべての行・列が同じ（`assert_frame_equal(check_exact=True)`）。
+  - `shot_list.detect_all`（読み込みから）で IMG_4397 全体 159 秒（F3a）→ 67 秒（動画の 0.59 倍）。
+  - 30 分の動画の見積もり：約 2 時間 → 約 1.5 時間（当てはめ 57 分・検出 18 分・選手 15 分）。全体を通しては測っていない。
+  - 検出の結果が同じなので `DETECTOR_VERSION` は上げていない（保存済みの検出はそのまま使える）。
+- 品質チェック：通った（合成 MAPE 30fps 3.688% / 240fps 4.193%、hitter_position 6.955% / 6.059%、check_hits 0.988 以上、check_hitter 0.18 m、
+  check_movement・check_rallies・check_shot_types 変わらず、実動画 4 本 最大のずれ 0.00%、check_shot_speeds 2.47%・1.73%。どれも前回と同じ。
+  テスト 1168 秒。件数の表示は前回と同じく「0 件通過」と出たが [OK]）。
+- 次にやること：F3d（全体を通して測る）。ほかは D1c の残り（PR #9 待ち）、F1（A2b の答え待ち）。
+
 ## 2026-11-03 08:55 F3b 当てはめを速くする（済み。F3 は途中）
 - 選んだ理由：D1c の残りは PR #9 待ち、F1 は A2b の答え待ちなので、ROADMAP の次の F3b。
 - やったこと：
