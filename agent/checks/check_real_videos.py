@@ -7,6 +7,10 @@
 - 基準の初速：基準を作った時点のコードで解析し直した値（``kmh``）。``ranking.csv`` の値は ``ranking_kmh`` に参考として残す
   （``ranking.csv`` は古いコードで作られたものがあり、今のコードとは手順が違うため）
 
+正しい初速（``real_videos_truth.json``、コマを見て決めたもの。作り方は ``agent/truth/README.md``）があれば、
+その誤差も出す（打った時刻の速さどうしと、解析の打った時刻での正しい軌道の速さとの差）。正しい初速の不確かさが大きい
+（30 fps では打った時刻の誤差だけで ±20〜110 km/h ある）ので、参考として出すだけで失敗にはしない。
+
 解析し直しは GUI の「詳しく解析する」（``batch.analyze_selected``）と同じ手順で、動画は ``.agent/config.json`` の
 ``videos_dir`` か、基準を作ったときの場所から探す。動画がない PC では「飛ばした」として通す。
 
@@ -33,6 +37,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
 BASELINE = Path(__file__).with_name("real_videos_baseline.json")
+TRUTH = Path(__file__).with_name("real_videos_truth.json")
 TOLERANCE = 0.03        # 基準の初速からこの割合以上ずれたら失敗
 
 
@@ -103,7 +108,14 @@ def rerun_video(entry: dict[str, Any], video: Path, cfg: dict[str, Any], work: P
                                   "audio": entry.get("audio")})
     with contextlib.redirect_stdout(io.StringIO()):      # 解析の「[注意]」は品質チェックの出力に混ぜない
         done = analyze_selected(work, cfg, overlay=False, progress=lambda s: None)
-    return {c.id: c.result or {} for c in done}
+    res = {}
+    for c in done:
+        r = dict(c.result or {})
+        fit = Path(r.get("dir", "")) / "fit_result.json"
+        if fit.is_file():       # 正しい初速と同じ時刻で比べるため、解析の打った時刻も返す
+            r["t_impact_s"] = json.loads(fit.read_text(encoding="utf-8")).get("t_ref_s")
+        res[c.id] = r
+    return res
 
 
 def rerun_all(todo: list[tuple[dict[str, Any], Path]], baseline: Path) -> dict[str, dict[int, dict[str, Any]]]:
@@ -142,6 +154,38 @@ def compare(entry: dict[str, Any], results: dict[int, dict[str, Any]]) -> list[d
     return rows
 
 
+def compare_truth(rows: list[dict[str, Any]], results: dict[str, dict[int, dict[str, Any]]],
+                  truth: dict[str, Any]) -> list[dict[str, Any]]:
+    """解析し直した初速と、コマを見て決めた正しい初速の差（参考）。"""
+    sys.path.insert(0, str(ROOT / "agent" / "truth"))
+    from true_speeds import speed_at
+
+    out = []
+    for ref in truth["smashes"]:
+        row = next((r for r in rows if r["video"] == ref["video"] and r["id"] == ref["id"]), None)
+        if row is None:
+            continue
+        t_imp = results.get(ref["video"], {}).get(ref["id"], {}).get("t_impact_s")
+        kmh = row["kmh"]
+        same = None if t_imp is None else round(speed_at(ref, t_imp), 1)
+        out.append({"video": ref["video"], "id": ref["id"], "true_kmh": ref["kmh"], "true_sigma_kmh": ref["sigma_kmh"],
+                    "kmh": kmh, "err_kmh": None if kmh is None else round(kmh - ref["kmh"], 1),
+                    "z": None if kmh is None else round((kmh - ref["kmh"]) / ref["sigma_kmh"], 2),
+                    "dt_hit_ms": None if t_imp is None else round((t_imp - ref["t_hit_s"]) * 1000, 1),
+                    "true_kmh_at_t": same, "err_same_t_kmh": None if same is None or kmh is None else round(kmh - same, 1),
+                    "sigma_same_t_kmh": ref["sigma_same_time_kmh"]})
+    return out
+
+
+def truth_summary(tr: list[dict[str, Any]]) -> str:
+    z = [abs(r["z"]) for r in tr if r["z"] is not None]
+    e = [abs(r["err_same_t_kmh"]) / r["true_kmh_at_t"] for r in tr if r["err_same_t_kmh"] is not None]
+    if not z:
+        return ""
+    return (f"。正しい初速との差（参考、{len(z)} 本）：|差|/σ の中央値 {float(pd.Series(z).median()):.2f}、2σ を超えたもの "
+            f"{sum(v > 2 for v in z)} 本" + (f"、同じ時刻の速さの差の中央値 {float(pd.Series(e).median()) * 100:.0f}%" if e else ""))
+
+
 def run(ctx: dict[str, Any]) -> dict[str, Any]:
     if not BASELINE.exists():
         return {"ok": True, "skipped": True, "summary": "実動画：基準がないので飛ばしました"}
@@ -158,14 +202,15 @@ def run(ctx: dict[str, Any]) -> dict[str, Any]:
     for e, _ in todo:
         rows += compare(e, results[e["name"]])
     bad = [r for r in rows if not r["ok"]]
+    truth = compare_truth(rows, results, json.loads(TRUTH.read_text(encoding="utf-8"))) if TRUTH.exists() else []
     devs = [abs(r["dev_pct"]) for r in rows if r["dev_pct"] is not None]
     summary = (f"実動画 {len(todo)} 本・{len(rows)} 本のスマッシュ：最大のずれ {max(devs, default=0):.2f}%"
                + (f"、3% を超えたもの {len(bad)} 本（" + "、".join(
                    f"{r['video']} #{r['id']} {r['base_kmh']}→{r['kmh'] if r['kmh'] is not None else '解析できず'}"
                    for r in bad) + "）" if bad else "")
-               + (f"（動画がなく飛ばした：{'、'.join(missing)}）" if missing else ""))
+               + (f"（動画がなく飛ばした：{'、'.join(missing)}）" if missing else "") + truth_summary(truth))
     return {"ok": not bad, "summary": summary, "metrics": {"rows": rows, "max_dev_pct": max(devs, default=0.0),
-                                                           "missing": missing}}
+                                                           "missing": missing, "truth": truth}}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -215,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
     for row in r.get("metrics", {}).get("rows", []):
         print(f"  {row['video']} #{row['id']} {row['t_onset']:.1f}s：基準 {row['base_kmh']} → {row['kmh']} km/h"
               f"（{row['dev_pct']}%）{'' if row['ok'] else '  ← NG ' + (row['error'] or '')}")
+    for tr in r.get("metrics", {}).get("truth", []):
+        print(f"  正しい初速 {tr['video']} #{tr['id']}：{tr['true_kmh']} ± {tr['true_sigma_kmh']} → 解析 {tr['kmh']} km/h"
+              f"（差 {tr['err_kmh']}、{tr['z']}σ）／解析の打った時刻 {tr['dt_hit_ms']} ms ずれ、その時刻の正しい速さ "
+              f"{tr['true_kmh_at_t']} km/h との差 {tr['err_same_t_kmh']}（±{tr['sigma_same_t_kmh']}）")
     print(f"[{'飛ばした' if r.get('skipped') else 'OK' if r['ok'] else 'NG'}] {r['summary']}（{time.time() - t:.0f} 秒）")
     return 0 if r["ok"] else 1
 

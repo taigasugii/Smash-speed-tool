@@ -1,0 +1,437 @@
+{
+ "created": "2026-11-04 03:10:48",
+ "source": "agent/truth/smash_points.json",
+ "tool": "agent/truth/true_speeds.py",
+ "sigma": "1σ（当てはめ・終端速度・打った時刻・打つ人の点の 2 乗和）",
+ "smashes": [
+  {
+   "video": "IMG_5096",
+   "id": 1,
+   "t_hit_s": 8.181,
+   "t_hit_sigma_s": 0.003,
+   "kmh": 244.0,
+   "sigma_kmh": 22.7,
+   "sigma_parts_kmh": {
+    "fit": 5.6,
+    "terminal_velocity": 19.1,
+    "hit_time": 10.8,
+    "hitter_point": 1.0
+   },
+   "sigma_same_time_kmh": 20.0,
+   "hit_point_m": [
+    -6.09,
+    -1.41,
+    2.55
+   ],
+   "state": {
+    "t_s": 8.181,
+    "p0_m": [
+     -6.0855,
+     -1.4124,
+     2.546
+    ],
+    "v0_mps": [
+     67.5608,
+     -4.5003,
+     -3.1804
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 126,
+   "rms_px": 0.69,
+   "fps": 237,
+   "method": "240fps: shuttle checked by eye in every frame (detector/tracker marks, kept only where the mark sat on the shuttle); hit frame by eye (racket covers the shuttle between 1931 and 1932); hitter floor point = between take-off and landing feet; end = receiver's racket at frame 2063 above the feet line",
+   "note": "奥の人が 8.74 s に打ち返した（着地していない）"
+  },
+  {
+   "video": "IMG_5096",
+   "id": 3,
+   "t_hit_s": 14.735,
+   "t_hit_sigma_s": 0.003,
+   "kmh": 297.8,
+   "sigma_kmh": 26.3,
+   "sigma_parts_kmh": {
+    "fit": 10.1,
+    "terminal_velocity": 16.8,
+    "hit_time": 16.1,
+    "hitter_point": 6.6
+   },
+   "sigma_same_time_kmh": 20.7,
+   "hit_point_m": [
+    -4.34,
+    -0.48,
+    2.57
+   ],
+   "state": {
+    "t_s": 14.735,
+    "p0_m": [
+     -4.3368,
+     -0.48,
+     2.5745
+    ],
+    "v0_mps": [
+     82.1224,
+     -6.525,
+     -7.3568
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 94,
+   "rms_px": 0.5,
+   "fps": 237,
+   "method": "240fps: shuttle checked by eye in every 5th frame sheet and spot-checked per frame; hit frame by eye; hitter floor point between the feet before/after the hit; end = receiver's racket in front of the feet line",
+   "note": "奥の人が 15.18 s に打ち返した"
+  },
+  {
+   "video": "IMG_5096",
+   "id": 4,
+   "t_hit_s": 18.811,
+   "t_hit_sigma_s": 0.003,
+   "kmh": 347.3,
+   "sigma_kmh": 38.5,
+   "sigma_parts_kmh": {
+    "fit": 15.4,
+    "terminal_velocity": 25.0,
+    "hit_time": 21.9,
+    "hitter_point": 11.6
+   },
+   "sigma_same_time_kmh": 31.6,
+   "hit_point_m": [
+    -3.88,
+    -1.5,
+    3.14
+   ],
+   "state": {
+    "t_s": 18.811,
+    "p0_m": [
+     -3.8828,
+     -1.5047,
+     3.1352
+    ],
+    "v0_mps": [
+     95.0412,
+     5.3198,
+     -15.6143
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 72,
+   "rms_px": 0.52,
+   "fps": 237,
+   "method": "240fps: shuttle checked by eye in every 5th frame sheet and spot-checked per frame; hit frame by eye; hitter floor point between the feet before/after the hit; end = receiver's racket in front of the feet line; jump smash: hitter floor point = under the body mid-jump (between take-off and landing feet)",
+   "note": "打ったのは 18.81 s（ラケットが当たるコマ 4450〜4451）。基準の 18.70 s の候補は打つ前の手を追っている。奥の人が 19.19 s に打ち返した"
+  },
+  {
+   "video": "IMG_3391",
+   "id": 1,
+   "t_hit_s": 2.1298,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 457.7,
+   "sigma_kmh": 128.9,
+   "sigma_parts_kmh": {
+    "fit": 29.3,
+    "terminal_velocity": 73.6,
+    "hit_time": 101.7,
+    "hitter_point": 1.1
+   },
+   "sigma_same_time_kmh": 79.2,
+   "hit_point_m": [
+    -6.31,
+    -1.39,
+    3.01
+   ],
+   "state": {
+    "t_s": 2.1298,
+    "p0_m": [
+     -6.315,
+     -1.393,
+     3.0093
+    ],
+    "v0_mps": [
+     125.8951,
+     -0.7855,
+     -17.7455
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 10,
+   "rms_px": 1.56,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point midway between the take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "ジャンプして打った。奥の人が 2.60 s に打ち返した"
+  },
+  {
+   "video": "IMG_3391",
+   "id": 2,
+   "t_hit_s": 6.7421,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 333.7,
+   "sigma_kmh": 83.2,
+   "sigma_parts_kmh": {
+    "fit": 28.5,
+    "terminal_velocity": 54.0,
+    "hit_time": 54.0,
+    "hitter_point": 16.4
+   },
+   "sigma_same_time_kmh": 63.3,
+   "hit_point_m": [
+    -5.81,
+    -2.27,
+    2.82
+   ],
+   "state": {
+    "t_s": 6.7421,
+    "p0_m": [
+     -5.8052,
+     -2.2697,
+     2.8216
+    ],
+    "v0_mps": [
+     90.8119,
+     13.0761,
+     -13.2153
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 10,
+   "rms_px": 1.74,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point midway between the take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "ジャンプして打った。奥の人が 7.13 s に打ち返した"
+  },
+  {
+   "video": "IMG_3391",
+   "id": 5,
+   "t_hit_s": 11.0627,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 404.8,
+   "sigma_kmh": 144.2,
+   "sigma_parts_kmh": {
+    "fit": 82.1,
+    "terminal_velocity": 38.9,
+    "hit_time": 79.5,
+    "hitter_point": 78.9
+   },
+   "sigma_same_time_kmh": 120.4,
+   "hit_point_m": [
+    -5.27,
+    -0.36,
+    3.61
+   ],
+   "state": {
+    "t_s": 11.0627,
+    "p0_m": [
+     -5.2702,
+     -0.3615,
+     3.6085
+    ],
+    "v0_mps": [
+     106.9779,
+     -11.7904,
+     -32.5219
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 4,
+   "rms_px": 3.4,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point midway between the take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "ジャンプして打った。見えるのは 4 コマだけ"
+  },
+  {
+   "video": "IMG_4397",
+   "id": 53,
+   "t_hit_s": 91.1801,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 428.5,
+   "sigma_kmh": 121.1,
+   "sigma_parts_kmh": {
+    "fit": 35.8,
+    "terminal_velocity": 67.8,
+    "hit_time": 89.1,
+    "hitter_point": 28.9
+   },
+   "sigma_same_time_kmh": 82.0,
+   "hit_point_m": [
+    -5.09,
+    0.9,
+    2.8
+   ],
+   "state": {
+    "t_s": 91.1801,
+    "p0_m": [
+     -5.0932,
+     0.9049,
+     2.8048
+    ],
+    "v0_mps": [
+     116.2226,
+     -20.6427,
+     -15.2533
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 8,
+   "rms_px": 1.3,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point under the body between take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "奥の人が 91.43 s に打ち返した"
+  },
+  {
+   "video": "IMG_4397",
+   "id": 50,
+   "t_hit_s": 82.1275,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 304.1,
+   "sigma_kmh": 73.5,
+   "sigma_parts_kmh": {
+    "fit": 21.0,
+    "terminal_velocity": 54.0,
+    "hit_time": 44.9,
+    "hitter_point": 5.4
+   },
+   "sigma_same_time_kmh": 58.2,
+   "hit_point_m": [
+    -5.98,
+    -0.46,
+    2.55
+   ],
+   "state": {
+    "t_s": 82.1275,
+    "p0_m": [
+     -5.9758,
+     -0.4576,
+     2.5471
+    ],
+    "v0_mps": [
+     84.2755,
+     -0.2135,
+     -5.7268
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 13,
+   "rms_px": 0.9,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point under the body between take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "打つ人の足は画面の左の端で一部しか見えない。奥の人が 82.57 s に打ち返した"
+  },
+  {
+   "video": "IMG_4397",
+   "id": 22,
+   "t_hit_s": 27.613,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 325.1,
+   "sigma_kmh": 70.2,
+   "sigma_parts_kmh": {
+    "fit": 19.2,
+    "terminal_velocity": 43.8,
+    "hit_time": 51.3,
+    "hitter_point": 0.4
+   },
+   "sigma_same_time_kmh": 47.9,
+   "hit_point_m": [
+    -5.78,
+    -0.74,
+    2.69
+   ],
+   "state": {
+    "t_s": 27.613,
+    "p0_m": [
+     -5.7833,
+     -0.7415,
+     2.6891
+    ],
+    "v0_mps": [
+     90.0189,
+     2.8534,
+     -6.7117
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 13,
+   "rms_px": 0.88,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point under the body between take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "奥の人が 28.06 s に打ち返した"
+  },
+  {
+   "video": "IMG_4397",
+   "id": 60,
+   "t_hit_s": 104.1198,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 218.9,
+   "sigma_kmh": 38.7,
+   "sigma_parts_kmh": {
+    "fit": 8.0,
+    "terminal_velocity": 29.6,
+    "hit_time": 23.2,
+    "hitter_point": 3.7
+   },
+   "sigma_same_time_kmh": 30.9,
+   "hit_point_m": [
+    -5.35,
+    -1.97,
+    2.42
+   ],
+   "state": {
+    "t_s": 104.1198,
+    "p0_m": [
+     -5.351,
+     -1.9657,
+     2.4218
+    ],
+    "v0_mps": [
+     60.7313,
+     -1.2594,
+     -2.4174
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 15,
+   "rms_px": 1.2,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point under the body between take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "奥の人が 104.50 s に打ち返した"
+  },
+  {
+   "video": "IMG_4397",
+   "id": 55,
+   "t_hit_s": 94.88,
+   "t_hit_sigma_s": 0.008,
+   "kmh": 335.3,
+   "sigma_kmh": 100.4,
+   "sigma_parts_kmh": {
+    "fit": 23.0,
+    "terminal_velocity": 69.0,
+    "hit_time": 54.5,
+    "hitter_point": 42.6
+   },
+   "sigma_same_time_kmh": 84.3,
+   "hit_point_m": [
+    -5.93,
+    -2.14,
+    2.76
+   ],
+   "state": {
+    "t_s": 94.88,
+    "p0_m": [
+     -5.9277,
+     -2.1438,
+     2.7566
+    ],
+    "v0_mps": [
+     91.2003,
+     10.9585,
+     -15.3684
+    ],
+    "terminal_velocity_mps": 6.7
+   },
+   "n_points": 16,
+   "rms_px": 1.7,
+   "fps": 30,
+   "method": "30fps: shuttle streak centres checked by eye in every frame (detector/tracker marks kept only where they sat on the streak); hit time = hit sound onset minus sound travel time; hitter floor point under the body between take-off and landing feet; end = receiver's racket/hand above the receiver's feet line",
+   "note": "ジャンプして前へ跳びながら打った（踏み切り x≈−5.1 m、着地 x≈−4.6〜−3.7 m）。奥の人の足元に落ちた（95.44 s、x≈5.0 m）"
+  }
+ ]
+}
