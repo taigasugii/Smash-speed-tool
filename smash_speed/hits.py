@@ -23,6 +23,18 @@
 カメラで投影した向き）と比べた票と、「1 ラリーの中ではふつう交互」という決まりから、いちばんありそうな並びを選ぶ。
 カメラがなければ打った側は空欄。
 
+選手の位置（``players.csv``。D1）があれば、打った時刻のシャトルから各側の選手の枠までの距離（``player_reach``）を使う。
+
+- どちらの選手にも届かない所（枠の高さの ``max_reach`` 倍より遠い）の打球は捨てる（飛んでいる途中の向きの変化・
+  ラリーの間に転がるシャトル・隣のコートのシャトルなど）。
+- 片方の選手だけが届く所に ``same_reach_s`` より短い間に続けて出た 2 本は、同じ打球として 1 本にする。
+- 近い方の選手を打った側の票に足す。
+- 側を決めた後、同じ側が ``same_side_s`` より短い間に続けて打ったと出た 2 本は、確かでない方を捨てる
+  （相手が打ち返す間がない。選手の位置がなくても行う）。
+
+練習の動画 3 本と IMG_4397 80〜100 s（コマで決めた正解 70 本）で、再現率 0.943 → 0.929・適合率 0.611 → 0.833・
+打った側 57/66 → 63/65（``agent/checks/check_real_hits.py``）。
+
 ``python -m smash_speed.hits --bench`` で、合成ラリー（``synth_rally``）での再現率・適合率を出す。
 """
 
@@ -268,7 +280,8 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
               min_track_score: float = 1.2, min_audio_strength: float = 30.0, quiet_window_s: float = 0.1,
               rally_window_s: float = 1.0,
               rally_gap_s: float = 3.0, min_lag_pairs: int = 3, lag_tol_s: float = 0.03, weak_scale: float = 0.8,
-              **break_kw) -> list[Hit]:
+              players: pd.DataFrame | None = None, max_reach: float = 0.8, reach_window_s: float = 0.1,
+              same_side_s: float = 0.6, same_reach_s: float = 0.3, **break_kw) -> list[Hit]:
     """打球の時刻と打った側を出す。
 
     Args:
@@ -286,6 +299,15 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
         min_lag_pairs: 音の遅れを見積もるのに要る、音と軌道の両方がある打球の数（足りなければ遅れは 0）
         lag_tol_s: 遅れを引いた音の時刻と軌道の時刻がこれより離れていたら、軌道の時刻を使う [s]
         weak_scale: 軌道の変化と組にならなかった打球音の近くでは、しきい値をこの倍まで下げて変化を探す
+        players: 選手の位置（``players.csv`` の形。列 ``t, side, x0, y0, x1, y1``）。あれば、打った時刻にシャトルが
+            どちらの選手の枠からも ``max_reach`` より離れている打球を捨て、近い方の選手を打った側の票に足す
+        max_reach: 選手の枠からシャトルまでの距離の上限（枠の高さを単位。ラケットを伸ばして届く所）
+        reach_window_s: 打った時刻の前後これだけの間のシャトルの点で、選手の枠までの距離を測る [s]
+        same_side_s: 同じ側が続けて打ったと出た 2 本の間がこれより短ければ（相手が打ち返す間がない）、
+            確かでない方を捨てる [s]。0 なら捨てない
+        same_reach_s: 片方の側の選手だけが届く所に続けて出た 2 本の間がこれより短ければ、同じ打球として
+            確かでない方を捨てる [s]（相手の打球なら、シャトルがネットを越えるのに最短でもこれくらいかかる。
+            選手の近くの別の物の軌道で届く側を間違えることがあるので、``same_side_s`` より短くする）
         **break_kw: ``track_breaks`` に渡す
 
     Returns:
@@ -360,8 +382,22 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
             if h.method == "audio+track" and h.score >= 1.0 and abs(h.t - h.t_track) > lag_tol_s:
                 h.t, h.method, h.t_audio = h.t_track, "track", None
     hits.sort(key=lambda h: h.t)
+    reach = None
+    if (players is not None and det is not None and len(players)
+            and {"t", "side", "x0", "y0", "x1", "y1"} <= set(players.columns)):
+        # 打った時刻にシャトルがどちらの選手にも届かない所にあれば打球ではない（飛んでいる途中の向きの変化・
+        # 隣のコートのシャトルなど）。シャトルが見えていなければ決められないので残す
+        reach = player_reach(hits, det, players, reach_window_s)
+        keep = [i for i, r in enumerate(reach) if not r or min(r.values()) <= max_reach]
+        hits, reach = [hits[i] for i in keep], [reach[i] for i in keep]
+        if same_side_s > 0:
+            # 同じ選手だけが届く所に続けて出た 2 本は同じ打球（交互の決まりで側を割り振る前に除く）
+            hits, reach = _drop_same_side(hits, reach, same_reach_s, [_reacher(r, max_reach) for r in reach])
     if camera is not None and det is not None:
-        assign_sides(hits, det, camera, rally_gap_s)
+        assign_sides(hits, det, camera, rally_gap_s, reach=reach)
+        if same_side_s > 0:
+            hits, reach = _drop_same_side(hits, reach, same_side_s)
+            assign_sides(hits, det, camera, rally_gap_s, reach=reach)
     return hits
 
 
@@ -392,14 +428,93 @@ def side_votes(hits: list[Hit], det: pd.DataFrame, camera: Camera) -> list[float
     return votes
 
 
+def player_reach(hits: list[Hit], det: pd.DataFrame, players: pd.DataFrame, window_s: float = 0.1
+                 ) -> list[dict[str, float]]:
+    """打球ごとの、打った時刻の前後 ``window_s`` のシャトルの点から各側の選手の枠までの、画像の上のいちばん近い距離
+    （その選手の枠の高さを単位。枠の中なら 0）。{側: 距離}。シャトルが見えていない・選手がいない側は入れない。
+
+    枠の高さを単位にすると、カメラからの遠さによらず「ラケットを伸ばして届くか」を比べられる
+    （1.7 m の人の枠で、頭の上 0.5・横 0.9 ほどまで届く）。ダブルスでは 1 側の 2 人のうち近い方。
+    """
+    t, uv = _visible_points(det)
+    pl = players.dropna(subset=["x0", "y0", "x1", "y1"])
+    groups = {s: g.sort_values("t") for s, g in pl.groupby("side") if s in ("h", "o")}
+    out = []
+    for h in hits:
+        m = np.abs(t - h.t) <= window_s
+        r: dict[str, float] = {}
+        if m.any():
+            p = uv[m]
+            for s, g in groups.items():
+                # 打った時刻にいちばん近いコマの枠（1 側に 2 人いればそれぞれ）
+                gt = g.t.to_numpy(float)
+                near = g[np.abs(gt - h.t) <= max(window_s, 0.2)]
+                if near.empty:
+                    continue
+                near = near.loc[(near.t - h.t).abs().groupby(near.player).idxmin()]
+                best = np.inf
+                for b in near.itertuples():
+                    hh = max(float(b.y1 - b.y0), 1.0)
+                    du = np.maximum(0.0, np.maximum(b.x0 - p[:, 0], p[:, 0] - b.x1))
+                    dv = np.maximum(0.0, np.maximum(b.y0 - p[:, 1], p[:, 1] - b.y1))
+                    best = min(best, float(np.min(np.hypot(du, dv))) / hh)
+                r[s] = best
+        out.append(r)
+    return out
+
+
+def _reach_vote(r: dict[str, float], scale: float = 0.3) -> float:
+    """選手の枠までの距離から「h 側が打った」票（+）・「o 側が打った」票（−）。両側が測れなければ 0。"""
+    if "h" not in r or "o" not in r:
+        return 0.0
+    return float(np.tanh((r["o"] - r["h"]) / scale))
+
+
+def _reacher(r: dict[str, float], max_reach: float) -> str:
+    """シャトルに届くのが片方の側の選手だけならその側。両方・どちらも届かない・測れなければ空。"""
+    near = [s for s, d in r.items() if d <= max_reach]
+    return near[0] if len(near) == 1 and len(r) == 2 else ""
+
+
+def _drop_same_side(hits: list[Hit], reach: list[dict[str, float]] | None, max_dt_s: float,
+                    sides: list[str] | None = None) -> tuple[list[Hit], list[dict[str, float]] | None]:
+    """同じ側が ``max_dt_s`` より短い間に続けて打ったと出た 2 本のうち、確かでない方を捨てる。
+
+    相手が打ち返すには、シャトルがネットを 2 回越える間（速いスマッシュと返球でも 0.6 秒ほど）が要るので、
+    この間に同じ側が 2 回打つことはない（同じ打球を軌道と音で 2 度拾った・打つ前の手前の動きを拾った、など）。
+    打球音のある方、なければ選手に近い方、それも同じなら軌道の変化の大きい方を残す。
+    側は ``sides``（なければ ``Hit.side``）を使う。
+    """
+    side = sides if sides is not None else [h.side for h in hits]
+
+    def rank(i: int) -> tuple[float, float, float]:
+        r = reach[i] if reach else {}
+        d = r.get(side[i], np.inf) if r else np.inf
+        return (hits[i].audio_strength > 0, -d, hits[i].score)
+
+    keep = list(range(len(hits)))
+    changed = True
+    while changed:
+        changed = False
+        for a, b in zip(keep[:-1], keep[1:]):
+            if side[a] and side[a] == side[b] and hits[b].t - hits[a].t < max_dt_s:
+                keep.remove(b if rank(a) >= rank(b) else a)
+                changed = True
+                break
+    return [hits[i] for i in keep], ([reach[i] for i in keep] if reach is not None else None)
+
+
 def assign_sides(hits: list[Hit], det: pd.DataFrame, camera: Camera, rally_gap_s: float = 3.0,
-                 p_alternate: float = 0.9) -> None:
+                 p_alternate: float = 0.9, reach: list[dict[str, float]] | None = None) -> None:
     """``hits`` の打った側を決める。
 
     1 ラリーの中では打つ側はふつう交互（打球の見落とし・見つけすぎがあると同じ側が続く）なので、
     「交互になる確率 ``p_alternate``」と各打球の票から、いちばんありそうな並びを動的計画法で選ぶ。
+    ``reach``（``player_reach``）があれば、打った時刻にシャトルに近い方の選手の票を足す。
     """
     votes = side_votes(hits, det, camera)
+    if reach is not None:
+        votes = [float(np.clip(v + _reach_vote(r), -1.0, 1.0)) for v, r in zip(votes, reach)]
     start = 0
     for i in range(1, len(hits) + 1):
         if i < len(hits) and hits[i].t - hits[i - 1].t <= rally_gap_s:

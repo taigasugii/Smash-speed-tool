@@ -75,6 +75,8 @@ class ShotListOptions:
     players: bool = False             # 選手の位置も出す（``players.analyze_players``。人の検出のモデルを使うので遅くなる）
     player_options: PlayerOptions | None = None
     hitter_prior: bool = True         # 選手の位置があれば、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
+    hit_players: bool = True          # 選手の位置があれば、打球を見つけるのにも使う（``find_hits`` の ``players``。
+                                      # どちらの選手にも届かない所の打球を捨て、近い方を打った側にする）
 
 
 # =============================================================================
@@ -128,6 +130,9 @@ class TrackFilter:
     max_image_speed: float = 1.2      # 画像の上の速さ（1 コマごとの移動の中央値）の上限 [画像の幅/s]。
                                       # 超えるものは、別々の物の間を飛び移った軌道（実動画で 1.5〜6）
     min_extent: float = 0.03          # 軌道の点の広がり（外接する四角の対角線）[画像の幅]。止まっている物を落とす
+    min_image_speed: float = 0.1      # 画像の上の速さ（1 コマごとの移動の中央値）の下限 [画像の幅/s]。ゆっくり動く物
+                                      # （手に持って歩くシャトル・人の動き。IMG_4397 の 97〜99.5 s で 0.07〜0.08）を落とす。
+                                      # 飛んでいるシャトルは、ゆっくり落ちる軌道でも 0.15 ほど以上（練習の動画 3 本と IMG_4397）
     min_inside: float = 0.8           # 視線がコートの空間を通る点の割合
     min_speed_mps: float = 3.0        # コートの空間のいちばん奥にあるとしたときの速さの上限 [m/s] がこれより遅い
                                       # 軌道を落とす（人の歩き・手足の動き。飛んでいるシャトルは頂点の近くでも 3 m/s 以上）
@@ -183,7 +188,8 @@ def track_table(det: pd.DataFrame, camera: Camera, cfg: dict[str, Any], flt: Tra
     tab = pd.DataFrame(rows, columns=["track_id", "n", "t_start", "t_end", "duration_s", "image_speed", "extent",
                                       "inside", "speed_max_mps", "edge_start"])
     tab["keep"] = ((tab.n >= flt.min_points) & (tab.duration_s >= flt.min_duration_s)
-                   & (tab.image_speed <= flt.max_image_speed) & (tab.extent >= flt.min_extent)
+                   & (tab.image_speed <= flt.max_image_speed) & (tab.image_speed >= flt.min_image_speed)
+                   & (tab.extent >= flt.min_extent)
                    & (tab.inside >= flt.min_inside) & (tab.speed_max_mps >= flt.min_speed_mps))
     return tab
 
@@ -438,17 +444,19 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     progress(f"[進行] シャトルが見えたコマ {n_vis} / {len(det)}")
     lap("shuttle_tracks")
 
-    hits = find_hits(det, meta.capture_fps, onsets, camera=camera, rally_gap_s=o.rally_gap_s)
-    progress(f"[進行] 打球 {len(hits)} 本")
-    lap("hits")
-    workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
-    # 選手の位置は当てはめの前に出し、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
+    # 選手の位置は打球を見つける前に出し、打った時刻にシャトルに届く選手から打球と打った側を確かめる
+    # （``find_hits`` の ``players``）。当てはめでは打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     players_info = players = None
     if o.players:
         players_info = players_step(o, cfg, out, progress)
         if "error" not in players_info and (out / PLAYERS_FILE).exists():
             players = pd.read_csv(out / PLAYERS_FILE)
         lap("players")
+    hits = find_hits(det, meta.capture_fps, onsets, camera=camera, rally_gap_s=o.rally_gap_s,
+                     players=players if o.hit_players else None)
+    progress(f"[進行] 打球 {len(hits)} 本")
+    lap("hits")
+    workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
                          players=players if o.hitter_prior else None)
     lap("fit")
@@ -526,12 +534,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
     ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
+    ap.add_argument("--no-hit-players", action="store_true", help="打球を見つけるのに選手の位置を使わない")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
-                                         players=a.players, hitter_prior=not a.no_hitter_prior), cfg)
+                                         players=a.players, hitter_prior=not a.no_hitter_prior,
+                                         hit_players=not a.no_hit_players), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

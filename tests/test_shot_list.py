@@ -337,3 +337,18 @@ def test_players_step_does_not_stop_the_shot_list(tmp_path, monkeypatch):
     o = ShotListOptions(tmp_path / "v.mp4", tmp_path / "c.json", tmp_path, players=True)
     assert shot_list.players_step(o, CFG, tmp_path, msgs.append) == {"error": "ネットにつながりません"}
     assert any("選手の位置は出せませんでした" in m for m in msgs)
+
+
+def test_track_table_drops_a_slow_track_that_hardly_moves():
+    """1 秒ほど写っていても少ししか動かない物（手に持って歩くシャトルなど）は落とし、飛んでいるシャトルは残す。"""
+    t = np.arange(30) / 30.0
+    W = CAM.width
+    start = CAM.project(np.array([[-3.0, 0.0, 1.0]]))[0]
+    slow = _track(0, t, np.c_[start[0] + np.linspace(0, 0.05 * W, 30), np.full(30, start[1])])
+    fly = _track(1, t[:12] + 2.0, CAM.project(np.c_[np.linspace(-4, 0, 12), np.zeros(12), np.linspace(3, 2, 12)]))
+    det = pd.concat([slow, fly], ignore_index=True)
+    flt = TrackFilter(min_speed_mps=0.0)
+    tab = track_table(det, CAM, CFG, flt).set_index("track_id")
+    assert not tab.loc[0, "keep"] and tab.loc[1, "keep"]
+    flt.min_image_speed = 0.0
+    assert track_table(det, CAM, CFG, flt).keep.all()
