@@ -60,6 +60,18 @@ clear_01.mp4,612,10.200000,right_wrist,1043.5,402.0,2
 付け方の目安：200 コマは、ショット 20 本 × 10 コマ（構え・テイクバック・振り出し・インパクトの前後 3 コマ・フォロースルー）にすると、
 速く動いてぶれたコマも含まれる。関節は骨の中心（肩は肩峰ではなく腕の付け根の中心）に付ける。
 
+GUI の「関節・打点を付ける」（`smash_speed/pose_label.py`・`webapp/label_api.py`）で付けると、出力の場所の `pose_labels/joints.csv` に
+この形で書く（1 コマ 17 行。付けていない関節は visible = 0 で位置は空欄。同じ（動画, コマ）は付け直すと置き換える）。
+1 つの CSV に複数の動画が入るので、`load_labels(path, video)` で動画を選び、`pose pck` は推定の .npz の動画の名前（`estimate` が入れる）か
+`--video` で選ぶ。`video` は動画のファイルの名前（フォルダは含めない）。
+
+- 付けるコマ（`plan_frames`）：打点の時刻から −0.8 秒（構え）・−0.5 秒（テイクバック）・−0.25 秒と −0.1 秒（振り出し）・
+  打点の 1 コマ前・打点・1 コマ後・+0.1 秒と +0.25 秒（フォロースルー）・+0.45 秒（戻り）の 10 コマ。
+- 下書き：フォームの解析で推定したままの姿勢（`form/raw/*.npz`）にそのコマがあればそれを、なければ選んだモデルの結果を、
+  直すための出発点として出す。下書きのモデルの近くで手を止めると、そのモデルの PCK が高めに出る。どの下書きを使ったかを
+  `pose_labels/joints_prefill.csv`（`video,frame,prefill`。手だけなら空欄）に残すので、比べるときは下書きのモデルごとに PCK を分けて見るか、
+  下書きを使わないコマ・両方のモデルを交互に使ったコマを混ぜる。
+
 ```
 python -m smash_speed.pose estimate clear_01.mp4 --model rtmpose --start 10 --end 12 --out rtmpose.npz
 python -m smash_speed.pose estimate clear_01.mp4 --model mediapipe --start 10 --end 12 --out mediapipe.npz
@@ -82,6 +94,24 @@ python -m smash_speed.pose pck labels.csv rtmpose.npz mediapipe.npz
    `tests/test_form.py`）。手で付けた打点のコマから `calibrate_wrist_offset` で差の中央値を決めて使う。
 
 手で付けた打点と比べるには `impact_errors`（誤差の平均・中央値・最大を、秒とコマで出す）。
+
+### 手で付けた打点
+
+GUI の「関節・打点を付ける」→「打った瞬間のコマを付ける」で、ラケットがシャトルに当たったコマを付ける。出力の場所の
+`pose_labels/impacts.csv` に 1 行 1 スイングで書く（`pose_label.IMPACT_COLUMNS`）：
+
+```
+video,frame,t_s
+clear_01.mp4,612,10.200000
+```
+
+`frame` は動画のコマの番号、`t_s` はその実時間 [s]（動画の時刻。`pose estimate`・フォームの解析と同じ時刻）。同じ動画で 0.3 秒以内に
+付け直すと、同じスイングとして置き換える。当たったコマがはっきりしないときは、シャトルの向きが変わる直前のコマにする。
+
+`python -m smash_speed.pose_label impacts <impacts.csv> <出力の場所>` は、手の打点から 0.3 秒以内のフォームの解析のショット
+（`form_features.csv` の `t_impact_s`）と組にして `impact_errors` を出し、推定したままの姿勢（`form/raw/*.npz`）から解析と同じ決め方で
+手首の速さの最大の時刻を出し直して、手の打点との差の中央値（`calibrate_wrist_offset`）を `wrist_offset_s` の目安として出す。
+合成のスイングでは、手首の最大は打点の 0.03 秒前で、目安は +0.03 秒になる（`tests/test_pose_label.py`）。
 
 ### 切り出し・反転・正規化
 

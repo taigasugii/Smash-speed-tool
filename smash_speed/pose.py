@@ -375,16 +375,32 @@ def write_labels(path: str | Path, labels: Labels) -> Path:
     return path
 
 
-def load_labels(path: str | Path) -> Labels:
-    """``LABEL_COLUMNS`` の CSV を読む。書いていない関節は visible = 0。"""
+def label_videos(path: str | Path) -> list[str]:
+    """ラベルの CSV に入っている動画の名前。"""
+    with Path(path).open(encoding="utf-8-sig", newline="") as f:
+        return sorted({r.get("video") or "" for r in csv.DictReader(f)})
+
+
+def load_labels(path: str | Path, video: str | None = None) -> Labels:
+    """``LABEL_COLUMNS`` の CSV を読む。書いていない関節は visible = 0。
+
+    1 つの CSV に複数の動画があるとき（GUI の「関節・打点を付ける」で付けたもの）は、``video`` でどの動画かを選ぶ
+    （コマの番号は動画ごとなので、混ぜると別の動画のコマが重なる）。
+    """
+    if video is None:
+        vids = label_videos(path)
+        if len(vids) > 1:
+            raise ValueError(f"ラベルに複数の動画があります。どの動画か選んでください: {', '.join(vids)}")
     rows: dict[int, dict[str, Any]] = {}
-    video = ""
+    video_found = ""
     with Path(path).open(encoding="utf-8-sig", newline="") as f:
         for r in csv.DictReader(f):
+            if video is not None and (r.get("video") or "") != video:
+                continue
             k = int(r["frame"])
             d = rows.setdefault(k, {"t": float(r["t_s"]) if r.get("t_s") else np.nan,
                                     "xy": np.full((NUM_KEYPOINTS, 2), np.nan), "v": np.zeros(NUM_KEYPOINTS, int)})
-            video = r.get("video") or video
+            video_found = r.get("video") or video_found
             if r["joint"] not in KP:
                 raise ValueError(f"知らない関節の名前です: {r['joint']!r}（{', '.join(KEYPOINTS)}）")
             j = KP[r["joint"]]
@@ -393,8 +409,10 @@ def load_labels(path: str | Path) -> Labels:
                 d["xy"][j] = (float(r["x"]), float(r["y"]))
                 d["v"][j] = v
     frames = np.array(sorted(rows), int)
-    return Labels(t=np.array([rows[k]["t"] for k in frames]), xy=np.array([rows[k]["xy"] for k in frames]),
-                  visible=np.array([rows[k]["v"] for k in frames]), frames=frames, video=video)
+    return Labels(t=np.array([rows[k]["t"] for k in frames]),
+                  xy=np.array([rows[k]["xy"] for k in frames]).reshape(len(frames), NUM_KEYPOINTS, 2),
+                  visible=np.array([rows[k]["v"] for k in frames]).reshape(len(frames), NUM_KEYPOINTS), frames=frames,
+                  video=video_found)
 
 
 def torso_length(xy: np.ndarray) -> np.ndarray:
@@ -485,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("labels")
     c.add_argument("poses", nargs="+")
     c.add_argument("--alpha", type=float, default=0.2)
+    c.add_argument("--video", default=None,
+                   help="ラベルに複数の動画があるとき、比べる動画の名前（なければ推定の .npz に入っている動画の名前）")
     args = p.parse_args(argv)
 
     if args.cmd == "estimate":
@@ -498,10 +518,16 @@ def main(argv: list[str] | None = None) -> int:
         found = np.isfinite(seq.xy).all(axis=2).any(axis=1).mean() if len(seq) else 0.0
         print(f"{len(seq)} コマを推定しました（人が見つかったコマ {found:.0%}）: {args.out}")
         return 0
-    labels = load_labels(args.labels)
-    print(f"ラベル: {len(labels.t)} コマ")
+    vids = label_videos(args.labels)
     for path in args.poses:
         seq = PoseSequence.load(path)
+        video = args.video or (seq.meta.get("video") if len(vids) > 1 else None)
+        try:
+            labels = load_labels(args.labels, video)
+        except ValueError as e:
+            print(f"{Path(path).name}: {e}（--video で選べます）")
+            return 2
+        print(f"ラベル: {len(labels.t)} コマ" + (f"（{video}）" if video else ""))
         r = pck(seq, labels, alpha=args.alpha)
         val = "—" if r["pck"] is None else f"{r['pck']:.3f}"
         err = "—" if r["mean_error_px"] is None else f"{r['mean_error_px']:.1f} px"

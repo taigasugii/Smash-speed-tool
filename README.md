@@ -58,6 +58,8 @@
 左のメニューの「記録の推移」は、出力の場所にあるショットの一覧の結果をすべて集め、撮った日ごとの速さと種類の割合を出す
 （下の「セッションをまたいだ記録」。新しく解析したら「作り直す」を押す）。どちらも出力の場所の中のファイルだけを開く。
 
+「関節・打点を付ける」では、横から撮ったスイングの関節の位置と打った瞬間のコマを手で付ける（フォームの解析の答え合わせ用。下の「フォームの解析」）。
+
 ほかに「結果の一覧」（これまでの全結果と集計表）、「研究ツール」（正解ラベル付け・合成データ・疑似低 fps 動画・精度検証・TrackNetV3 の学習データ）、「設定」（保存先・上書き用の設定 YAML）がある。
 動画の上では、マウスホイールで拡大、右ドラッグ（またはスペース＋ドラッグ）で移動。クリックする画面ではカーソルの近くにルーペが出る。
 
@@ -890,6 +892,30 @@ python -m smash_speed.form_table out\clear_01_form --ref out\ref.npz --stature 1
 
 手で付けた関節の位置と比べるとき（どの姿勢推定のモデルを使うか決める）は `python -m smash_speed.pose pck labels.csv a.npz b.npz`。
 実際の動画・実際のモデルでの確かめはまだ（デスクトップで行う）。
+
+#### 関節・打点を手で付ける（GUI の「関節・打点を付ける」、`smash_speed/pose_label.py`）
+
+姿勢推定のモデルを決める（E1）・打点の見つけ方を確かめる（E1b）ための正解を、GUI で付ける。動画は「動画のフォルダ」
+（画面で選んだフォルダ → 開発エージェントの設定の `videos_dir` → 開いている動画のフォルダ の順。その 1 つ下のフォルダまで）の中だけから読み、
+付けた結果は出力の場所の `pose_labels/` に書く（形は `docs/pose_features.md` の「精度（PCK）」「手で付けた打点」）。
+
+- **関節を付ける**：右の「付けるコマ」に、スイングごとに 10 コマ（構え・テイクバック・振り出し 2・打点の前後 3・フォロースルー 2・戻り）が並ぶ
+  （スイングは、手で付けた打点・フォームの解析の結果・「打った音から探す」から）。17 の関節（鼻・目・耳・肩・肘・手首・腰・膝・足首）を
+  黄色い丸の順にクリックし、隠れている所は H（位置は推測）、写っていない所は X。点はドラッグで直せる。Ctrl+Z で元に戻す、F で左右を入れ替え、
+  Enter で保存して次のコマへ（← → でコマを移ると自動で保存）。「下書き」を選ぶと、フォームの解析の結果かモデルの関節が薄い点で出るので、直すだけでよい。
+  上に、付けたコマの数（目安 200）が出る。
+- **打った瞬間のコマを付ける**：スイングを選び、← → で 1 コマずつ（P でゆっくり再生）見て、ラケットがシャトルに当たったコマで Enter。
+
+```powershell
+# 付けた数
+python -m smash_speed.pose_label progress outputs\pose_labels\joints.csv
+# モデルを比べる（動画ごとに推定して、手の関節と PCK で比べる。CSV に複数の動画があれば、推定の .npz の動画の名前で選ぶ）
+python -m smash_speed.pose estimate clear_01.mp4 --model rtmpose --out out\rtmpose_clear_01.npz
+python -m smash_speed.pose estimate clear_01.mp4 --model mediapipe --out out\mediapipe_clear_01.npz
+python -m smash_speed.pose pck outputs\pose_labels\joints.csv out\rtmpose_clear_01.npz out\mediapipe_clear_01.npz
+# 打点の誤差（フォームの解析の結果と比べる）と、音がないときの差 wrist_offset_s の目安
+python -m smash_speed.pose_label impacts outputs\pose_labels\impacts.csv outputs
+```
 
 ## 実動画（iPhone 17, 4K 30fps）で試した結果
 

@@ -30,7 +30,7 @@ from smash_speed.config import PROJECT_ROOT, load_config
 from smash_speed.court import court_segments
 from smash_speed.geometry import floor_point
 from smash_speed.video_io import VideoMeta, probe, seek_read
-from smash_speed.webapp import agent, form_api
+from smash_speed.webapp import agent, form_api, label_api
 from smash_speed.webapp.remote import REMOTE
 
 APP_ID = "smash-speed-web"
@@ -1188,6 +1188,7 @@ def labels_save():
 
 # フォームを比べる画面（ROADMAP E4）
 form_api.install(app, out_root, lambda: S.state, start_task, python_exe, busy)
+label_api.install(app, out_root, lambda: S.state)
 
 
 # =============================================================================
