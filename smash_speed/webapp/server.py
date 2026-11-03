@@ -944,8 +944,8 @@ def _label_stats(labels: list, video: str) -> dict[str, Any]:
     from smash_speed.shot_labels import label_summary, video_key
 
     def clean(r: dict[str, Any]) -> dict[str, Any]:
-        a = r["rule_accuracy"]
-        return {**r, "rule_accuracy": round(float(a), 4) if np.isfinite(a) else None}
+        num = lambda a: round(float(a), 4) if np.isfinite(a) else None  # noqa: E731
+        return {**r, "rule_accuracy": num(r["rule_accuracy"]), "not_hit_rate": num(r["not_hit_rate"])}
 
     key = video_key(video)
     return {"all": clean(label_summary(labels)), "video": clean(label_summary([r for r in labels if r.video_name == key]))}
@@ -959,7 +959,7 @@ def shots_get():
     """
     from dataclasses import asdict
 
-    from smash_speed.shot_labels import LABELS_FILE, match_labels, read_labels
+    from smash_speed.shot_labels import LABELS_FILE, NOT_A_HIT, NOT_A_HIT_LABEL, match_labels, read_labels
     from smash_speed.shot_list import SHOT_LIST_FILE
     from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
 
@@ -977,8 +977,11 @@ def shots_get():
         r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
         r["truth"] = truth.get(k)
         rows.append(r)
-    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv")) if (Path(d) / f).exists()}
-    return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, files=files,
+    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv"), ("report", "report.html"))
+             if (Path(d) / f).exists()}
+    # 正しい種類として選べるのは、labels の 8 種類（unknown のほか）と「打球ではない」（not_hit）
+    return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,
+              files=files,
               label_stats=_label_stats(labels, info.get("video", "")))
 
 
@@ -1006,6 +1009,63 @@ def shot_label():
     except ValueError as e:
         return err(str(e))
     return ok(id=k, truth=label, label_stats=_label_stats(labels, video))
+
+
+# =============================================================================
+# レポート・記録の推移のページ（rally_report・history が書いた HTML）
+# =============================================================================
+def _under_out_root(p: str | Path) -> Path | None:
+    """出力の場所の中にあるファイルなら、その場所（``..`` やリンクで外に出るものは None）。"""
+    root = out_root().resolve()
+    try:
+        q = Path(p).resolve()
+    except (OSError, RuntimeError):
+        return None
+    return q if q.is_relative_to(root) and q.is_file() else None
+
+
+def _page(path: Path):
+    resp = send_file(path, mimetype="text/html", conditional=False)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/report/shots")
+def report_shots():
+    """いま開いているショットの一覧の ``report.html``。古い解析でまだなければ、その場で書く。"""
+    from smash_speed.rally_report import REPORT_FILE, write_report
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOTS_FILE
+
+    d = _shots_dir()
+    if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
+        abort(404)
+    if not (Path(d) / REPORT_FILE).exists() and _under_out_root(Path(d) / SHOTS_FILE):
+        write_report(d, S.cfg().get("court"))
+    p = _under_out_root(Path(d) / REPORT_FILE)
+    if p is None:
+        abort(404)
+    return _page(p)
+
+
+@app.post("/api/history")
+def history_make():
+    """出力の場所の下のショットの一覧をすべて集めて、``history.html``・``history.csv`` を書き直す。"""
+    from smash_speed.history import write_history
+
+    rows, csv_path, _ = write_history(out_root())
+    return ok(n_days=len(rows), n_videos=sum(r.get("n_videos") or 0 for r in rows), csv=str(csv_path))
+
+
+@app.get("/report/history")
+def report_history():
+    """``/api/history`` で書いた ``history.html``（出力の場所の直下）。"""
+    from smash_speed.history import HISTORY_HTML
+
+    p = _under_out_root(out_root() / HISTORY_HTML)
+    if p is None:
+        abort(404)
+    return _page(p)
 
 
 @app.get("/api/shot_view")

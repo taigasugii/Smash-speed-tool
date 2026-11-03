@@ -49,6 +49,7 @@ const NAV = [
   { id: "shots", num: "▤", label: "ショットの一覧", sub: "すべての球の種類と速さ" },
   { id: "form", num: "人", label: "フォームを比べる", sub: "横から撮ったスイング" },
   { id: "list", num: "≡", label: "結果の一覧", sub: "これまでの解析" },
+  { id: "history", num: "↗", label: "記録の推移", sub: "日ごとの速さと種類" },
   { id: "tools", num: "⚗", label: "研究ツール", sub: "ラベル付け・検証など" },
   { id: "agent", num: "🤖", label: "開発エージェント", sub: "自動で機能を増やす" },
   { id: "settings", num: "⚙", label: "設定", sub: "出力先・詳細設定" },
