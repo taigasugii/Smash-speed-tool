@@ -16,11 +16,15 @@ RTMPose はもともと 17 点、MediaPipe Pose は 33 点のうち同じ所の 
 
 | モデル | ライセンス | 重み | GPU | 入れ方 |
 |---|---|---|---|---|
-| RTMPose（rtmlib） | Apache 2.0（rtmlib・RTMPose のコード） | `balanced` で人の検出（YOLOX-m）と関節（RTMPose-m）で約 100 MB。初めて使うときに OpenMMLab の配布元から取ってくる | ONNX なので `accel.make_session` に載せ替え、デスクトップでは DirectML | `pip install --no-deps rtmlib tqdm`（下の注意） |
+| RTMPose（rtmlib） | Apache 2.0（rtmlib・RTMPose のコード） | `balanced` で人の検出（YOLOX-m 約 97 MB）と関節（RTMPose-m 約 52 MB）。初めて使うときに OpenMMLab の配布元から `ckpts/pose/rtmlib/` に取ってくる（`rtmpose_model_paths`） | ONNX なので `accel.make_session` に載せ替え、デスクトップでは DirectML | `pip install --no-deps rtmlib tqdm`（下の注意） |
 | MediaPipe Pose Landmarker | Apache 2.0（コードと重み） | lite 約 6 MB・full 約 9 MB・heavy 約 30 MB。`ckpts/pose/` に取ってくる | Python 版は CPU だけ | `pip install -e .[pose]` |
 
 - rtmlib は `onnxruntime`（CPU 版）を一緒に入れようとする。Windows で `onnxruntime-directml` と両方入ると壊れる（`docs/gpu.md`）ので、
   `--no-deps` で入れる。
+- rtmlib の `Body` は、人が 1 人も見つからないコマでは画像全体を 1 人として関節を出す（信頼度は 0.1 前後と低いが、位置はでたらめ）。
+  `RTMPoseModel` は人の検出を先に呼び、見つからなければ「誰もいない」を返す。
+- 速さ（2026-11-05、RX 7900 XT、1080p の動画、`balanced`）：DirectML で 1 コマ約 32 ms、CPU で約 2.4 秒（約 75 倍）。
+  GPU と CPU の関節の位置の差はほぼ 0 px（最大 0.6 px）。
 - RTMPose の重みは body7（COCO・AI Challenger・CrowdPose・MPII・Halpe など 7 つのデータの集まり）で学習されている。
   コードは Apache 2.0 だが、学習に使ったデータには研究用に限るものが含まれる。個人の解析に使う分には問題になりにくいが、
   解析の結果やモデルを配るときは確かめ直す。

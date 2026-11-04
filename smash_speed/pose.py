@@ -156,18 +156,48 @@ class RTMPoseModel:
             raise ImportError("rtmlib が入っていません（pip install -e .[pose]）") from e
         from smash_speed.accel import make_session
 
-        self.body = Body(mode=mode, backend="onnxruntime", device="cpu")
-        for part in (getattr(self.body, "det_model", None), self.body.pose_model):
-            if part is not None:
-                part.session = make_session(part.onnx_model, prefer)
+        paths = rtmpose_model_paths(mode)
+        sizes = Body.MODE[mode]
+        self.body = Body(det=str(paths["det"]), det_input_size=sizes["det_input_size"], pose=str(paths["pose"]),
+                         pose_input_size=sizes["pose_input_size"], backend="onnxruntime", device="cpu")
+        for part in (self.body.det_model, self.body.pose_model):
+            part.session = make_session(part.onnx_model, prefer)
         self.provider = self.body.pose_model.session.get_providers()[0]
 
     def __call__(self, image: np.ndarray) -> list[Person]:
-        kpts, scores = self.body(image)
+        # rtmlib の Body は、人が見つからないと画像全体を 1 人として関節を出す（信頼度は低いが位置はでたらめ）ので、
+        # 人の検出を先に呼び、見つからなければ誰もいないとする
+        bboxes = self.body.det_model(image)
+        if len(bboxes) == 0:
+            return []
+        kpts, scores = self.body.pose_model(image, bboxes=bboxes)
         kpts = np.asarray(kpts, float).reshape(-1, NUM_KEYPOINTS, 2)
         scores = np.asarray(scores, float).reshape(-1, NUM_KEYPOINTS)
         # RTMPose（SimCC）の信頼度は 0〜1 を超えることがあるので、0〜1 に収める
         return [(k, np.clip(s, 0.0, 1.0)) for k, s in zip(kpts, scores)]
+
+
+def rtmpose_model_paths(mode: str = "balanced", download: bool = True) -> dict[str, Path]:
+    """RTMPose の人の検出（``det``）と関節（``pose``）の ONNX のファイル（なければ ``ckpts/pose/rtmlib/`` に取ってくる）。
+
+    rtmlib に任せるとホームの下（``~/.cache/rtmlib``）に置かれるので、MediaPipe と同じくリポジトリの ``ckpts/`` に置く。
+    """
+    from rtmlib import Body
+
+    if mode not in Body.MODE:
+        raise ValueError(f"RTMPose の大きさは {', '.join(Body.MODE)} のどれかにしてください: {mode!r}")
+    out = {}
+    for part in ("det", "pose"):
+        url = Body.MODE[mode][part]
+        path = MODEL_DIR / "rtmlib" / (Path(url).name.split(".")[0] + ".onnx")
+        if not path.exists():
+            if not download:
+                raise FileNotFoundError(path)
+            from rtmlib.tools.file import download_checkpoint
+
+            path = Path(download_checkpoint(url, dst_dir=str(path.parent), progress=False))
+        out[part] = path
+    return out
 
 
 def mediapipe_model_path(variant: str = "full", download: bool = True) -> Path:

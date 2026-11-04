@@ -178,3 +178,32 @@ def test_mediapipe_runs_if_installed():
         assert model(np.zeros((240, 320, 3), np.uint8)) == []
     finally:
         model.close()
+
+
+def test_rtmpose_model_paths_use_ckpts(tmp_path, monkeypatch):
+    """RTMPose の重みは ckpts/pose/rtmlib/ から読み、あれば取ってこない。なければ取ってこない設定では分かるように止まる。"""
+    pytest.importorskip("rtmlib")
+    import smash_speed.pose as pose_mod
+    monkeypatch.setattr(pose_mod, "MODEL_DIR", tmp_path)
+    with pytest.raises(FileNotFoundError):
+        pose_mod.rtmpose_model_paths("balanced", download=False)
+    with pytest.raises(ValueError):
+        pose_mod.rtmpose_model_paths("huge", download=False)
+    (tmp_path / "rtmlib").mkdir()
+    (tmp_path / "rtmlib" / "yolox_m_8xb8-300e_humanart-c2c7a14a.onnx").write_bytes(b"")
+    (tmp_path / "rtmlib" / "rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.onnx").write_bytes(b"")
+    paths = pose_mod.rtmpose_model_paths("balanced", download=False)
+    assert paths["det"].parent == tmp_path / "rtmlib" and paths["det"].name.startswith("yolox_m")
+    assert paths["pose"].name.startswith("rtmpose-m")
+
+
+def test_rtmpose_runs_if_installed():
+    """rtmlib と重みがあれば実際に動き、人のいない画像では誰も返さない（rtmlib は画像全体を 1 人として返してしまう）。"""
+    pytest.importorskip("rtmlib")
+    from smash_speed.pose import RTMPoseModel, rtmpose_model_paths
+    try:
+        rtmpose_model_paths("balanced", download=False)
+    except FileNotFoundError:
+        pytest.skip("RTMPose の重みがない")
+    model = RTMPoseModel(prefer="cpu")
+    assert model(np.zeros((240, 320, 3), np.uint8)) == []
