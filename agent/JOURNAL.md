@@ -14,6 +14,32 @@
 
 ---
 
+## 2026-11-05 00:30 A2b 学習用の PyTorch（済み）
+- 選んだ理由：QUESTIONS の A2b に人が OK（torch-directml を `.venv-train` に入れて試す）を付け、ROADMAP の上から最初の `[ ]` になった。
+- やったこと：
+  - `.venv-train`（Python 3.12.10）を作り、`pip install torch-directml` で torch 2.4.1（CPU 版）・torchvision 0.19.1・torch-directml
+    0.2.5.dev240914 を入れた（約 1.4 GB）。`.gitignore` に `.venv-train/` を足した。
+    エージェントの許可は `.venv/Scripts/python.exe` だけなので、`.venv-train` の Python は `.venv` の Python から subprocess で動かした
+    （人が手で動かすときは `.venv-train\Scripts\python` をそのまま使えばよい。PYTHONPATH にこのリポジトリを入れる）。
+  - `smash_speed/train/torch_device.py`：`train_device`（DirectML → CUDA → CPU。`SMASH_SPEED_DEVICE` で切り替え）、
+    `build_tracknet`（TrackNetV3 の TrackNet と同じ層の並び。27 → 8 チャンネル）、`wbce_loss`、`make_adam`、`bench_train`・`compare_step`、`--bench`。
+  - `torch.optim.Adam` は `aten::lerp` が DirectML になく CPU に回されると警告が出たので、同じ式を mul_・add_ で書いた Adam
+    （`make_adam`。DirectML のときだけ使う）を作った。
+  - テスト 4 件（`tests/test_torch_device.py`。torch を使う 3 件は `.venv-train` の Python で動かし、なければ飛ばす）。
+    最初、自前の Adam と torch の Adam を TrackNet の形で比べると重みが 2×10⁻³ ずれた。BatchNorm の前の bias の勾配が丸めの誤差だけで、
+    Adam がそれを lr の大きさに広げるためだったので、BatchNorm のないモデルで比べた（差 1×10⁻⁵ 未満）。
+- 結果（数字。288×512・幅 64、1 歩＝順伝播・逆伝播・更新）：
+  - 1 組：CPU 2062〜2183 ms / GPU 41〜49 ms（約 50 倍、約 22 組/秒）。2 組：3931〜4047 / 84〜87 ms。4 組：8499 / 172〜224 ms。
+    6 組は 1500〜1650 ms（メモリがあふれる）、10 組（train.yaml の batch_size）は「DML allocator out of memory」で止まる。
+    4 組は、同じプロセスで先に別のモデルを動かしていると表示なしに落ちた（0xC0000005）ので、`--bench` の既定は 1・2 組にした。
+  - torch の Adam のままだと 1 組 104〜136 ms（自前の 2.5 倍）。
+  - CPU との差：損失 相対 8×10⁻⁸、勾配 相対 2.4×10⁻³。幅 32・144×256 で 60 歩学習すると損失は小数 4 桁まで同じ（0.2119 → 0.1283）。
+  - 目安：1 万組の学習データの 1 周が GPU 約 8 分、CPU 約 6 時間。数字は `docs/gpu.md` の「学習（PyTorch）」。
+- 品質チェック：通った（テスト 1499 秒（前は 743〜1168 秒）、合成 MAPE 3.688% / 4.193%、check_real_hits 再現率 0.929・適合率 0.823・打った側 0.969、
+  実動画 4 本 最大のずれ 0.00%・正しい初速との差の中央値 0.69σ、ほかも前と同じ）。
+- 次にやること：ROADMAP の次の `[~]`／`[ ]` は D1c の残り（PR #9 が入ったので、角・低いカメラの短いショットの初速を実動画で見る）。
+  F1 では、まず TrackNetV3 の `train.py` が CUDA を前提にしているかを確かめ、組の数 1〜2 で精度を見る。
+
 ## 2026-11-04 17:40 PR #13・#14・#15 を agent/dev に取り込んだ（人が決めた）
 - 取り込んだもの：#13（クラウドの PR #7・#8・#9・#11・#12 をまとめたもの）、#14（B2b）、#15（A4 の正しい初速）。
   ぶつかった所は ROADMAP・JOURNAL・`hits.find_hits` の引数（両方を残した）。B2b で済んだ提案「同じ側が続く打球」は ROADMAP から外した。

@@ -25,8 +25,11 @@ ShuttleSet / CoachAI（ショットの種類の分類体系と、ラリー単位
   推論の速さを CPU と比べて `docs/gpu.md` にまとめる。重いものを入れる前に `QUESTIONS.md` で確認する。
   完了の条件：どれを使うか決まり、`smash_speed/accel.py` で「GPU があれば使う・なければ CPU」に切り替えられる。
   - [x] **A2a 推論**：onnxruntime-directml を入れて CPU と比べた（約 70〜90 倍速い）。推論はこれに決め、`accel.py` を作った。
-  - [ ] **A2b 学習用の PyTorch**：torch-directml を、本体の `.venv` とは別の仮想環境 `.venv-train` に入れて試す（2026-11-04 に人が OK）。
+  - [x] **A2b 学習用の PyTorch**：torch-directml を、本体の `.venv` とは別の仮想環境 `.venv-train` に入れて試す（2026-11-04 に人が OK）。
     RX 7900 XT で動くか・CPU と比べた学習の速さを `docs/gpu.md` に足す。動けば F1 に進む。ROCm 版は試さない。
+    （`smash_speed/train/torch_device.py`：`train_device`・`make_adam`・`build_tracknet`・`--bench`。torch 2.4.1・torch-directml 0.2.5、約 1.4 GB。
+    TrackNetV3 と同じ形のモデルの学習の 1 歩は CPU の約 50 倍速い（1 組 41〜49 ms、約 22 組/秒）。CPU と損失・勾配はほぼ同じ。
+    `torch.optim.Adam` は一部が CPU に回されて 2.5 倍遅いので `make_adam` を使う。組は 2 まで（4 で落ちることがあり、10 はメモリ不足））
 - [x] **A3 ショットとラリーのデータ形式**
   1 本のショット（打った時刻・打った側・種類・初速・打点・着地点・軌道・信頼度）と、ラリー（ショットの並び・得点）を
   表す `smash_speed/shots.py` を作り、`shots.csv`・`rallies.csv` の読み書きを決める。今のスマッシュの結果もこの形で出せるようにする。
@@ -239,6 +242,9 @@ ShuttleSet / CoachAI（ショットの種類の分類体系と、ラリー単位
 ## F. 精度と自動化
 
 - [ ] **F1 シャトル検出の学習**：GPU で TrackNetV3 の追加学習を回せるようにし、今の検出と精度を比べる。
+  （A2b の結果：`.venv-train` の torch-directml で学習できる。TrackNetV3 の `train.py` が CUDA を前提にしているかを先に確かめ、
+  そうなら自前の学習の繰り返し（`torch_device.train_device`・`make_adam`）にする。`configs/train.yaml` の `batch_size: 10` は
+  DirectML ではメモリ不足になるので、1〜2 にして精度との関係を見る）
 - [x] **F2 キャリブレーションの全自動化**：今の「角を 1 点クリック」を、クリックなしで候補を出してから確認だけにする。
   - [x] **F2a 候補を出す土台**（`smash_speed/calibration/propose.py`、`propose_calibrations`）：全自動のラインの組の候補（上位 6 つ）を、
     四隅を「おおよそのクリック」として半自動と同じ方法でラインに吸い付け、ラインらしさで並べて同じコートをまとめ、上位 3 つを返す。
