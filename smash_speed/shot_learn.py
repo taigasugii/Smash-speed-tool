@@ -13,6 +13,9 @@
 実際のラベルはまだ少ないので、``synthetic_labels`` で合成ラリーのショットに「実動画のずれ」（打点が低く・初速が遅く
 出るなど）と雑音を入れたラベルを作り、学習がルールのずれを取り戻せるかを確かめる（``--bench``）。
 
+「打球ではない」のラベル（``shot_labels.NOT_A_HIT``）は種類ではないので分類器には入れず、``hit_check`` で
+ラベルを付けたショットのうち何本が打球ではなかったか（打った瞬間の見つけ間違いの割合）を数える。
+
 ``python -m smash_speed.shot_learn <shot_labels.csv>`` でルールと比べ、``--out`` に学習したモデル（JSON）を書く。
 """
 
@@ -27,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from smash_speed.physics import PhysicsParams
-from smash_speed.shot_labels import ShotLabel, read_labels
+from smash_speed.shot_labels import NOT_A_HIT, ShotLabel, read_labels
 from smash_speed.shot_types import (CLASSES, ShotFeatures, classify_features, confusion_matrix, features_from_trajectory,
                                     scores, shot_features)
 from smash_speed.shots import Shot
@@ -62,7 +65,8 @@ def feature_vector(f: ShotFeatures) -> np.ndarray:
 def label_table(labels: Iterable[ShotLabel], phys: PhysicsParams | None = None) -> pd.DataFrame:
     """ラベルを 1 本 1 行の表にする：正解・ルールの判定・ラリーの組・手がかり。
 
-    打点・速度のないラベル（当てはめられなかったショット）と、種類が ``CLASSES`` にないラベルは入れない。
+    打点・速度のないラベル（当てはめられなかったショット）と、種類が ``CLASSES`` にないラベル
+    （「打球ではない」・unknown）は入れない。
     """
     phys = phys or PhysicsParams()
     rows = []
@@ -76,6 +80,27 @@ def label_table(labels: Iterable[ShotLabel], phys: PhysicsParams | None = None) 
                      "true": r.label, "rule": classify_features(f),
                      **dict(zip(FEATURE_NAMES, feature_vector(f)))})
     return pd.DataFrame(rows, columns=["video_name", "t_hit_s", "group", "true", "rule", *FEATURE_NAMES])
+
+
+def hit_check(labels: Iterable[ShotLabel]) -> dict[str, Any]:
+    """ラベルを付けたショットのうち「打球ではない」の本数と割合（打った瞬間の見つけ間違いの割合の目安）。
+
+    人がラベルを付けたショットは一覧に出たショットなので、「打球ではない」の割合は、見つけた打球のうち
+    間違いだったものの割合（誤検出の割合）になる。見落とした打球は一覧に出ないので、ここでは数えられない。
+
+    Returns:
+        ``n``（ラベルの本数）・``n_not_hit``・``rate``（ラベルがなければ nan）・``by_video``（動画ごとの同じもの）
+    """
+    by_video: dict[str, dict[str, Any]] = {}
+    for r in labels:
+        v = by_video.setdefault(r.video_name, {"n": 0, "n_not_hit": 0})
+        v["n"] += 1
+        v["n_not_hit"] += r.label == NOT_A_HIT
+    for v in by_video.values():
+        v["rate"] = v["n_not_hit"] / v["n"]
+    n = sum(v["n"] for v in by_video.values())
+    n_not = sum(v["n_not_hit"] for v in by_video.values())
+    return {"n": n, "n_not_hit": n_not, "rate": (n_not / n) if n else float("nan"), "by_video": by_video}
 
 
 # =============================================================================
@@ -298,13 +323,19 @@ def _velocity_like(v0: np.ndarray, speed: float, elev_deg: float) -> np.ndarray:
 
 
 def synthetic_labels(n_rallies: int = 60, seed: int = 0, shift: RealShift | None = None,
-                     phys: PhysicsParams | None = None, video_name: str = "synthetic.mp4") -> list[ShotLabel]:
-    """合成ラリーの正解の種類に、ずれと雑音を入れた軌道の値を付けたラベル（``shot_labels.csv`` と同じ形）。"""
+                     phys: PhysicsParams | None = None, video_name: str = "synthetic.mp4",
+                     not_hit_share: float = 0.0) -> list[ShotLabel]:
+    """合成ラリーの正解の種類に、ずれと雑音を入れた軌道の値を付けたラベル（``shot_labels.csv`` と同じ形）。
+
+    ``not_hit_share`` > 0 なら、打った瞬間の見つけ間違いをまねて、ショットの飛んでいる途中（打ってから 0.3 秒後）に
+    「打球ではない」のラベルを足す（ラベル全体のうちおよそこの割合。値はそのショットの途中の位置・速度）。
+    """
     from smash_speed.synth_rally import make_rally
 
     phys = phys or PhysicsParams()
     shift = shift or RealShift()
     rng = np.random.default_rng([seed, 7])
+    rng_not = np.random.default_rng([seed, 11])   # 打球ではないを足すか（ほかのショットの値は変えない）
     out = []
     for r in range(n_rallies):
         rally = make_rally(rng, phys, n_shots=int(rng.integers(4, 13)), server_side="h" if r % 2 == 0 else "o",
@@ -321,6 +352,19 @@ def synthetic_labels(n_rallies: int = 60, seed: int = 0, shift: RealShift | None
                                  hit_x_m=float(p0[0]), hit_y_m=float(p0[1]), hit_z_m=float(p0[2]),
                                  v0_x_mps=float(v0[0]), v0_y_mps=float(v0[1]), v0_z_mps=float(v0[2]),
                                  terminal_velocity_mps=phys.terminal_velocity, rally_id=r, index_in_rally=i + 1))
+            if not_hit_share > 0 and rng_not.uniform() < not_hit_share / (1 - not_hit_share):
+                # 飛んでいる途中の 1 点を「打った」と間違えたもの：位置・速度は 0.3 秒後の軌道の値
+                dt = 0.3
+                p1 = p0 + v0 * dt + 0.5 * np.array([0.0, 0.0, -9.81]) * dt ** 2
+                v1 = v0 * np.exp(-9.81 * dt / phys.terminal_velocity) + np.array([0.0, 0.0, -9.81 * dt])
+                p1[2] = max(p1[2], 0.1)
+                f1 = features_from_trajectory(p1, v1, phys, False)
+                out.append(ShotLabel(video_name=video_name, t_hit_s=round(float(s.t_hit) + dt, 4), label=NOT_A_HIT,
+                                     predicted=classify_features(f1), side=s.side,
+                                     speed_kmh=float(np.linalg.norm(v1) * 3.6), hit_x_m=float(p1[0]),
+                                     hit_y_m=float(p1[1]), hit_z_m=float(p1[2]), v0_x_mps=float(v1[0]),
+                                     v0_y_mps=float(v1[1]), v0_z_mps=float(v1[2]),
+                                     terminal_velocity_mps=phys.terminal_velocity, rally_id=r, index_in_rally=None))
     return out
 
 
@@ -352,6 +396,10 @@ def main(argv: list[str] | None = None) -> None:
         labels = read_labels(a.labels_csv)
         table = label_table(labels)
         print(f"{a.labels_csv}：ラベル {len(labels)} 本（使えるもの {len(table)} 本、動画 {table['video_name'].nunique()} 本）")
+        hc = hit_check(labels)
+        if hc["n"]:
+            print(f"打球ではない：{hc['n_not_hit']} 本（ラベルを付けたショットの {100 * hc['rate']:.1f}%。"
+                  "打った瞬間の見つけ間違いの割合の目安。種類の学習には使いません）")
         if len(table) < MIN_LABELS:
             print(f"※ {MIN_LABELS} 本より少ないので、数字は目安です")
     else:

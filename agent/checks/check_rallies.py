@@ -1,13 +1,14 @@
 """ラリーの区切りの精度のチェック：続けて打った合成ラリーで、ラリーの区切りを測る（C1）。
 
 ラリーの間の休み（着地から次のサーブまで）を短く（1〜2 秒）して、打球の間隔だけでは区切れない場合を作る。
+ラリーの終わり方は、相手のコートの中・線の外・ネットの手前を ``ENDS`` の割合でまぜる（終わり方と得点した側も確かめる）。
 
 1. 正解のショット（打った時刻・着地の時刻に少しずれを足したもの）を区切る（``rallies.synthetic_benchmark`` の truth）。
 2. 横から撮った合成ラリーを 30 fps で観測し、動画全体の検出から打球を見つけ（打球音あり）、軌道を当てはめてから区切る
    （同 fit。実際の流れと同じ）。
 
-区切りの再現率・適合率が基準を下回る、または打球の間隔だけで分けるやり方（``shots.make_rallies``）より
-再現率が低くなったら失敗にする。
+区切りの再現率・適合率が基準を下回る、打球の間隔だけで分けるやり方（``shots.make_rallies``）より
+再現率が低くなる、または終わり方と得点した側が合ったラリーの割合（終わり方ごと）が ``MIN_OUTCOME`` を下回ったら失敗にする。
 
 使い方::
 
@@ -29,6 +30,9 @@ N_TRUTH_SESSIONS, N_FIT_SESSIONS, N_RALLIES = 4, 1, 5
 # 間隔だけでは 0.92・0.50）から、たまたまの違いでは落ちないように余裕をとった基準
 MIN_TRUTH = 0.95
 MIN_FIT = 0.8
+# 終わり方をまぜた合成（truth 8×5・fit 2×5 ラリー、休み 1〜3 秒）で、in・out・net とも 1.000 だった
+ENDS = {"in": 0.4, "out": 0.3, "net": 0.3}
+MIN_OUTCOME = 0.8
 
 
 def run(ctx: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -38,7 +42,7 @@ def run(ctx: dict[str, Any] | None = None) -> dict[str, Any]:
     workers = max(1, min(8, (os.cpu_count() or 2) - 1))
     bad, parts, metrics = [], [], {}
     for mode, n, lim in (("truth", N_TRUTH_SESSIONS, MIN_TRUTH), ("fit", N_FIT_SESSIONS, MIN_FIT)):
-        r = synthetic_benchmark(n, N_RALLIES, 30.0, SEED, mode, rest_s=REST_S, workers=workers)
+        r = synthetic_benchmark(n, N_RALLIES, 30.0, SEED, mode, rest_s=REST_S, workers=workers, ends=ENDS)
         new, gap = r["new"], r["gap"]
         metrics[mode] = {k: round(v, 3) if isinstance(v, float) else v for k, v in new.items()}
         metrics[mode]["gap_recall"] = round(gap["boundary_recall"], 3)
@@ -49,6 +53,10 @@ def run(ctx: dict[str, Any] | None = None) -> dict[str, Any]:
                 bad.append(f"{mode} の {k} {new[k]:.3f}（基準 {lim}）")
         if new["boundary_recall"] < gap["boundary_recall"]:
             bad.append(f"{mode} で間隔だけのやり方より再現率が低い")
+        for k, (ok, cnt) in sorted(new["by_reason"].items()):
+            if cnt and ok / cnt < MIN_OUTCOME:
+                bad.append(f"{mode} の終わり方 {k} の正解 {ok}/{cnt}（基準 {MIN_OUTCOME}）")
+        parts[-1] += "、終わり方 " + "・".join(f"{k} {ok}/{cnt}" for k, (ok, cnt) in sorted(new["by_reason"].items()))
     ok = not bad
     summary = f"ラリーの区切り（休み {REST_S[0]:.0f}〜{REST_S[1]:.0f} 秒）：" + ("、".join(parts) if ok else
                                                                          "基準を下回った：" + "、".join(bad))

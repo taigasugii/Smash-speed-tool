@@ -26,7 +26,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-from smash_speed.movement import MOVEMENT_FILE, MOVEMENT_SVG
+from smash_speed.movement import MOVEMENT_SVG, load_movement
 from smash_speed.rally_stats import END_REASON_LABELS, landing_svg, landing_types, rally_stats
 from smash_speed.shots import RALLIES_FILE, SHOT_TYPE_LABELS, SHOTS_FILE, Rally, Shot, read_rallies, read_shots
 
@@ -132,10 +132,24 @@ def movement_section(movement: dict[str, Any], svg: str = "") -> str:
             for p in movement.get("players", {}).values()]
     if not rows:
         return ""
+    # いた場所：自分の半面の前・中・後（ネットからの深さ）と、コートの外にいた時間の割合
+    depth = movement.get("depth_names") or ["前", "中", "後"]
+    zone_rows = []
+    for p in movement.get("players", {}).values():
+        z = p.get("zones") or {}
+        grid = z.get("grid") or []
+        if not grid:
+            continue
+        zone_rows.append([SIDE_NAMES.get(p["side"], p["side"]) + (f"・{p['player'] + 1} 人目" if p["player"] else "")]
+                         + [_f(100 * sum(row), "{:.0f}") for row in grid]
+                         + [_f(100 * z.get("outside", 0.0), "{:.0f}")])
+    zones = (_table(["選手"] + [f"{d} %" for d in depth] + ["コートの外 %"], zone_rows, set(range(1, len(depth) + 2)))
+             if zone_rows else "")
     return ('<section><h2>選手の動き</h2>'
             + _table(["選手", "時間 秒", "移動距離 m", "1 分あたり m", "1 ラリーあたり m", "最高の速さ m/s",
                       "動いていた割合 %"], rows, {1, 2, 3, 4, 5, 6})
             + (f'<div>{svg}</div>' if svg else "")
+            + (f'<details><summary>いた場所の割合（ネットからの深さ）</summary>{zones}</details>' if zones else "")
             + '<p class="note">足元の位置をならしてから測った目安です（揺れを強くならすほど短く出ます）。'
               '「動いていた」は秒速 1 m より速く動いていた時間。図は色が濃いマスほど長くいた所で、十字は平均の位置。</p>'
               '</section>')
@@ -209,7 +223,10 @@ def build_report(shots: list[Shot], rallies: list[Rally], info: dict[str, Any] |
                      + f'<p class="note">平均 {_f(rs["mean"], "{:.1f}")} 本・中央値 {_f(rs["median"], "{:.1f}")} 本'
                      + (f'、平均 {_f(sec["mean"], "{:.1f}")} 秒' if sec["n"] else "") + "。"
                      + (f"終わり方：{escape(ends)}。" if ends else "")
-                     + (f"得点：{escape(wins)}（着地点からの目安）。" if wins else "") + '</p></section>')
+                     + (f"得点：{escape(wins)}（着地点からの目安）。" if wins else "")
+                     + (f"ラリーの外の打球 {st['n_shots_outside_rallies']} 本（選手の動きから、ラリーの間に拾って返した・"
+                        "となりのコートのシャトルとみなしたもの）は、ラリーに入れていません。"
+                        if st["n_shots_outside_rallies"] else "") + '</p></section>')
     if land:
         parts.append('<section><h2>着地点</h2><div class="courts">' + land + '</div>'
                      + '<p class="note">コートを上から見た図（左が h の側、右が o の側）。点は 1 本ずつの着地点'
@@ -242,11 +259,9 @@ def write_report(out_dir: str | Path, court: dict[str, Any] | None = None, shots
     info_path = out_dir / SHOT_LIST_FILE
     info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
     # 選手の動きは、この解析で選手の位置も出したときだけ（前の解析の movement.json が残っていても使わない）
-    movement, svg = None, ""
-    if (info.get("players") or {}).get("movement") and (out_dir / MOVEMENT_FILE).exists():
-        movement = json.loads((out_dir / MOVEMENT_FILE).read_text(encoding="utf-8"))
-        svg_path = out_dir / MOVEMENT_SVG
-        svg = svg_path.read_text(encoding="utf-8") if svg_path.exists() else ""
+    movement, svg = load_movement(out_dir), ""
+    if movement is not None and (out_dir / MOVEMENT_SVG).exists():
+        svg = (out_dir / MOVEMENT_SVG).read_text(encoding="utf-8")
     path = out_dir / REPORT_FILE
     path.write_text(build_report(shots, rallies, info, court, movement=movement, movement_svg=svg), encoding="utf-8")
     return path

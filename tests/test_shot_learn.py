@@ -125,3 +125,29 @@ def test_synthetic_labels_round_trip(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "ルール：正解率" in out and "学習：正解率" in out and "200 本より少ない" in out
     assert load_model(tmp_path / "shot_model.json").n_train == len(labels)
+
+
+def test_not_a_hit_is_left_out_and_counted(tmp_path, capsys):
+    """「打球ではない」のラベル（合成の見つけ間違い）は種類の学習から外し、見つけ間違いの割合として数える。"""
+    from smash_speed.shot_labels import NOT_A_HIT
+    from smash_speed.shot_learn import hit_check
+
+    base = synthetic_labels(n_rallies=8, seed=1)
+    labels = synthetic_labels(n_rallies=8, seed=1, not_hit_share=0.2)
+    not_hit = [r for r in labels if r.label == NOT_A_HIT]
+    hits = [r for r in labels if r.label != NOT_A_HIT]
+    assert 0 < len(not_hit) < len(labels) and len(hits) == len(base)
+    assert all(r.hit_z_m is not None and r.v0_x_mps is not None for r in not_hit)  # 特徴量はある（入れれば表に入る）
+    table = label_table(labels)
+    assert len(table) == len(label_table(base)) and NOT_A_HIT not in set(table["true"])
+    r = compare_with_rules(table, k=3)
+    assert set(r["model"]["matrix"].index) == set(r["rule"]["matrix"].index)
+    hc = hit_check(labels)
+    assert hc["n"] == len(labels) and hc["n_not_hit"] == len(not_hit)
+    assert hc["rate"] == pytest.approx(len(not_hit) / len(labels)) and 0.05 < hc["rate"] < 0.4
+    assert hc["by_video"]["synthetic.mp4"]["n_not_hit"] == len(not_hit)
+    assert np.isnan(hit_check([])["rate"])
+    path = write_labels(tmp_path / "shot_labels.csv", labels)
+    main([str(path), "-k", "2"])
+    out = capsys.readouterr().out
+    assert f"打球ではない：{len(not_hit)} 本" in out and "ルール：正解率" in out

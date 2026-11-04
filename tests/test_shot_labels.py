@@ -66,3 +66,23 @@ def test_label_summary(tmp_path):
     assert m["n"] == 3 and m["n_videos"] == 2 and m["by_type"] == {"clear": 1, "drive": 1, "smash": 1}
     assert m["rule_accuracy"] == pytest.approx(2 / 3)
     assert math.isnan(label_summary([])["rule_accuracy"])
+
+
+def test_not_a_hit_label(tmp_path):
+    """「打球ではない」は種類ではないが、ラベルとして残せる。決まりの判定の割合には入れず、別に数える。"""
+    from smash_speed.shot_labels import LABEL_CHOICES, NOT_A_HIT
+    from smash_speed.shots import SHOT_TYPES
+
+    assert NOT_A_HIT not in SHOT_TYPES and NOT_A_HIT in LABEL_CHOICES and "unknown" not in LABEL_CHOICES
+    assert len(LABEL_CHOICES) == 9
+    f = tmp_path / "shot_labels.csv"
+    s = _shots()
+    set_label(f, "IMG_1.mp4", s[0], "clear")
+    set_label(f, "IMG_1.mp4", s[1], NOT_A_HIT)
+    labels = read_labels(f)
+    assert sorted(r.label for r in labels) == ["clear", NOT_A_HIT]
+    assert match_labels(labels, "IMG_1.mp4", s) == {0: "clear", 1: NOT_A_HIT}
+    m = label_summary(labels)
+    assert m["n"] == 2 and m["n_not_hit"] == 1 and m["not_hit_rate"] == pytest.approx(0.5)
+    assert m["rule_accuracy"] == pytest.approx(1.0)   # 打球ではないショットは、判定の当たり外れに数えない
+    assert math.isnan(label_summary([])["not_hit_rate"])

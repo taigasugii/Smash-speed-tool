@@ -114,6 +114,8 @@ def rally_stats(shots: list[Shot], rallies: list[Rally], court: dict[str, Any] |
     by_side = {side: type_table([s for s in shots if s.side == side]) for side in ("h", "o")}
     return {
         "n_shots": len(shots), "n_rallies": len(rallies),
+        # ラリーの外の打球（選手の動きで、ラリーの間に拾って返した・となりのコートのものとして落としたもの）
+        "n_shots_outside_rallies": sum(s.rally_id is None for s in shots) if rallies else 0,
         "n_shots_with_speed": sum(s.speed_kmh is not None for s in shots),
         "rally_shots": _summary(n_by), "rally_seconds": _summary(dur), "rally_length_hist": hist,
         "longest_rally": None if longest is None else {
@@ -242,12 +244,21 @@ def landing_svg(shots: list[Shot], court: dict[str, Any] | None = None, columns:
 # =============================================================================
 def write_stats(out_dir: str | Path, shots: list[Shot] | None = None, rallies: list[Rally] | None = None,
                 court: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``<出力先>/stats.json``・``landing.svg`` を書く（ショット・ラリーを省略すると CSV から読む）。統計を返す。"""
+    """``<出力先>/stats.json``・``landing.svg`` を書く（ショット・ラリーを省略すると CSV から読む）。統計を返す。
+
+    この解析で選手の位置も出したとき（``movement.load_movement``）は、選手ごとの移動距離・速さ・ヒートマップを
+    ``players`` に入れる（``movement.movement_stats``）。
+    """
+    from smash_speed.movement import load_movement, movement_stats
+
     out_dir = Path(out_dir)
     shots = read_shots(out_dir / SHOTS_FILE) if shots is None else shots
     rallies = read_rallies(out_dir / RALLIES_FILE) if rallies is None and (out_dir / RALLIES_FILE).exists() \
         else (rallies or [])
     st = rally_stats(shots, rallies, court)
+    movement = load_movement(out_dir)
+    if movement is not None:
+        st["players"] = movement_stats(movement)
     (out_dir / STATS_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
     svg = landing_svg(shots, court)
     if svg:
