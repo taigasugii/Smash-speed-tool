@@ -480,15 +480,16 @@ def find_candidates(o: BatchOptions, cfg: dict[str, Any],
 
 def candidate_hitters(cands: list[Candidate], meta: VideoMeta, camera: Camera, cfg: dict[str, Any],
                       detector: Any, o_players: Any = None, window_s: float = 1.0,
-                      progress: Callable[[str], None] = print) -> int:
+                      progress: Callable[[str], None] = print, notes: dict[int, str] | None = None) -> int:
     """軌道が見つかった候補ごとに、打った時刻の前後 ``window_s`` だけ選手を検出・追跡し、
     打つ人の足元の初めの値を選手の足元にする。置き換えた数を返す。
 
     打った側は、大まかな推定の打点（``hitter``）に近い選手で決める。選手の位置が足りない・ダブルスで
-    どちらか決められない候補は、大まかな推定のまま残す。確認済みの候補は変えない。
-    ``detector`` は ``players.PersonDetector``（``detect(img)`` で枠を返すもの）。
+    どちらか決められない候補は、大まかな推定のまま残す（``notes`` を渡すと、候補の番号ごとに理由を入れる）。
+    確認済みの候補は変えない。``detector`` は ``players.PersonDetector``（``detect(img)`` で枠を返すもの）。
     """
-    from smash_speed.hitter import hitter_at
+    from smash_speed.hitter import HitterOptions, hitter_at
+    from smash_speed.shots import side_of
     from smash_speed.players import PlayerOptions, detect_in_windows, track_between
 
     po = o_players or PlayerOptions()
@@ -504,6 +505,8 @@ def candidate_hitters(cands: list[Candidate], meta: VideoMeta, camera: Camera, c
         t_hit = c.t_impact if c.t_impact is not None else c.t_onset
         e = hitter_at(pl, t_hit, "", (c.hitter["x"], c.hitter["y"]))
         if e is None or e.ambiguous:
+            if notes is not None:
+                notes[c.id] = _no_hitter_note(pl, t_hit, side_of(c.hitter["x"]), e, HitterOptions())
             continue
         c.hitter_rough = dict(c.hitter)
         c.hitter = {"x": round(e.x, 3), "y": round(e.y, 3)}
@@ -511,6 +514,20 @@ def candidate_hitters(cands: list[Candidate], meta: VideoMeta, camera: Camera, c
         n += 1
     progress(f"[進行] 選手の位置から打つ人の足元を入れた候補 {n}/{len(todo)} 個")
     return n
+
+
+def _no_hitter_note(players: Any, t_hit: float, side: str, e: Any, o: Any) -> str:
+    """``candidate_hitters`` で足元を入れなかった理由（記録用の短い文）。"""
+    if e is not None and e.ambiguous:
+        return "同じ側に 2 人いて、どちらが打ったか決められない"
+    if players is None or players.empty:
+        return "前後の区間で選手が見つからない"
+    near = players[((players["t"] - t_hit).abs() <= o.window_s) & (players["side"] == side)]
+    ok = near[["x", "y"]].notna().all(axis=1)
+    if not ok.any():
+        return f"打った時刻の前後 {o.window_s:g} 秒に、打った側の選手の足元がない"
+    return (f"打った時刻の前後 {o.window_s:g} 秒の打った側の足元が {int(ok.sum())} コマで、"
+            f"揺れ（{o.spread_m:g} m より離れたもの）を外すと {o.min_frames} コマ残らない")
 
 
 def players_step(o: BatchOptions, cfg: dict[str, Any], meta: VideoMeta, camera: Camera, cands: list[Candidate],

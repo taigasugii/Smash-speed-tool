@@ -142,6 +142,46 @@ def rerun_all(todo: list[tuple[dict[str, Any], Path]], baseline: Path) -> dict[s
     return res
 
 
+def retrack_hitters(entry: dict[str, Any], video: Path, cfg: dict[str, Any], detector: Any, work: Path) -> int:
+    """1 本の動画の基準の候補の打つ人の足元を、選手の追跡から出した足元にする（``find-smashes --players`` と同じ
+    ``batch.candidate_hitters``）。置き換えた数を返す。
+
+    元の足元は ``hitter_rough`` に残し、出どころを ``hitter_source`` に入れる。入れられなかった候補は元の足元のままにし、
+    理由を ``hitter_note`` に書く。
+    """
+    sys.path.insert(0, str(ROOT))
+    from smash_speed.batch import Candidate, candidate_hitters
+    from smash_speed.calibration.io import load_calibration
+    from smash_speed.pipeline import _camera_for_video
+    from smash_speed.video_io import probe
+
+    work.mkdir(parents=True, exist_ok=True)
+    calib = work / "calibration.json"
+    calib.write_text(json.dumps(entry["calibration"], ensure_ascii=False), encoding="utf-8")
+    meta = probe(video, entry.get("capture_fps"), cfg)
+    camera, _ = load_calibration(calib)
+    camera = _camera_for_video(camera, meta)
+    by_id = {b["id"]: b for b in entry["candidates"]}
+    # 作り直すときは、前に入れた追跡の足元ではなく元の大まかな推定から選手を選ぶ
+    cands = [Candidate(id=b["id"], t_onset=b["t_onset"], strength=b["strength"], start_s=b["start_s"],
+                       end_s=b["end_s"], status="ok", hitter=dict(b.get("hitter_rough") or b["hitter"]),
+                       landing=b["landing"], confirmed=b["confirmed"]) for b in entry["candidates"]]
+    notes: dict[int, str] = {}
+    candidate_hitters(cands, meta, camera, cfg, detector, progress=lambda s: None, notes=notes)
+    n = 0
+    for c in cands:
+        b = by_id[c.id]
+        b["hitter_rough"] = dict(b.get("hitter_rough") or b["hitter"])
+        b["hitter"] = c.hitter
+        b["hitter_source"] = c.hitter_source
+        b.pop("hitter_note", None)
+        if c.hitter_source:
+            n += 1
+        else:
+            b["hitter_note"] = "確認済みの足元" if c.confirmed else notes.get(c.id, "足元を入れられなかった")
+    return n
+
+
 def compare(entry: dict[str, Any], results: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for b in entry["candidates"]:
@@ -213,10 +253,60 @@ def run(ctx: dict[str, Any]) -> dict[str, Any]:
                                                            "missing": missing, "truth": truth}}
 
 
+def retrack_baseline(cfg: dict[str, Any]) -> int:
+    """基準の打つ人の足元を選手の追跡から出し直して（``retrack_hitters``）、初速を解析し直し、基準を書き直す。
+
+    前の初速は ``kmh_before`` に残す。正しい初速があれば、前後の |差|/σ も出す。
+    """
+    sys.path.insert(0, str(ROOT))
+    from smash_speed.config import load_config
+    from smash_speed.players import PersonDetector, PlayerOptions, ensure_model
+
+    base = json.loads(BASELINE.read_text(encoding="utf-8"))
+    todo = [(e, v) for e in base["videos"] if (v := find_video(e, cfg.get("videos_dir"))) is not None]
+    if not todo:
+        print("動画が見つからないので、基準は変えませんでした")
+        return 1
+    po = PlayerOptions()
+    detector = PersonDetector(ensure_model(po.model, progress=lambda s: None), po.min_score, po.nms_iou)
+    acfg = load_config()
+    before = {(e["name"], c["id"]): c["kmh"] for e in base["videos"] for c in e["candidates"]}
+    with tempfile.TemporaryDirectory() as td:
+        for e, v in todo:
+            n = retrack_hitters(e, v, acfg, detector, Path(td) / e["name"])
+            print(f"  {e['name']}：追跡の足元を入れた候補 {n}/{len(e['candidates'])} 本")
+        tmp = Path(td) / "baseline.json"
+        tmp.write_text(json.dumps(base, ensure_ascii=False), encoding="utf-8")
+        results = rerun_all(todo, tmp)
+    for e, _ in todo:
+        for c in e["candidates"]:
+            kmh = results.get(e["name"], {}).get(c["id"], {}).get("kmh")
+            c["kmh_before"] = before[(e["name"], c["id"])]
+            if kmh is None:
+                raise RuntimeError(f"{e['name']} #{c['id']} が解析できなかったので、基準は変えませんでした")
+            c["kmh"] = kmh
+            h, r = c["hitter"], c["hitter_rough"]
+            print(f"  {e['name']} #{c['id']} {c['t_onset']:.1f}s：足元 ({r['x']:.2f}, {r['y']:.2f}) → ({h['x']:.2f}, {h['y']:.2f})"
+                  f"、初速 {c['kmh_before']:.1f} → {kmh:.1f} km/h" + (f"（{c['hitter_note']}）" if c.get("hitter_note") else ""))
+    if TRUTH.exists():
+        truth = json.loads(TRUTH.read_text(encoding="utf-8"))
+        for label, key in (("前", "kmh_before"), ("後", "kmh")):
+            rows = [{"video": e["name"], "id": c["id"], "kmh": c[key]} for e, _ in todo for c in e["candidates"]]
+            tr = compare_truth(rows, {}, truth)
+            print(f"  正しい初速との差（{label}）：|差|/σ の合計 {sum(abs(x['z']) for x in tr):.1f}"
+                  + "".join(f"、{x['video']} #{x['id']} {x['z']:+.1f}σ" for x in tr))
+    base["hitters_retracked"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    BASELINE.write_text(json.dumps(base, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(f"基準を書き直しました → {BASELINE}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--make-baseline", action="store_true", help="本体の outputs から基準を作り直す")
     ap.add_argument("--outputs", help="基準を作る outputs フォルダ（既定は .agent/config.json の main_repo の outputs）")
+    ap.add_argument("--retrack-hitters", action="store_true",
+                    help="基準の打つ人の足元を選手の追跡から出し直し、初速を解析し直して基準を書き直す（人が決めたときだけ）")
     ap.add_argument("--rerun", help=argparse.SUPPRESS)       # 内部用：1 本の動画を解析し直して --out に書く
     ap.add_argument("--video", help=argparse.SUPPRESS)
     ap.add_argument("--baseline", help=argparse.SUPPRESS)
@@ -255,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"基準を作りました：{len(b['videos'])} 本の動画・"
               f"{sum(len(v['candidates']) for v in b['videos'])} 本のスマッシュ → {BASELINE}")
         return 0
+    if a.retrack_hitters:
+        return retrack_baseline(cfg)
     t = time.time()
     r = run({"root": ROOT, "config": cfg})
     for row in r.get("metrics", {}).get("rows", []):

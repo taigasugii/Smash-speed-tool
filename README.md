@@ -327,6 +327,9 @@ smash-speed validate --dataset data/validation/index.csv --out outputs/validatio
 ない PC では飛ばす。品質チェック（`agent/eval_gate.py`）からも呼ばれる。
 所要時間はデスクトップで約 4 分（動画ごとに別のプロセスで並べて解析する。1 本ずつだと約 12 分）。
 基準を作り直すとき（解析を意図して変えたときなど、人が決めたときだけ）は `--make-baseline` を付ける。
+`--retrack-hitters` は、基準の打つ人の足元を選手の追跡から出し直して（`find-smashes --players` と同じ処理）、初速を解析し直し、
+基準を書き直す。元の足元は `hitter_rough`、前の初速は `kmh_before` に残り、足元を入れられなかった候補は元の足元のまま
+理由を `hitter_note` に書く（2026-11-05 にこれで作り直した）。
 
 ---
 

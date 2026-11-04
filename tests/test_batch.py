@@ -147,3 +147,53 @@ def test_find_candidates_keeps_the_rough_hitter_when_players_fail(session, tmp_p
     assert c.hitter_source == "" and c.hitter_rough is None and c.hitter is not None
     _, binfo = load_candidates(tmp_path / "b")
     assert "モデル" in binfo["players"]["error"]
+
+
+def test_no_hitter_note_says_why_the_hitter_was_not_taken():
+    import pandas as pd
+
+    from smash_speed.batch import _no_hitter_note
+    from smash_speed.hitter import HitterEstimate, HitterOptions
+
+    o = HitterOptions()
+    pl = pd.DataFrame({"t": [0.0, 0.1, 0.2], "side": ["h", "h", "o"], "player": [0, 0, 1],
+                       "x": [-5.0, -3.0, 4.0], "y": [0.0, 0.0, 0.0]})
+    assert "選手が見つからない" in _no_hitter_note(pl.iloc[:0], 0.1, "h", None, o)
+    assert "足元がない" in _no_hitter_note(pl, 2.0, "h", None, o)
+    assert "2 コマ" in _no_hitter_note(pl, 0.1, "h", None, o)
+    amb = HitterEstimate(-5.0, 0.0, "h", 0, 3, False, 0.1, ambiguous=True)
+    assert "2 人" in _no_hitter_note(pl, 0.1, "h", amb, o)
+
+
+def test_real_video_check_retracks_the_baseline_hitters(session, tmp_path):
+    """品質チェックの実動画の基準の打つ人の足元を、選手の追跡の足元に置き換える（D3d）。"""
+    import importlib.util
+    from pathlib import Path
+
+    from smash_speed.calibration.io import load_calibration
+
+    p = Path(__file__).resolve().parents[1] / "agent" / "checks" / "check_real_videos.py"
+    spec = importlib.util.spec_from_file_location("check_real_videos", p)
+    chk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(chk)
+    cfg, d, info = session
+    camera, _ = load_calibration(d / "calibration.json")
+    hx, hy = info["hitter_xy"]
+    rough = {"x": hx + 1.0, "y": hy - 0.8}
+    t = info["t_impact_video_s"]
+    cand = {"id": 1, "t_onset": t, "strength": 1.0, "start_s": t - 0.3, "end_s": t + 1.0, "hitter": dict(rough),
+            "landing": {"x": 5.0, "y": 0.0}, "confirmed": False, "kmh": 250.0}
+    calib = json.loads((d / "calibration.json").read_text(encoding="utf-8"))
+    entry = {"name": "S", "capture_fps": None, "calibration": calib,
+             "candidates": [cand, {**cand, "id": 2, "hitter": {"x": -6.0, "y": 1.0}, "confirmed": True}]}
+    det = _FakePeople(camera, [(hx, hy), (-np.sign(hx) * 4.0, 0.5)])
+    assert chk.retrack_hitters(entry, d / "synthetic.mp4", cfg, det, tmp_path / "w") == 1
+    c, confirmed = entry["candidates"]
+    assert c["hitter_source"] == "players" and c["hitter_rough"] == rough and "hitter_note" not in c
+    assert np.hypot(c["hitter"]["x"] - hx, c["hitter"]["y"] - hy) < 0.05
+    # 確認済みの足元は変えない
+    assert confirmed["hitter"] == {"x": -6.0, "y": 1.0} and confirmed["hitter_source"] == ""
+    assert confirmed["hitter_note"]
+    # 2 回目も元の大まかな推定（hitter_rough）から選び、hitter_rough は書き換えない
+    chk.retrack_hitters(entry, d / "synthetic.mp4", cfg, det, tmp_path / "w2")
+    assert entry["candidates"][0]["hitter_rough"] == rough
