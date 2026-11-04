@@ -201,6 +201,16 @@ def test_player_reach_in_box_heights():
     assert player_reach([Hit(3.0)], det, players) == [{}]       # シャトルが見えていない
 
 
+def test_player_reach_uses_the_track_time_before_the_shuttle_is_seen():
+    """検出の始まりより前の打球音の時刻（サーブ）でも、軌道の時刻のシャトルの点と選手の枠で測る。"""
+    det = _det([1.0, 1.033, 1.067, 1.1], [[150.0, 50.0], [170.0, 40.0], [190.0, 30.0], [210.0, 20.0]])
+    # 選手は打った後に右へ離れていく（0.9 s では枠が遠い）
+    players = pd.DataFrame({"t": [0.9, 1.0], "side": ["h", "h"], "player": [0, 0],
+                            "x0": [0.0, 100.0], "y0": [100.0, 100.0], "x1": [40.0, 140.0], "y1": [300.0, 300.0]})
+    (r,) = player_reach([Hit(0.9, method="audio+track", t_track=1.0)], det, players)
+    assert r["h"] == pytest.approx(np.hypot(10, 50) / 200)
+
+
 @pytest.mark.parametrize("fps", [30.0, 120.0])
 def test_players_keep_every_synthetic_hit(cam, fps):
     """選手が打点の近くにいれば、選手の位置を使っても合成ラリーの打球と打った側は変わらない。"""

@@ -440,7 +440,7 @@ def side_votes(hits: list[Hit], det: pd.DataFrame, camera: Camera) -> list[float
 
 def player_reach(hits: list[Hit], det: pd.DataFrame, players: pd.DataFrame, window_s: float = 0.1
                  ) -> list[dict[str, float]]:
-    """打球ごとの、打った時刻の前後 ``window_s`` のシャトルの点から各側の選手の枠までの、画像の上のいちばん近い距離
+    """打球ごとの、打った時刻（軌道の時刻があればそれ）の前後 ``window_s`` のシャトルの点から各側の選手の枠までの、画像の上のいちばん近い距離
     （その選手の枠の高さを単位。枠の中なら 0）。{側: 距離}。シャトルが見えていない・選手がいない側は入れない。
 
     枠の高さを単位にすると、カメラからの遠さによらず「ラケットを伸ばして届くか」を比べられる
@@ -451,17 +451,20 @@ def player_reach(hits: list[Hit], det: pd.DataFrame, players: pd.DataFrame, wind
     groups = {s: g.sort_values("t") for s, g in pl.groupby("side") if s in ("h", "o")}
     out = []
     for h in hits:
-        m = np.abs(t - h.t) <= window_s
+        # 軌道の時刻があればその前後を見る（シャトルの点と選手の枠を同じ時刻でそろえる）。検出の始まりより前の
+        # 打球音の時刻（``audio_before_start``）で見ると、シャトルが見え始める前の所になって点がほとんどない
+        tc = h.t if h.t_track is None else h.t_track
+        m = np.abs(t - tc) <= window_s
         r: dict[str, float] = {}
         if m.any():
             p = uv[m]
             for s, g in groups.items():
                 # 打った時刻にいちばん近いコマの枠（1 側に 2 人いればそれぞれ）
                 gt = g.t.to_numpy(float)
-                near = g[np.abs(gt - h.t) <= max(window_s, 0.2)]
+                near = g[np.abs(gt - tc) <= max(window_s, 0.2)]
                 if near.empty:
                     continue
-                near = near.loc[(near.t - h.t).abs().groupby(near.player).idxmin()]
+                near = near.loc[(near.t - tc).abs().groupby(near.player).idxmin()]
                 best = np.inf
                 for b in near.itertuples():
                     hh = max(float(b.y1 - b.y0), 1.0)
