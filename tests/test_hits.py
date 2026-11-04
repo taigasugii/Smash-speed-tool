@@ -7,8 +7,8 @@ from scipy.io import wavfile
 
 from smash_speed.config import load_config
 from smash_speed.events import audio_onsets
-from smash_speed.hits import (Hit, _most_likely_sides, find_hits, hits_to_shots, match_hits, synthetic_benchmark,
-                              track_breaks)
+from smash_speed.hits import (Hit, _drop_same_side, _most_likely_sides, find_hits, hits_to_shots, match_hits,
+                              player_reach, synthetic_benchmark, track_breaks)
 from smash_speed.physics import PhysicsParams
 from smash_speed.synth import write_click_audio
 from smash_speed.synth_rally import make_rally, observe_rally, rally_camera
@@ -171,3 +171,75 @@ def test_synthetic_benchmark_reports_recall_and_precision():
     r = synthetic_benchmark(n_rallies=3, fps=60.0, seed=2, use_audio=True)
     assert r["n_hits"] == r["tp"] + r["fn"]
     assert r["recall"] >= 0.9 and r["precision"] >= 0.9 and r["side_accuracy"] >= 0.9
+
+
+def _rally_players(rally, cam, fps):
+    """合成ラリーの ``players.csv`` の形の表。各側の選手は、その側の時刻のいちばん近い打点の真下に立つ
+    （枠は足元から頭か上げた手（打点の 0.6 m 下）の高い方まで、幅は高さの 0.4 倍。人の検出の枠も上げた腕を含む）。"""
+    rows = []
+    t = np.arange(rally.t_start, rally.t_end, 1 / fps)
+    for side in "ho":
+        segs = [sg for sg in rally.segments if sg.side == side]
+        for i, ti in enumerate(t):
+            sg = min(segs, key=lambda sg: abs(sg.t_hit - ti))
+            top = max(1.7, sg.p0[2] - 0.6)
+            foot, head = cam.project(np.array([[sg.p0[0], sg.p0[1], 0.0], [sg.p0[0], sg.p0[1], top]]))
+            hh = abs(foot[1] - head[1])
+            rows.append({"frame": i, "t": ti, "side": side, "player": 0, "x0": foot[0] - 0.2 * hh,
+                         "y0": min(foot[1], head[1]), "x1": foot[0] + 0.2 * hh, "y1": max(foot[1], head[1])})
+    return pd.DataFrame(rows)
+
+
+def test_player_reach_in_box_heights():
+    det = _det([1.0, 1.05], [[150.0, 50.0], [160.0, 50.0]])
+    players = pd.DataFrame({"t": [1.0, 1.0], "side": ["h", "o"], "player": [0, 0],
+                            "x0": [100.0, 600.0], "y0": [100.0, 100.0], "x1": [140.0, 640.0], "y1": [300.0, 200.0]})
+    (r,) = player_reach([Hit(1.0)], det, players)
+    # h：枠の右上の角から (10, 50) px、枠の高さ 200 px。o：枠の左上の角から (440, 50) px、高さ 100 px
+    assert r["h"] == pytest.approx(np.hypot(10, 50) / 200)
+    assert r["o"] == pytest.approx(np.hypot(440, 50) / 100)
+    assert player_reach([Hit(3.0)], det, players) == [{}]       # シャトルが見えていない
+
+
+@pytest.mark.parametrize("fps", [30.0, 120.0])
+def test_players_keep_every_synthetic_hit(cam, fps):
+    """選手が打点の近くにいれば、選手の位置を使っても合成ラリーの打球と打った側は変わらない。"""
+    rng = np.random.default_rng(7)
+    for _ in range(3):
+        rally = make_rally(rng, PHYS, n_shots=8)
+        det = observe_rally(rally, cam, fps, PHYS, rng)
+        true_t, true_side = [s.t_hit for s in rally.segments], [s.side for s in rally.segments]
+        base = match_hits(find_hits(det, fps, camera=cam), true_t, true_side)
+        m = match_hits(find_hits(det, fps, camera=cam, players=_rally_players(rally, cam, fps)), true_t, true_side)
+        assert m["tp"] >= base["tp"] and m["fp"] <= base["fp"] and m["side_correct"] >= base["side_correct"]
+
+
+def test_players_drop_a_turn_out_of_reach(cam):
+    """飛んでいる途中で向きが変わって見えた所（どちらの選手にも届かない所）は、選手の位置があれば打球にしない。"""
+    fps = 60.0
+    rally = make_rally(np.random.default_rng(5), PHYS, n_shots=4)
+    det = observe_rally(rally, cam, fps, PHYS, np.random.default_rng(1), noise_px=0.5, dropout=0.0)
+    # いちばん長いショットの真ん中から後ろの点を、横へずらし続ける（向きの変化に見える）
+    k = int(np.argmax([b.t_hit - a.t_hit for a, b in zip(rally.segments[:-1], rally.segments[1:])]))
+    t_mid = 0.5 * (rally.segments[k].t_hit + rally.segments[k + 1].t_hit)
+    after = (det.timestamp > t_mid) & (det.timestamp < rally.segments[k + 1].t_hit - 0.15)
+    det.loc[after, "y_px"] += 1500.0 * (det.timestamp[after] - t_mid)
+    true_t, true_side = [s.t_hit for s in rally.segments], [s.side for s in rally.segments]
+    plain = find_hits(det, fps, camera=cam)
+    assert any(abs(h.t - t_mid) < 0.1 for h in plain)
+    hits = find_hits(det, fps, camera=cam, players=_rally_players(rally, cam, fps))
+    assert not any(abs(h.t - t_mid) < 0.1 for h in hits)
+    assert match_hits(hits, true_t, true_side)["tp"] >= match_hits(plain, true_t, true_side)["tp"]
+
+
+def test_same_side_twice_in_a_short_time_keeps_one():
+    """同じ側が続けて打ったと出た 2 本の間が短ければ、打球音のある方（なければ選手に近い方）だけを残す。"""
+    hits = [Hit(1.0, "h", "track", score=3.0), Hit(1.3, "h", "audio", audio_strength=40.0), Hit(1.9, "o", "track")]
+    kept, _ = _drop_same_side(hits, None, 0.6)
+    assert [h.t for h in kept] == [1.3, 1.9]
+    reach = [{"h": 0.5, "o": 2.0}, {"h": 0.1, "o": 2.0}]
+    kept, r = _drop_same_side([Hit(1.0, "h"), Hit(1.2, "h")], reach, 0.6)
+    assert [h.t for h in kept] == [1.2] and r == [reach[1]]
+    # 間が長い（相手が打ち返す間がある）・側が違うなら両方残す
+    assert len(_drop_same_side([Hit(1.0, "h"), Hit(1.7, "h")], None, 0.6)[0]) == 2
+    assert len(_drop_same_side([Hit(1.0, "h"), Hit(1.2, "o")], None, 0.6)[0]) == 2
