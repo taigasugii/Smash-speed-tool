@@ -426,7 +426,7 @@ def frame():
                 img = cv2.resize(img, (w, int(round(img.shape[0] * w / img.shape[1]))), interpolation=cv2.INTER_AREA)
             data = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
             S.cache[key] = data
-            while len(S.cache) > 60:
+            while len(S.cache) > 240:  # ショットの場面を続けて再生しても読み直さない数
                 S.cache.popitem(last=False)
     resp = app.response_class(data, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "max-age=600"
@@ -1074,7 +1074,7 @@ def shot_view():
 
     ``i`` は ``/api/shots`` の ``id``。返すもの：場面に使うコマの番号、当てはめた軌道（コートの座標と画像の上の点）、
     打点・着地点、打ってから次の打球までのシャトルの検出（画像の上の点）、場面を前後に送れるコマの並び
-    （``frames``：打つ少し前から次の打球までの ``[コマ, 時刻, x, y]``。見えないコマは x・y が None）。
+    （``frames``：打つ 0.8 秒前から次の打球までの ``[コマ, 時刻, x, y]``。見えないコマは x・y が None）。
     """
     from smash_speed.physics import PhysicsParams
     from smash_speed.shot_list import DETECTIONS_FILE
@@ -1118,8 +1118,8 @@ def shot_view():
             frame = int(df.frame.iloc[int(np.argmin(np.abs(df.timestamp.to_numpy() - t_show)))])
             w = df[(df.timestamp >= s.t_hit_s - 0.05) & (df.timestamp <= t_end + 0.05) & (df.visible > 0)]
             det = [[round(float(r.timestamp), 4), round(float(r.x_px), 1), round(float(r.y_px), 1)] for r in w.itertuples()]
-            # 前後に送れるコマ：打つ 0.2 秒前から、次の打球（または軌道の終わり）まで
-            a = df[(df.timestamp >= s.t_hit_s - 0.2) & (df.timestamp <= t_end + 0.05)]
+            # 前後に送れる・再生するコマ：打つ 0.8 秒前（構えと振り）から、次の打球（または軌道の終わり）まで
+            a = df[(df.timestamp >= s.t_hit_s - 0.8) & (df.timestamp <= t_end + 0.05)]
             frames = [[int(r.frame), round(float(r.timestamp), 4)]
                       + ([round(float(r.x_px), 1), round(float(r.y_px), 1)] if r.visible > 0 else [None, None])
                       for r in a.itertuples()]

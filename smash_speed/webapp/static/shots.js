@@ -264,12 +264,13 @@ App.views.shots = {
     host.innerHTML = "";
     const card = h(`<div class="card"><h2>${fmt(s.t_hit_s, 2)} 秒の${esc(s.label)}${s.speed_kmh != null ? `（${fmt(s.speed_kmh, 0)} km/h）` : ""}</h2>
       <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">○</span> は見つけたシャトル（<span style="color:#ea580c">●</span> がこのコマ）、<span style="color:#2563eb">線</span> は計算した飛び方
-        （<span style="color:#2563eb">●</span> がこのコマの時刻の位置）です。下のボタンか、キーボードの ← → でコマを前後に送れます。
+        （<span style="color:#2563eb">●</span> がこのコマの時刻の位置）です。「▶ 再生」（キーボードのスペース）で、打つ 0.8 秒前から次の打球までを
+        動画として繰り返し見られます。速さはゆっくりにもできます。止めている間は、下のボタンかキーボードの ← → でコマを前後に送れます。
         右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所${v.hitter ? `、<span style="color:#7c3aed">■</span> が打った人の足元` : ""}です。
         ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}
         いちばん下で、このショットの正しい種類を選べます（キーボードの数字でも選べます）。</p>
       <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
-        <div style="flex:2;min-width:320px"><div id="scene" style="position:relative"></div><div id="step"></div></div>
+        <div style="flex:3;min-width:320px"><div id="scene" style="position:relative"></div><div id="step"></div></div>
         <div id="top" style="flex:1;min-width:240px"></div></div>
       <div id="truth" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)"></div></div>`);
     this.sceneKey = null;
@@ -316,6 +317,10 @@ App.views.shots = {
     const step = $("#step", card);
     step.innerHTML = `<div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap">
         <button class="btn sm" id="prev">◀ 前のコマ</button><button class="btn sm" id="next">次のコマ ▶</button>
+        <button class="btn sm primary" id="play">▶ 再生</button>
+        <select id="speed" title="再生の速さ"><option value="1">ふつうの速さ</option><option value="0.5">1/2 の速さ</option>
+          <option value="0.25">1/4 の速さ</option></select>
+        <label class="row small" style="gap:4px"><input type="checkbox" id="auto"> 開いたら再生する</label>
         <button class="btn sm ghost" id="hit">打った瞬間へ</button>
         <input type="range" id="sl" min="0" max="${frames.length - 1}" value="${k}" style="flex:1;min-width:120px">
         <span class="small muted" id="when" style="min-width:150px"></span></div>`;
@@ -345,20 +350,59 @@ App.views.shots = {
       $("#prev", step).disabled = k === 0;
       $("#next", step).disabled = k === frames.length - 1;
     };
-    $("#prev", step).onclick = () => show(k - 1);
-    $("#next", step).onclick = () => show(k + 1);
-    sl.oninput = () => show(+sl.value);
+    // 再生：コマの画像を時刻どおりの間隔で順に出す（読み込みが遅いときは、読めるまで待ってから次へ）。
+    // 終わりまで行ったら少し止めて最初から繰り返す。fps の高い動画は、間引いて 1 秒に 30 コマほどにする
+    const pref = (k2, d) => { try { return localStorage.getItem(k2) ?? d; } catch { return d; } };
+    const save = (k2, val) => { try { localStorage.setItem(k2, val); } catch { /* 保存できなくても動く */ } };
+    const speedSel = $("#speed", step), auto = $("#auto", step), playBtn = $("#play", step);
+    speedSel.value = pref("shots.playSpeed", "0.5");
+    auto.checked = pref("shots.autoPlay", "1") === "1";
+    speedSel.onchange = () => save("shots.playSpeed", speedSel.value);
+    auto.onchange = () => save("shots.autoPlay", auto.checked ? "1" : "0");
+    const ts = frames.map((f) => f[1]).filter((t) => t != null);
+    const fpsEst = ts.length > 1 ? (ts.length - 1) / Math.max(1e-6, ts[ts.length - 1] - ts[0]) : 30;
+    const stride = Math.max(1, Math.round(fpsEst / 30));
+    let playing = 0;  // 再生のたびに増やし、古い再生の続きを止める
+    const loaded = () => (img.complete ? Promise.resolve() : new Promise((r) => { img.onload = img.onerror = () => r(); }));
+    const stop = () => { playing++; playBtn.textContent = "▶ 再生"; };
+    const play = async () => {
+      const id = ++playing;
+      playBtn.textContent = "■ 止める";
+      if (k >= frames.length - 1) k = 0;
+      while (id === playing && card.isConnected) {
+        const t0 = performance.now(), ta = frames[k][1];
+        show(k);
+        await loaded();
+        if (id !== playing || !card.isConnected) return;
+        const end = k >= frames.length - 1;
+        const nk = end ? 0 : Math.min(frames.length - 1, k + stride);
+        const tb = frames[nk][1];
+        const wait = end ? 700 : (ta != null && tb != null ? (tb - ta) * 1000 / +speedSel.value : 33);
+        await new Promise((r) => setTimeout(r, Math.max(0, wait - (performance.now() - t0))));
+        if (id !== playing) return;
+        k = nk;
+      }
+    };
+    // 押した後にボタンに残る選択を外す（スペースでボタンがもう一度押されて、すぐ止まらないように）
+    playBtn.onclick = () => { playBtn.blur(); if (playBtn.textContent.startsWith("■")) stop(); else play(); };
+    $("#prev", step).onclick = () => { stop(); show(k - 1); };
+    $("#next", step).onclick = () => { stop(); show(k + 1); };
+    sl.oninput = () => { stop(); show(+sl.value); };
     $("#hit", step).onclick = () => {
+      stop();
       let best = 0;
       frames.forEach((f, i) => { if (f[1] != null && Math.abs(f[1] - s.t_hit_s) < Math.abs((frames[best][1] ?? 1e9) - s.t_hit_s)) best = i; });
       show(best);
     };
-    // ← → はコマ送り（キーの受け取りは renderDetail がまとめてする）
+    // ← → はコマ送り、スペースは再生と停止（キーの受け取りは renderDetail がまとめてする）
     this.sceneKey = (e) => {
-      if (e.key === "ArrowLeft") { show(k - 1); e.preventDefault(); }
-      if (e.key === "ArrowRight") { show(k + 1); e.preventDefault(); }
+      if (e.key === "ArrowLeft") { stop(); show(k - 1); e.preventDefault(); }
+      if (e.key === "ArrowRight") { stop(); show(k + 1); e.preventDefault(); }
+      if (e.key === " ") { playBtn.click(); e.preventDefault(); }
     };
     show(k);
+    // カードが画面に入ってから始める（renderDetail はこの後でカードを付ける）
+    if (auto.checked) setTimeout(() => { if (card.isConnected) { k = 0; play(); } }, 0);
   },
 };
 

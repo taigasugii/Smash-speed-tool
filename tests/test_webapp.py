@@ -221,10 +221,10 @@ def test_shot_list_flow(client, tmp_path):
         v = client.get("/api/shot_view", query_string={"i": k}).get_json()
         assert v["ok"] and v["court"] and v["image_size"]
         assert v["t_hit_s"] < v["t_end_s"] and v["frame"] >= 0
-        # 場面を前後に送れるコマ（B5c2）：打つ少し前から次の打球まで、時刻の順。見えたコマは検出と同じ点
+        # 場面を前後に送れる・再生するコマ（B5c2）：打つ 0.8 秒前から次の打球まで、時刻の順。見えたコマは検出と同じ点
         fr = v["frames"]
         assert v["frame"] in [f[0] for f in fr] and np.all(np.diff([f[1] for f in fr]) > 0)
-        assert fr[0][1] < v["t_hit_s"] and fr[0][1] >= v["t_hit_s"] - 0.2 - 1e-6 and fr[-1][1] <= v["t_end_s"] + 0.05 + 1e-6
+        assert fr[0][1] < v["t_hit_s"] and fr[0][1] >= v["t_hit_s"] - 0.8 - 1e-6 and fr[-1][1] <= v["t_end_s"] + 0.05 + 1e-6
         seen = {f[1]: (f[2], f[3]) for f in fr if f[2] is not None}
         assert all(seen[t] == (x, y) for t, x, y in v["detections"])
         if s["speed_kmh"] is None:
