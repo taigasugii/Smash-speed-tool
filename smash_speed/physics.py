@@ -231,6 +231,8 @@ class FitOptions:
     # 大きく離れないようにする（カメラが飛行方向を正面に近い角度で見ていると、奥行きが決まりにくいため）
     p0_prior_m: Any = None
     p0_prior_sigma_m: tuple[float, float] = (0.6, 0.5)  # （水平, 高さ）の不確かさ [m]
+    # 打点の位置の目安も式の数に数え、観測が 2 コマでも当てはめる（側方のクリア。目安がしっかりしているときだけ）
+    prior_counts: bool = False
     # 初期値にする打点時刻の位置 [m]・速度 [m/s]（打点から出る軌道の探索の結果など）。None なら観測から計算する。
     # カメラが飛行平面に近いと、視線と平面の交点（観測からの初期値）がカメラの後ろに出て計算できないため
     init_state: Any = None
@@ -418,7 +420,8 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
                    opts.p0_prior_m, opts.p0_prior_sigma_m)
     n_par = model.n_kin + model.n_plane + int(opts.estimate_terminal_velocity)
     n_res = 2 * sum(len(o.t) for o in obs)
-    if n_res <= n_par:
+    n_prior = 3 if (opts.prior_counts and opts.p0_prior_m is not None) else 0
+    if n_res + n_prior <= n_par:
         raise ValueError(f"観測点が少なすぎます（残差 {n_res} 個 ≤ パラメータ {n_par} 個）")
 
     starts = [] if theta0 is None else [theta0]

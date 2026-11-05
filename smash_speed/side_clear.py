@@ -97,6 +97,30 @@ def setup_from_pose(norm, stature_m: float, width: int, height: int, f_px: float
                      height=height, f_px=f_px, facing=norm.facing)
 
 
+RACKET_REACH_M = 0.5     # 手首からラケットの打つ所まで [m]（ラケット 0.67 m のうち、握りから面の真ん中まで）
+HIT_PRIOR_SIGMA_M = 0.3  # 姿勢から決めた打点の目安の不確かさ [m]（ラケットの向きが分からない分）
+
+
+def hit_point_from_pose(norm, setup: SideSetup, wrist: str = "right_wrist", elbow: str = "right_elbow"
+                        ) -> tuple[float, float] | None:
+    """打点の時刻の利き手の手首から、ラケットの打つ所の位置（打つ人の足元からの打つ向きの距離・高さ）[m] を見積もる。
+
+    手首から、肘 → 手首の向きに ``RACKET_REACH_M`` 伸ばした所とする（左利きは ``prepare_shot`` で反転済みなので右手）。
+    打った直後のシャトルが 2〜4 コマしか見えないとき、当てはめの打点の目安にする。
+    """
+    i = int(np.argmin(np.abs(norm.t)))
+    w, e = norm.joint(wrist)[i], norm.joint(elbow)[i]
+    if not (np.isfinite(w).all() and np.isfinite(e).all()):
+        return None
+    m_per_unit = norm.torso_px / setup.px_per_m           # 胴体の長さ 1 → [m]
+    fore = w - e
+    n = np.linalg.norm(fore)
+    reach = fore / n * RACKET_REACH_M if n > 0 else np.array([0.0, RACKET_REACH_M])
+    hip_v = norm.meta["raw_hip_px"][1]
+    hip_height = (setup.ground_v_px - hip_v) / setup.px_per_m
+    return float(w[0] * m_per_unit + reach[0]), float(hip_height + w[1] * m_per_unit + reach[1])
+
+
 @dataclass
 class ClearResult:
     """クリアの打球の結果。位置は打つ人の足元からの [m]。"""
@@ -118,20 +142,36 @@ class ClearResult:
 
 
 def fit_clear(t: np.ndarray, uv: np.ndarray, t_hit: float, camera: Camera, phys: PhysicsParams | None = None,
-              hitter_from_net_m: float | None = None, hit_height_m: float = 2.5, refine_plane: bool = True
+              hitter_from_net_m: float | None = None, hit_height_m: float = 2.5, refine_plane: bool = True,
+              min_obs: int = 3, hit_along_m: float = 0.0, hit_prior_sigma_m: tuple[float, float] = (1.0, 0.8)
               ) -> ClearResult | None:
     """打った後のシャトルの画像の位置 (N, 2) [px]（時刻 t [s]）から、クリアの打球の結果を出す。
 
-    飛行の面は打つ人を通り打つ向き（+x）に伸びる鉛直な面。``refine_plane`` なら面の向き・位置も少し動かして当てはめる。
+    飛行の面は打つ人を通り打つ向き（+x）に伸びる鉛直な面。``refine_plane`` なら面の向き・位置も少し動かして当てはめる
+    （見えたコマが 5 未満なら面は動かさない）。打点の目安は打つ人の足元からの打つ向きの距離 ``hit_along_m``・高さ
+    ``hit_height_m`` [m] と不確かさ（水平, 高さ）。60fps・横向きではクリアは 2〜4 コマで画面の上に出ることが多いので、
+    3 コマから当てはめ、``min_obs=2`` なら打点の目安（姿勢の手首から）を式に数えて 2 コマでも当てはめる。
     """
     phys = phys or PhysicsParams()
     keep = (t >= t_hit) & np.isfinite(uv).all(axis=1)
-    if keep.sum() < 5:
+    if keep.sum() < min_obs:
         return None
     obs = Observations(camera, t[keep], uv[keep])
     plane = FlightPlane(origin=np.zeros(3), direction=np.array([1.0, 0.0, 0.0]))
+    refine_plane = refine_plane and keep.sum() >= 5
+    hit = np.array([hit_along_m, 0.0, hit_height_m])
     opts = FitOptions(ci_method="none", refine_plane=refine_plane, plane_sigma_deg=10.0, plane_sigma_m=0.5,
-                      p0_prior_m=np.array([0.0, 0.0, hit_height_m]), p0_prior_sigma_m=(1.0, 0.8))
+                      p0_prior_m=hit, p0_prior_sigma_m=hit_prior_sigma_m)
+    if keep.sum() < 3:
+        # 2 コマ：打点の目安を式に数え、初期値は目安の打点から 1 コマ目へ向かう速度にする
+        from smash_speed.geometry import intersect_plane
+        X = intersect_plane(camera, obs.uv, plane)
+        if not np.isfinite(X).all():
+            return None
+        dt = obs.t[0] - t_hit
+        v_init = (X[0] - hit) / dt if dt > 0.004 else (X[1] - X[0]) / (obs.t[1] - obs.t[0])
+        opts.prior_counts = True
+        opts.init_state = (hit, v_init)
     try:
         fit = fit_trajectory(obs, t_hit, mode="plane", plane=plane, phys=phys, opts=opts)
     except (ValueError, RuntimeError):
@@ -204,7 +244,10 @@ def analyze_balls(out_dir: str | Path, stature_m: float, hitter_from_net_m: floa
         det = detect_fn(t_imp - 0.02, t_imp + after_s)
         det = det[det["visible"] > 0]
         uv = setup.to_right(det[["x_px", "y_px"]].to_numpy(float))
-        res = fit_clear(det["timestamp"].to_numpy(float), uv, t_imp, setup.camera(), phys, hitter_from_net_m)
+        hit = hit_point_from_pose(n, setup)
+        prior = {} if hit is None else {"hit_along_m": hit[0], "hit_height_m": hit[1], "min_obs": 2,
+                                        "hit_prior_sigma_m": (HIT_PRIOR_SIGMA_M, HIT_PRIOR_SIGMA_M)}
+        res = fit_clear(det["timestamp"].to_numpy(float), uv, t_imp, setup.camera(), phys, hitter_from_net_m, **prior)
         if res is None:
             out.append({**row, "ball_note": f"シャトルが {len(det)} コマしか見つからず、当てはめられません"})
             continue
@@ -238,6 +281,8 @@ class SideCase:
     height: int = 1080
     hfov_deg: float = 69.0           # 横の画角（縦向きなら同じレンズで約 42.6°）
     lead_m: float = 2.0              # 画面の真ん中を、打つ人よりこれだけ打つ向きの前にする [m]
+    min_obs: int = 3                 # 当てはめに要る、打った後に見えたコマの数
+    hit_prior_m: float | None = None  # 打点の目安（姿勢の手首から）のずれ [m]。None なら目安なし（足元の上 2.5 m）
 
 
 def _truth(seg, phys: PhysicsParams, hitter_xy: np.ndarray, direction: np.ndarray) -> dict[str, float]:
@@ -257,6 +302,7 @@ def side_benchmark(n: int = 40, case: SideCase | None = None, seed: int = 0, phy
     case = case or SideCase()
     phys = phys or PhysicsParams()
     rng = np.random.default_rng(seed)
+    prior_rng = np.random.default_rng(seed + 1)   # 打点の目安のずれ（ほかの条件と同じクリアになるよう別にする）
     errs: dict[str, list[float]] = {k: [] for k in ("speed_kmh", "elevation_deg", "apex_height_m",
                                                     "land_from_hitter_m", "land_depth_m")}
     rel_speed, frame_s, fails = [], [], 0
@@ -286,8 +332,13 @@ def side_benchmark(n: int = 40, case: SideCase | None = None, seed: int = 0, phy
         setup = SideSetup(px_per_m=true_scale * (1 + case.stature_err), ground_v_px=ground_v + case.ground_err_px,
                           hitter_u_px=hit_u, width=cam.width, height=cam.height, f_px=cam.f)
         t_hit = seg.t_hit + case.t_hit_err_s
+        prior: dict[str, Any] = {}
+        if case.hit_prior_m is not None:  # 打点の目安：本当の打点（打つ向き・高さ）に、目安のずれだけ揺らす
+            along, height = prior_rng.normal([seg.p0[0] - hitter[0], seg.p0[2]], case.hit_prior_m)
+            prior = {"hit_along_m": along, "hit_height_m": height,
+                     "hit_prior_sigma_m": (max(case.hit_prior_m, 0.1),) * 2}
         res = fit_clear(times[ok], uv[ok], t_hit, setup.camera(), phys, hitter_from_net_m=-float(hitter[0]),
-                        refine_plane=case.refine_plane)
+                        refine_plane=case.refine_plane, min_obs=case.min_obs, **prior)
         if res is None or not np.isfinite(res.speed_kmh):
             fails += 1
             continue
@@ -315,6 +366,9 @@ def side_benchmark(n: int = 40, case: SideCase | None = None, seed: int = 0, phy
 
 BENCH_CASES: dict[str, SideCase] = {
     "基準（7 m・高さ 1.3 m・60fps・打点が体より 0.25 m 手前）": SideCase(),
+    "見えたコマが 5 以上だけ（前のやり方）": SideCase(min_obs=5),
+    "2 コマから・打点の目安 ±0.3 m（姿勢の手首から）": SideCase(min_obs=2, hit_prior_m=0.3),
+    "2 コマから・打点の目安なし": SideCase(min_obs=2),
     "打点が体の面の上（0 m）": SideCase(contact_offset_m=0.0),
     "6 m": SideCase(distance_m=6.0),
     "8 m・高さ 1.5 m": SideCase(distance_m=8.0, cam_height_m=1.5),
@@ -328,6 +382,7 @@ BENCH_CASES: dict[str, SideCase] = {
     "打点の時刻 +5 ms": SideCase(t_hit_err_s=0.005),
     "縦向きに撮る（1080×1920）": SideCase(width=1080, height=1920, hfov_deg=42.6, lead_m=1.0),
     "縦向き・120fps": SideCase(width=1080, height=1920, hfov_deg=42.6, lead_m=1.0, fps=120.0),
+    "120fps・2 コマから・打点の目安 ±0.3 m": SideCase(fps=120.0, min_obs=2, hit_prior_m=0.3),
 }
 
 
