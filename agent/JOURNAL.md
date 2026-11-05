@@ -14,6 +14,26 @@
 
 ---
 
+## 2026-11-05 08:30 E1 MediaPipe を入れて実動画で RTMPose と比べる（E1 は人のラベル待ちで `[?]` に）
+- 選んだ理由：ROADMAP の上から最初の `[~]`。残りのうち、人を待たずにできるのは MediaPipe を入れて同じ所で比べること。
+- やったこと：
+  - mediapipe 1.2.2（Apache 2.0、25 MB）を `.venv` に `--no-deps` で入れ、absl-py・certifi・sounddevice を足した
+    （依存の `opencv-contrib-python` は今の `opencv-python` と `cv2` を取り合う）。重み lite・full・heavy（6・9・31 MB）を `ckpts/pose/` に。
+  - MediaPipe は画像全体では側方の遠くの人を見つけない（IMG_5096 の 471 コマすべてで 0 人。lite・full・heavy とも。胴体 68 px）。
+    人の周りを切り出すと見つかったので、`pose.PersonDetector`（rtmlib の YOLOX を `accel.make_session` で DirectML に）と `square_crop` を作り、
+    `MediaPipeModel(detector=)` で枠を長い辺 × 1.5 の正方形で切り出して 1 人ずつ渡す。`make_model("mediapipe")` の既定にした
+    （rtmlib がなければ注意を出して画像全体）。CLI に `--variant`・`--no-crop`。入れ方の文言（README・エラー）を `--no-deps` に直した。
+  - テスト 3 件（`test_pose.py`：切り出しの範囲、切り出した人の関節を元の座標に戻す、実際のモデルがあれば人のいない画像で誰も返さない）。
+  - `docs/pose_features.md` に入れ方の注意と比べの表。QUESTIONS に「関節を 200 コマ付けてほしい」を書き、E1 を `[?]` にした。
+- 結果（数字。手で付けた関節がないので RTMPose（GPU）を仮の基準にした。両方とも信頼度 0.3 以上の関節で、差が胴体 × 0.2 以内の割合）：
+  - IMG_5096 17.8〜19.8 s（471 コマ）：lite 93%・3.5 px・118 ms/コマ、full 97%・3.2 px・134 ms、heavy 98%・2.9 px・276 ms。
+    どれも全コマで打つ人を見つけ、RTMPose と同じ人を選んだ。使える関節 94〜95%（RTMPose 100%）。full の右手首は 75%・左手首 65% のコマだけ
+    使える（振った後・着地。打点の前後 18.6〜18.9 s の右手首はすべて使え、差 3 px）。重ねた画像 `outputs/e1/IMG_5096_18_mp_overlay.jpg`。
+  - IMG_5109 1〜3 s（60 コマ、後ろから近く）：切り出しあり 97%・切り出しなし 98%（近くの人は画像全体でも見つかる）。
+- 品質チェック：通った（テスト 1480 秒、合成 MAPE 30fps 3.688% / 240fps 4.193%、hitter_position 6.955% / 6.059%、check_real_hits 再現率 0.929・
+  適合率 0.823、実動画 4 本 最大のずれ 0.00%・正しい初速との差の中央値 0.45σ、check_shot_speeds 2.43%・1.74%、ほかも前と同じ）。
+- 次にやること：E1 は人のラベル待ち（QUESTIONS）。ROADMAP の次は E1b（`[~]`、実動画の打点の誤差。人の打点のラベル待ちなら飛ばす）・E6・F1。
+
 ## 2026-11-05 06:30 E1 RTMPose の重みの取得と DirectML での実行（途中。E1 は `[~]` のまま）
 - 選んだ理由：ROADMAP の上から最初の `[~]`（B7・B7b は確認待ち）。QUESTIONS の E1 に 2026-11-04「RTMPose の重みを取ってきてよい」の答え。
 - やったこと：

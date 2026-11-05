@@ -11,6 +11,7 @@
   重みは初めて使うときに rtmlib が OpenMMLab の配布元から取ってくる（``balanced`` で合わせて約 100 MB）。
 - ``mediapipe``：MediaPipe Pose Landmarker（33 点を 17 点に読み替える）。Python 版は CPU で動く。
   重み（lite 約 6 MB・full 約 9 MB・heavy 約 30 MB）は初めて使うときに ``ckpts/pose/`` に取ってくる。
+  画像全体では遠くの人を見つけないので、RTMPose と同じ人の検出（YOLOX）の枠で切り出して渡す（``PersonDetector``）。
 
 1 コマに複数の人が写るときは、前のコマの打つ人にいちばん近い人（最初のコマは関節の範囲がいちばん大きい人）を選ぶ
 （``pick_person``）。信頼度の低い関節（隠れた非利き腕など）は ``clean`` で欠け（NaN）にし、短い欠けだけ前後から埋める。
@@ -27,6 +28,7 @@ import argparse
 import csv
 import json
 import urllib.request
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
@@ -153,7 +155,7 @@ class RTMPoseModel:
         try:
             from rtmlib import Body
         except ImportError as e:
-            raise ImportError("rtmlib が入っていません（pip install -e .[pose]）") from e
+            raise ImportError("rtmlib が入っていません（pip install --no-deps rtmlib tqdm）") from e
         from smash_speed.accel import make_session
 
         paths = rtmpose_model_paths(mode)
@@ -213,33 +215,76 @@ def mediapipe_model_path(variant: str = "full", download: bool = True) -> Path:
     return path
 
 
+class PersonDetector:
+    """人の検出（RTMPose と同じ rtmlib の YOLOX）。BGR の画像 → 人の枠 (N, 4) [x0, y0, x1, y1] [px]（大きい順）。
+
+    MediaPipe に人の周りを切り出して渡すのに使う。GPU があれば GPU で動かす。
+    """
+
+    def __init__(self, mode: str = "balanced", prefer: str | None = None):
+        try:
+            from rtmlib import YOLOX, Body
+        except ImportError as e:
+            raise ImportError("rtmlib が入っていません（pip install --no-deps rtmlib tqdm）") from e
+        from smash_speed.accel import make_session
+
+        path = rtmpose_model_paths(mode)["det"]
+        self.det = YOLOX(str(path), model_input_size=Body.MODE[mode]["det_input_size"], backend="onnxruntime",
+                         device="cpu")
+        self.det.session = make_session(self.det.onnx_model, prefer)
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        boxes = np.asarray(self.det(image), float).reshape(-1, 4)
+        area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        return boxes[np.argsort(-area)]
+
+
+def square_crop(box: np.ndarray, width: int, height: int, pad: float) -> tuple[int, int, int, int]:
+    """人の枠を、長い辺 × ``pad`` の正方形に広げた切り出しの範囲 (x0, y0, x1, y1) [px]（画像の中に収める）。"""
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    half = max(box[2] - box[0], box[3] - box[1]) * pad / 2
+    return (max(int(cx - half), 0), max(int(cy - half), 0), min(int(np.ceil(cx + half)), width),
+            min(int(np.ceil(cy + half)), height))
+
+
 class MediaPipeModel:
     """MediaPipe Pose Landmarker。33 点のうち COCO の 17 点に当たるものを返す（信頼度は visibility）。
+
+    MediaPipe は画像全体を 224 px ほどに縮めて人を探すので、側方 6〜8 m・1080p で身長 250 px ほどに写る人は見つからない
+    （IMG_5096 では 471 コマすべてで 0 人）。``detector`` を渡すと、その人の枠を正方形に広げて切り出し、1 人ずつ渡す。
 
     Args:
         variant: 重みの大きさ（``lite`` / ``full`` / ``heavy``）
         num_poses: 1 コマで探す人の数の上限
+        detector: 人の枠を返すもの（``PersonDetector`` など）。None なら画像全体を渡す
+        crop_pad: 切り出しの正方形の辺 ÷ 人の枠の長い辺
     """
 
     name = "mediapipe"
 
-    def __init__(self, variant: str = "full", num_poses: int = 2, model_path: str | Path | None = None):
+    def __init__(self, variant: str = "full", num_poses: int = 2, model_path: str | Path | None = None,
+                 detector: Callable[[np.ndarray], np.ndarray] | None = None, crop_pad: float = 1.5):
         try:
             import mediapipe as mp
             from mediapipe.tasks.python import BaseOptions, vision
         except ImportError as e:
-            raise ImportError("mediapipe が入っていません（pip install -e .[pose]）") from e
+            raise ImportError("mediapipe が入っていません（pip install --no-deps mediapipe absl-py certifi sounddevice）"
+                              ) from e
         self._mp = mp
+        self.num_poses = num_poses
+        self.detector = detector
+        self.crop_pad = crop_pad
         path = Path(model_path) if model_path else mediapipe_model_path(variant)
         opts = vision.PoseLandmarkerOptions(base_options=BaseOptions(model_asset_path=str(path)),
-                                            running_mode=vision.RunningMode.IMAGE, num_poses=num_poses)
+                                            running_mode=vision.RunningMode.IMAGE,
+                                            num_poses=1 if detector is not None else num_poses)
         self.landmarker = vision.PoseLandmarker.create_from_options(opts)
 
-    def __call__(self, image: np.ndarray) -> list[Person]:
+    def _detect(self, image: np.ndarray) -> list[Person]:
         import cv2
 
         h, w = image.shape[:2]
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         res = self.landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb))
         out: list[Person] = []
         for lms in res.pose_landmarks:
@@ -249,15 +294,37 @@ class MediaPipeModel:
             out.append((xy, np.clip(score, 0.0, 1.0)))
         return out
 
+    def __call__(self, image: np.ndarray) -> list[Person]:
+        if self.detector is None:
+            return self._detect(image)
+        h, w = image.shape[:2]
+        out: list[Person] = []
+        for box in self.detector(image)[:self.num_poses]:
+            x0, y0, x1, y1 = square_crop(box, w, h, self.crop_pad)
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                continue
+            for xy, score in self._detect(image[y0:y1, x0:x1]):
+                out.append((xy + (x0, y0), score))
+        return out
+
     def close(self) -> None:
         self.landmarker.close()
 
 
 def make_model(name: str, prefer: str | None = None, **kwargs: Any) -> PoseModel:
-    """名前（``MODELS``）からモデルを作る。"""
+    """名前（``MODELS``）からモデルを作る。
+
+    MediaPipe は、rtmlib があれば人の検出（``PersonDetector``）で切り出して渡す（``crop=False`` で画像全体）。
+    rtmlib がなければ、注意を出して画像全体を渡す（遠くに小さく写る人は見つからない）。
+    """
     if name == "rtmpose":
         return RTMPoseModel(prefer=prefer, **kwargs)
     if name == "mediapipe":
+        if kwargs.pop("crop", True) and "detector" not in kwargs:
+            try:
+                kwargs["detector"] = PersonDetector(prefer=prefer)
+            except ImportError as e:
+                warnings.warn(f"{e}。MediaPipe に画像全体を渡します（小さく写る人は見つかりません）", stacklevel=2)
         return MediaPipeModel(**kwargs)
     raise ValueError(f"姿勢推定のモデルは {', '.join(MODELS)} のどれかにしてください: {name!r}")
 
@@ -528,6 +595,9 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--end", type=float, default=None, help="終わり [s]")
     e.add_argument("--capture-fps", type=float, default=None)
     e.add_argument("--device", choices=("auto", "gpu", "cpu"), default=None)
+    e.add_argument("--variant", choices=("lite", "full", "heavy"), default="full", help="MediaPipe の重みの大きさ")
+    e.add_argument("--no-crop", action="store_true",
+                   help="MediaPipe に人の周りを切り出さず、画像全体を渡す（遠くに小さく写る人は見つからない）")
     e.add_argument("--out", required=True)
     c = sub.add_parser("pck", help="手で付けた関節（CSV）と推定（.npz）を比べる")
     c.add_argument("labels")
@@ -538,7 +608,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "estimate":
-        model = make_model(args.model, prefer=args.device)
+        extra = {"variant": args.variant, "crop": not args.no_crop} if args.model == "mediapipe" else {}
+        model = make_model(args.model, prefer=args.device, **extra)
         try:
             seq = estimate_video(args.video, model, args.start, args.end, capture_fps=args.capture_fps)
         finally:

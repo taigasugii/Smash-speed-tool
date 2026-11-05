@@ -180,6 +180,33 @@ def test_mediapipe_runs_if_installed():
         model.close()
 
 
+def test_square_crop_stays_inside_image():
+    """人の枠を長い辺 × pad の正方形に広げ、画像の外に出る所は切る。"""
+    from smash_speed.pose import square_crop
+    assert square_crop(np.array([100, 100, 140, 200]), 640, 480, 1.5) == (45, 75, 195, 225)
+    assert square_crop(np.array([0, 400, 50, 480]), 640, 480, 2.0) == (0, 360, 105, 480)
+
+
+def test_mediapipe_crops_people_and_maps_back():
+    """人の検出を渡すと、枠の周りを切り出して 1 人ずつ渡し、関節を元の画像の座標に戻す（大きい順に num_poses 人まで）。"""
+    from smash_speed.pose import MediaPipeModel
+    model = MediaPipeModel.__new__(MediaPipeModel)  # mediapipe を読まずに、切り出しの所だけ確かめる
+    model.num_poses = 2
+    model.crop_pad = 1.5
+    model.detector = lambda img: np.array([[100, 100, 140, 200], [400, 300, 420, 340], [10, 10, 20, 20]], float)
+    seen = []
+
+    def detect(crop):
+        seen.append(crop.shape[:2])
+        h, w = crop.shape[:2]
+        return [(np.tile([w / 2, h / 2], (NUM_KEYPOINTS, 1)), np.full(NUM_KEYPOINTS, 0.9))]
+
+    model._detect = detect
+    people = model(np.zeros((480, 640, 3), np.uint8))
+    assert seen == [(150, 150), (60, 60)]
+    assert np.allclose(people[0][0], [120, 150]) and np.allclose(people[1][0], [410, 320])
+
+
 def test_rtmpose_model_paths_use_ckpts(tmp_path, monkeypatch):
     """RTMPose の重みは ckpts/pose/rtmlib/ から読み、あれば取ってこない。なければ取ってこない設定では分かるように止まる。"""
     pytest.importorskip("rtmlib")
@@ -207,3 +234,21 @@ def test_rtmpose_runs_if_installed():
         pytest.skip("RTMPose の重みがない")
     model = RTMPoseModel(prefer="cpu")
     assert model(np.zeros((240, 320, 3), np.uint8)) == []
+
+
+def test_mediapipe_with_person_detector_runs_if_installed():
+    """MediaPipe・rtmlib と両方の重みがあれば、人の検出で切り出す MediaPipe が動き、人のいない画像では誰も返さない。"""
+    pytest.importorskip("mediapipe")
+    pytest.importorskip("rtmlib")
+    from smash_speed.pose import PersonDetector, make_model, mediapipe_model_path, rtmpose_model_paths
+    try:
+        mediapipe_model_path("full", download=False)
+        rtmpose_model_paths("balanced", download=False)
+    except FileNotFoundError:
+        pytest.skip("重みがない")
+    model = make_model("mediapipe", prefer="cpu")
+    try:
+        assert isinstance(model.detector, PersonDetector)
+        assert model(np.zeros((240, 320, 3), np.uint8)) == []
+    finally:
+        model.close()

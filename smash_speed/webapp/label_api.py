@@ -320,7 +320,7 @@ def install(app: Flask, out_root: Callable[[], Path], state: Callable[[], dict[s
         if model == "form":
             return jsonify(ok=True, model="form", people=prefill_from_form(out_root(), p.name, t, m.capture_fps))
         if model not in available_models() or not available_models()[model]:
-            return fail(ValueError("このモデルは入っていません（pip install -e .[pose]）"))
+            return fail(ValueError("このモデルは入っていません（README の「姿勢推定」の入れ方）"))
         img = VIDEOS.read(p, frame)
         if img is None:
             return fail(ValueError("コマを読めませんでした"))

@@ -17,7 +17,7 @@ RTMPose はもともと 17 点、MediaPipe Pose は 33 点のうち同じ所の 
 | モデル | ライセンス | 重み | GPU | 入れ方 |
 |---|---|---|---|---|
 | RTMPose（rtmlib） | Apache 2.0（rtmlib・RTMPose のコード） | `balanced` で人の検出（YOLOX-m 約 97 MB）と関節（RTMPose-m 約 52 MB）。初めて使うときに OpenMMLab の配布元から `ckpts/pose/rtmlib/` に取ってくる（`rtmpose_model_paths`） | ONNX なので `accel.make_session` に載せ替え、デスクトップでは DirectML | `pip install --no-deps rtmlib tqdm`（下の注意） |
-| MediaPipe Pose Landmarker | Apache 2.0（コードと重み） | lite 約 6 MB・full 約 9 MB・heavy 約 30 MB。`ckpts/pose/` に取ってくる | Python 版は CPU だけ | `pip install -e .[pose]` |
+| MediaPipe Pose Landmarker | Apache 2.0（コードと重み） | lite 約 6 MB・full 約 9 MB・heavy 約 30 MB。`ckpts/pose/` に取ってくる | Python 版は CPU だけ（人の検出だけ DirectML） | `pip install --no-deps mediapipe absl-py certifi sounddevice`（下の注意） |
 
 - rtmlib は `onnxruntime`（CPU 版）を一緒に入れようとする。Windows で `onnxruntime-directml` と両方入ると壊れる（`docs/gpu.md`）ので、
   `--no-deps` で入れる。
@@ -28,6 +28,26 @@ RTMPose はもともと 17 点、MediaPipe Pose は 33 点のうち同じ所の 
 - RTMPose の重みは body7（COCO・AI Challenger・CrowdPose・MPII・Halpe など 7 つのデータの集まり）で学習されている。
   コードは Apache 2.0 だが、学習に使ったデータには研究用に限るものが含まれる。個人の解析に使う分には問題になりにくいが、
   解析の結果やモデルを配るときは確かめ直す。
+- mediapipe（1.2.2）は `opencv-contrib-python` を一緒に入れようとし、今の `opencv-python` と同じ `cv2` を取り合うので、
+  rtmlib と同じく `--no-deps` で入れ、足りない小さなもの（absl-py・certifi・sounddevice。flatbuffers・matplotlib は入っている）だけ足す。
+  `.[pose]` で入れると opencv が 2 つ入るので使わない。
+- MediaPipe は画像全体を 224 px ほどに縮めて人を探すので、側方の撮影（1080p で身長 250 px・胴体 70 px ほど）では人を見つけない
+  （IMG_5096 17.8〜19.8 s の 471 コマすべてで 0 人。lite・full・heavy とも）。そこで RTMPose と同じ人の検出（YOLOX、`PersonDetector`）の
+  枠を長い辺の 1.5 倍の正方形に広げて切り出し、1 人ずつ渡す（`make_model("mediapipe")` の既定。`--no-crop` で画像全体）。
+- MediaPipe（切り出し）と RTMPose の比べ（2026-11-05、手で付けた関節がまだないので、RTMPose を仮の基準にした一致の割合。
+  両方とも信頼度 0.3 以上の関節で、差が RTMPose の胴体の長さ × 0.2 以内の割合）：
+
+  | 動画 | モデル | 1 コマ | 人が見つかったコマ | 使える関節 | RTMPose との一致 | 差の中央値 |
+  |---|---|---|---|---|---|---|
+  | IMG_5096 17.8〜19.8 s（1080p・236fps、側方の遠く） | lite | 118 ms | 100% | 94% | 93% | 3.5 px |
+  | 〃 | full | 134 ms | 100% | 95% | 97% | 3.2 px |
+  | 〃 | heavy | 276 ms | 100% | 94% | 98% | 2.9 px |
+  | IMG_5109 1〜3 s（2530×1422・30fps、後ろから近く） | full | — | 100% | 91% | 97% | 0.043 × 胴体 |
+
+  （1 コマの時間は人の検出（DirectML）と、見つかった人 4 人までの MediaPipe（CPU）を合わせたもの。RTMPose は 32 ms）
+  MediaPipe は振った後・着地のあたりで手首・肘の信頼度が下がり（IMG_5096 の full で右手首は 75%、左手首は 65% のコマだけ使える。
+  打点の前後 18.6〜18.9 s の右手首はすべて使え、RTMPose との差は 3 px）、RTMPose は 100% 使える（ただし正しいかは分からない）。
+  重ねた画像：`outputs/e1/IMG_5096_18_mp_overlay.jpg`（18.5・18.81・19.2 s）。
 - どちらのモデルを使うかは、手で付けた関節（約 200 コマ）との PCK で決める（下）。まだ人が付けていないので決めていない。
 
 ### 打つ人の選び方
