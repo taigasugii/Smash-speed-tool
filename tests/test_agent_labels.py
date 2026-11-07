@@ -4,10 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from smash_speed.train.agent_labels import (answers_to_labels, compare_answers, implausible_jumps, item_tiles,
+from smash_speed.train.agent_labels import (answers_to_labels, compare_answers, compare_label_dirs,
+                                            detections_as_pred, evaluate_dir, implausible_jumps, item_tiles,
                                             merge_labels, parse_answer, pick_frames, pick_recheck, pick_sequence,
-                                            save_labels, seq_windows, snap, summary, write_check_sheets,
-                                            write_sheets, write_zoom)
+                                            save_labels, seq_windows, snap, summary, tolerance_for_width,
+                                            write_check_sheets, write_sheets, write_zoom)
 
 W, H = 640, 360
 
@@ -180,3 +181,39 @@ def test_overview_and_zoom(tmp_path):
     wide = item_tiles(get, item, det, 40, 1.0, overview=True)
     assert wide.shape[0] == plain.shape[0] and wide.shape[1] > plain.shape[1]
     assert write_zoom(get, [(5, 200.0, 150.0), (0, 100.0, 150.0)], tmp_path / "z.jpg", half=20).exists()
+
+
+def test_detections_as_pred_and_tolerance():
+    det, tab = _det()
+    p = detections_as_pred(det, {1}).set_index("frame")
+    assert len(p) == 40 and p.loc[13, "visible"] == 0 and p.loc[5, "x_px"] == 150.0
+    a = detections_as_pred(det).set_index("frame")
+    assert a.loc[13, "x_px"] == 500.0 and a.loc[31, "visible"] == 1   # 負けた・落ちた軌道の点も使う
+    assert tolerance_for_width(512) == 4.0 and tolerance_for_width(2560) == 20.0
+
+
+def test_evaluate_dir_compare_and_span_reasons(tmp_path):
+    det, tab = _det()
+    d = tmp_path / "e"
+    d.mkdir()
+    det.to_csv(d / "detections_None_None.csv", index=False)
+    tab.to_csv(d / "tracks.csv", index=False)
+    pd.DataFrame({"id": [0], "frame": [0], "video": ["v.mp4"]}).to_csv(d / "candidates.csv", index=False)
+    lab = pd.DataFrame({"frame": [5, 13, 31, 35], "timestamp": 0.0, "x_px": [151.0, 230.0, np.nan, np.nan],
+                        "y_px": [190.0, 174.0, np.nan, np.nan], "visible": [1, 1, 0, -1], "event": "",
+                        "source": ["agent_ok_snap", "agent_p", "agent_n", "agent_u"],
+                        "reason": ["span", "span_gap", "span_gap", "span_gap"]})
+    lab.to_csv(d / "labels.csv", index=False)
+    e = evaluate_dir(d, width=640)                                  # 距離 5 px
+    s = e["selected"]
+    assert e["tolerance_px"] == 5.0 and (s["tp"], s["fn"], s["tn"]) == (1, 1, 1)   # 13 は途切れ、31 は選んでいない
+    assert e["all"]["fp_far"] == 1 and e["all"]["fp_invisible"] == 1  # 負けた軌道（13）と落ちた軌道（31）の点
+    assert (d / "eval.json").exists()
+    d2 = tmp_path / "f"
+    d2.mkdir()
+    lab.assign(source=["agent_ok", "agent_n", "agent_n", "agent_u"], visible=[1, 0, 0, -1],
+               x_px=[153.0, np.nan, np.nan, np.nan]).to_csv(d2 / "labels.csv", index=False)
+    c = compare_label_dirs(d, d2)
+    assert c["n"] == 4 and c["agree"] == 3 and c["disagree_frames"] == [13] and c["dist_median_px"] == 2.0
+    by = summary(lab)["by_reason"]                                   # 「span」は「span_gap」を数えない
+    assert by["span"]["n"] == 1 and by["span_gap"]["n"] == 3 and by["span_gap"]["moved"] == 1

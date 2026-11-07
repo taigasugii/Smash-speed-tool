@@ -31,12 +31,15 @@
     （見本帳 outputs/train_labels/IMG_5109/sheets/*.jpg を見て answers.csv を書く）
     python -m smash_speed.train.agent_labels apply outputs/train_labels/IMG_5109
     （日を変えて 1 割を付け直す：recheck/sheets を見て recheck/answers.csv を書き、前の答えと比べる）
-    python -m smash_speed.train.agent_labels recheck pick outputs/train_labels/IMG_5109
+    python -m smash_speed.train.agent_labels recheck pick outputs/train_labels/IMG_5109  （答え合わせ用は --overview）
     python -m smash_speed.train.agent_labels recheck compare outputs/train_labels/IMG_5109
-    （答え合わせ用：続いた 40 コマの区間を 200 コマ分。右にコマ全体を縮めたものが付く）
-    python -m smash_speed.train.agent_labels pick IMG_5109_2.MP4 --camera clips:IMG_5109_2 --out outputs/train_labels/eval/IMG_5109_2 --n 200 --seq 40
+    （答え合わせ用：続いた 40 コマの区間を 200 コマ分。右にコマ全体を縮めたものが付く。置き場所は学習用と分けて outputs/eval_labels/）
+    python -m smash_speed.train.agent_labels pick IMG_5109_2.MP4 --camera clips:IMG_5109_2 --out outputs/eval_labels/IMG_5109_2 --n 200 --seq 40
     （迷うコマを 3 倍に拡大して前後 2 コマと並べる）
     python -m smash_speed.train.agent_labels zoom IMG_5109.MP4 zoom.jpg 775:1210:330 1000:640:415
+    （答え合わせ：正解と同じ所の今の検出を比べる。別々に付けた 2 つの正解どうしを比べる）
+    python -m smash_speed.train.agent_labels eval outputs/eval_labels/IMG_4397_80_100
+    python -m smash_speed.train.agent_labels compare outputs/eval_labels/IMG_5109_2 outputs/train_labels/eval/IMG_5109_2
 """
 
 from __future__ import annotations
@@ -54,7 +57,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 CANDIDATES_FILE = "candidates.csv"
 ANSWERS_FILE = "answers.csv"
-REASONS = ("gap", "jump", "rejected", "track_end", "edge", "normal", "seq")
+REASONS = ("gap", "jump", "rejected", "track_end", "edge", "normal", "seq",
+           "span", "span_gap")  # span・span_gap は 11-07 の答え合わせ用（区間のすべてのコマ）で使った理由
 
 
 # =============================================================================
@@ -445,8 +449,9 @@ def summary(labels: pd.DataFrame) -> dict[str, Any]:
                            "not_shuttle": int((labels.source == "agent_x").sum()),
                            "other_court": int(labels.source.str.fullmatch(r"agent_o(_snap)?").sum())}
     by = {}
+    parts = labels.reason.astype(str).str.split("+")  # 「span」が「span_gap」に含まれるので、語ごとに比べる
     for reason in REASONS:
-        m = labels.reason.str.contains(reason, regex=False)
+        m = parts.map(lambda r: reason in r).astype(bool)
         if m.any():
             s = labels.source[m]
             by[reason] = {"n": int(m.sum()), "candidate_ok": int(s.str.startswith("agent_ok").sum()),
@@ -573,6 +578,58 @@ def apply_answers(out_dir: Path, snap_pos: bool = True) -> dict[str, Any]:
 
 
 # =============================================================================
+# 答え合わせ（今の検出と比べる）
+# =============================================================================
+def tolerance_for_width(width: int, px_at_512: float = 4.0) -> float:
+    """TrackNet の評価（幅 512 px で 4 px 以内）を、動画の幅に合わせた距離 [px] にする。"""
+    return px_at_512 * width / 512.0
+
+
+def detections_as_pred(det_all: pd.DataFrame, track_ids: set[int] | None = None) -> pd.DataFrame:
+    """検出を 1 コマ 1 点の予測にする（``track_ids`` があればその軌道の点だけ。確かさの高い点を優先）。"""
+    frames = pd.DataFrame({"frame": sorted(det_all.frame.unique())})
+    v = det_all[(det_all.visible > 0) & det_all.x_px.notna()]
+    if track_ids is not None:
+        v = v[v.track_id.isin(track_ids)]
+    v = v.sort_values(["frame", "confidence"], ascending=[True, False]).drop_duplicates("frame")
+    out = frames.merge(v[["frame", "x_px", "y_px"]], on="frame", how="left")
+    out["visible"] = out.x_px.notna().astype(int)
+    return out
+
+
+def evaluate_dir(out_dir: Path, px_at_512: float = 4.0, width: int | None = None) -> dict[str, Any]:
+    """答え合わせ用の正解（``labels.csv``）と、同じ所の検出（``detections_*.csv``・``tracks.csv``）を比べ、
+    ``eval.json`` に書く。``selected`` は選んだ軌道の点（ショットの解析が使うもの）、``all`` は軌道を選ぶ前の
+    いちばん確かな点。距離は ``tolerance_for_width``（``_tol2x`` はその 2 倍）。"""
+    from smash_speed.train.metrics import detection_metrics
+
+    labels = pd.read_csv(out_dir / "labels.csv")
+    det_all = pd.read_csv(sorted(out_dir.glob("detections_*.csv"))[0])
+    tab = pd.read_csv(out_dir / "tracks.csv")
+    video = str(pd.read_csv(out_dir / CANDIDATES_FILE).video.iloc[0])
+    if width is None:
+        from smash_speed.config import load_config
+        from smash_speed.video_io import probe
+
+        width = probe(_video_path(video), None, load_config(None)).width
+    tol = tolerance_for_width(width, px_at_512)
+    gt = labels[["frame", "x_px", "y_px", "visible"]]
+    out: dict[str, Any] = {"video": video, "width": int(width), "tolerance_px": round(tol, 1)}
+    for name, ids in (("selected", set(tab.track_id[tab.selected])), ("all", None)):
+        pred = detections_as_pred(det_all, ids)
+        out[name] = detection_metrics(pred, gt, tol)
+        out[name + "_tol2x"] = detection_metrics(pred, gt, 2 * tol)
+    (out_dir / "eval.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    return out
+
+
+def compare_label_dirs(dir_a: Path, dir_b: Path) -> dict[str, Any]:
+    """別々に付けた 2 つの正解（``labels.csv``）の、同じコマどうしを ``compare_answers`` で比べる
+    （例えば日を変えて同じ動画を付けたもの。付け方のぶれの目安）。"""
+    return compare_answers(pd.read_csv(dir_a / "labels.csv"), pd.read_csv(dir_b / "labels.csv"))
+
+
+# =============================================================================
 # 付け直し・見直し
 # =============================================================================
 RECHECK_DIR = "recheck"
@@ -625,8 +682,9 @@ def implausible_jumps(labels: pd.DataFrame, width: int, max_gap: int = 3, max_st
     return pd.DataFrame(rows, columns=["frame_a", "frame_b", "px_per_frame"])
 
 
-def recheck_pick(out_dir: Path, frac: float, seed: int, half: int) -> pd.DataFrame:
-    """付け直すコマを選んで ``recheck/candidates.csv`` と見本帳を書く（前の答えは ``answers.csv`` にだけある）。"""
+def recheck_pick(out_dir: Path, frac: float, seed: int, half: int, overview: bool = False) -> pd.DataFrame:
+    """付け直すコマを選んで ``recheck/candidates.csv`` と見本帳を書く（前の答えは ``answers.csv`` にだけある）。
+    ``overview`` なら 1 行 1 コマで右にコマ全体の縮めた画像も並べる（答え合わせ用の「写っていない」を決めるとき）。"""
     from smash_speed.config import load_config
     from smash_speed.video_io import probe
 
@@ -639,7 +697,8 @@ def recheck_pick(out_dir: Path, frac: float, seed: int, half: int) -> pd.DataFra
     meta = probe(_video_path(str(cands.video.iloc[0])), None, load_config(None))
     dets = sorted(out_dir.glob("detections_*.csv"))
     det_all = pd.read_csv(dets[0]) if dets else pd.DataFrame(columns=["frame", "x_px", "y_px", "visible"])
-    write_sheets(FrameGetter(meta), items, det_all, rd / "sheets", half=half)
+    write_sheets(FrameGetter(meta), items, det_all, rd / "sheets", half=half, per_row=1 if overview else 2,
+                 overview=overview)
     return items
 
 
@@ -676,10 +735,15 @@ def main(argv: list[str] | None = None) -> int:
     z_.add_argument("--half", type=int, default=60); z_.add_argument("--zoom", type=float, default=3.0)
     a_ = sub.add_parser("apply", help="answers.csv を正解ラベルにする")
     a_.add_argument("out"); a_.add_argument("--no-snap", action="store_true")
+    e_ = sub.add_parser("eval", help="答え合わせ用の正解と、同じ所の今の検出を比べる（eval.json）")
+    e_.add_argument("out")
+    c_ = sub.add_parser("compare", help="別々に付けた 2 つの正解の、同じコマどうしを比べる")
+    c_.add_argument("a"); c_.add_argument("b")
     r_ = sub.add_parser("recheck", help="答えたコマの一部を付け直す（pick：見本帳を書く、compare：前の答えと比べる）")
     r_.add_argument("step", choices=["pick", "compare"]); r_.add_argument("out")
     r_.add_argument("--frac", type=float, default=0.1); r_.add_argument("--seed", type=int, default=0)
     r_.add_argument("--half", type=int, default=120)
+    r_.add_argument("--overview", action="store_true", help="見本帳にコマ全体の縮めた画像も並べる")
     a = ap.parse_args(argv)
     if (sys.stdout.encoding or "").lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8")
@@ -693,9 +757,13 @@ def main(argv: list[str] | None = None) -> int:
         get = FrameGetter(probe(_video_path(a.video), None, load_config(None)))
         specs = [(int(f), float(x), float(y)) for f, x, y in (s.split(":") for s in a.spec)]
         print(write_zoom(get, specs, Path(a.out), a.half, a.zoom))
+    elif a.cmd == "eval":
+        print(json.dumps(evaluate_dir(Path(a.out)), ensure_ascii=False, indent=1))
+    elif a.cmd == "compare":
+        print(json.dumps(compare_label_dirs(Path(a.a), Path(a.b)), ensure_ascii=False, indent=1))
     elif a.cmd == "recheck":
         if a.step == "pick":
-            c = recheck_pick(Path(a.out), a.frac, a.seed, a.half)
+            c = recheck_pick(Path(a.out), a.frac, a.seed, a.half, a.overview)
             print(f"{len(c)} コマ → {Path(a.out) / RECHECK_DIR}")
         else:
             print(json.dumps(recheck_compare(Path(a.out)), ensure_ascii=False, indent=1))
