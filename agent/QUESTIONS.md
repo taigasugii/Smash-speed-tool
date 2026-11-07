@@ -34,6 +34,18 @@ IMG_5096 のジャンプスマッシュ（17.8〜19.8 s）では、2 つの関�
 フォアハンドのハイクリアを 10 本ほど撮って `videos_dir` に入れてください。できれば身長も教えてください（画像の縮尺に使います）。
 答え：「撮った（ファイル名・身長）」「まだ撮れない」など。答えが付くまで、E6 は合成での確かめまでにします。
 
+### F1b TrackNetV3 の学習済みの重みを置いてほしい（2026-11-08）
+F1a の正解（学習用 1,100 コマ）で、TrackNetV3 と同じ形のモデルを GPU で学習し、答え合わせ用の正解で今の検出と比べる道具
+（`smash_speed/train/tracknet_train.py`）ができました。ただ、手元に TrackNetV3 の学習済みの重みがなく、エージェントは
+ネットから取ってこられない（Google Drive からの取得で、コマンドの許可もない）ので、今は乱数から学習した数字しか出せません。
+1,100 コマを乱数から学習しても、今の検出には届かない見込みです（追加学習の土台がないため）。
+
+お願い：TrackNetV3（https://github.com/qaz812345/TrackNetV3 、MIT License）の README にある Google Drive から
+`TrackNetV3_ckpts.zip` を取ってきて、中の **`TrackNet_best.pt`** を **`ckpts/tracknetv3/TrackNet_best.pt`**（このリポジトリの中。
+`ckpts/` は Git に入らない）に置いてください（`InpaintNet_best.pt` も同じ所に置いてもらえれば、あとで使います）。
+置いてもらえれば、エージェントが `--init ckpts/tracknetv3/TrackNet_best.pt` で追加学習し、今の検出と比べます。
+答え：「置いた」「TrackNetV3 は使わない（乱数からの学習・別の方法で）」など。答えが付くまで、F1b は乱数からの学習での確かめまでにします。
+
 ## 済み
 
 ### A2b 学習用の PyTorch（GPU）を入れてよいか（2026-10-28）

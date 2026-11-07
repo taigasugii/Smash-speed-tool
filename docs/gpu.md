@@ -116,3 +116,30 @@ opt = make_adam(model.parameters(), lr=1e-4, device=device)
   学習は 1 つのプロセスで 1 つのモデルにする。1 秒に学習できる組の数は 1〜4 組でほぼ同じ（約 20〜23 組）なので、小さくしても遅くはならない。
   ただし BatchNorm は組が少ないと不安定になりやすいので、F1 で組の数と精度の関係を見る。
 - 目安：1 万組の学習データなら、1 周（エポック）が GPU で約 8 分、CPU で約 6 時間。
+
+## エージェントの正解での学習（F1b、2026-11-08）
+
+道具：`smash_speed/train/tracknet_train.py`。TrackNetV3 の `train.py` は CUDA と「ラリーの全コマに正解がある」ことを前提にしているので使わず、
+`torch_device` の装置・Adam で自前に回す。F1a の正解はとびとびのコマで、「印はシャトルでない」のようにコマのほかの所が分からない答えも
+あるので、損失は正解のある所だけで数える（見える・写っていない：コマ全体、シャトルでない印：候補の周り半径 8 px（288×512 で）、
+分からない・隣のコート・正解のないコマ：数えない）。入力は TrackNetV3（`bg_mode: concat`）と同じ、背景（区間の 40 コマの中央値）＋ 8 コマの RGB。
+
+```
+# .venv：正解のコマを含む 8 コマの区間を 288×512 にして書き出す（学習用・答え合わせ用）
+.venv\Scripts\python -m smash_speed.train.tracknet_train build outputs\f1b\train outputs\train_labels\IMG_3391 ...
+.venv\Scripts\python -m smash_speed.train.tracknet_train build --contiguous outputs\f1b\eval outputs\eval_labels\IMG_4397_80_100 outputs\eval_labels\IMG_5109_2
+# .venv-train（PYTHONPATH にこのリポジトリ）：学習と、答え合わせ用の熱の地図
+.venv-train\Scripts\python -m smash_speed.train.tracknet_train train outputs\f1b\train outputs\f1b\run --epochs 30 --init ckpts\tracknetv3\TrackNet_best.pt
+.venv-train\Scripts\python -m smash_speed.train.tracknet_train predict outputs\f1b\eval outputs\f1b\run\model.pt
+# .venv：熱の地図を点にして（閾値 0.5 の最も大きな塊の中心）、今の検出（eval_labels の eval.json）と比べる
+.venv\Scripts\python -m smash_speed.train.tracknet_train eval outputs\f1b\eval outputs\f1b\run\model_pred.npy
+```
+
+- 重み：学習したものは `<出力>/model.pt`（検証の損失がいちばん小さいとき）と `model_last.pt`。`outputs/` の中なので Git に入らない。
+  TrackNetV3 の学習済みの重みは `ckpts/tracknetv3/TrackNet_best.pt` に置く（`ckpts/` も Git に入らない）。`--init` は層の並びが
+  同じなので名前ではなく順番で対応させて読む（形が違えば止まる）。
+- 書き出しの量：学習用 8 フォルダー（9 区間）・652 区間（正解 902 コマ：見える 509・シャトルでない印 393）で 2.3 GB、約 6.5 分。
+- 乱数からの学習（2026-11-08、学習済みの重みがないため）：検証 65 区間、1 周 約 60 秒（RX 7900 XT、2 組）、30 周で損失 0.166 → 0.0003。
+  答え合わせ用では、閾値 0.5 でシャトルを 1 つも出さず、正解の所が熱の地図のいちばん高い所になるのは見える 527 コマの 12% だけ
+  （閾値を 0.1〜0.2 に下げても適合率 0.02〜0.36）。1,000 コマほどのとびとびの正解では、乱数からはシャトルを覚えない。
+  追加学習には TrackNetV3 の学習済みの重みが要る（`agent/QUESTIONS.md` の F1b）。
