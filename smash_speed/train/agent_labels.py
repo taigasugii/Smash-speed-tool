@@ -14,6 +14,7 @@
     track_end  選んだ軌道の始まりと終わり（打った瞬間・画面の外へ出る所）
     edge       画面の端（上・左右）に近い点
     normal     選んだ軌道の途中のふつうのコマ（全体の 2〜3 割。学習が偏らないように）
+    seq        答え合わせ用の、続いたコマ（``pick --seq``。怪しいかどうかに関係なくすべて）
 
 答え（``answers.csv`` の ``id,answer``）::
 
@@ -32,6 +33,10 @@
     （日を変えて 1 割を付け直す：recheck/sheets を見て recheck/answers.csv を書き、前の答えと比べる）
     python -m smash_speed.train.agent_labels recheck pick outputs/train_labels/IMG_5109
     python -m smash_speed.train.agent_labels recheck compare outputs/train_labels/IMG_5109
+    （答え合わせ用：続いた 40 コマの区間を 200 コマ分。右にコマ全体を縮めたものが付く）
+    python -m smash_speed.train.agent_labels pick IMG_5109_2.MP4 --camera clips:IMG_5109_2 --out outputs/train_labels/eval/IMG_5109_2 --n 200 --seq 40
+    （迷うコマを 3 倍に拡大して前後 2 コマと並べる）
+    python -m smash_speed.train.agent_labels zoom IMG_5109.MP4 zoom.jpg 775:1210:330 1000:640:415
 """
 
 from __future__ import annotations
@@ -49,7 +54,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 CANDIDATES_FILE = "candidates.csv"
 ANSWERS_FILE = "answers.csv"
-REASONS = ("gap", "jump", "rejected", "track_end", "edge", "normal")
+REASONS = ("gap", "jump", "rejected", "track_end", "edge", "normal", "seq")
 
 
 # =============================================================================
@@ -145,6 +150,66 @@ def pick_frames(det_all: pd.DataFrame, tab: pd.DataFrame, width: int, height: in
     return out[["frame", "timestamp", "reason", "cand_x", "cand_y", "predicted"]]
 
 
+def seq_windows(det_all: pd.DataFrame, tab: pd.DataFrame, n_windows: int, length: int, seed: int = 0,
+                exclude: set[int] | None = None) -> list[int]:
+    """答え合わせ用の、続いたコマの区間の始まり（選んだ軌道があるコマを中心に、重ならないように）。"""
+    rng = np.random.default_rng(seed)
+    exclude = exclude or set()
+    sel_ids = set(tab.track_id[tab.selected]) if len(tab) else set()
+    on = np.sort(det_all.frame[det_all.track_id.isin(sel_ids) & (det_all.visible > 0)].unique().astype(int))
+    last = int(det_all.frame.max())
+    starts: list[int] = []
+    for c in rng.permutation(on):
+        s = int(min(max(0, c - length // 2), max(0, last - length + 1)))
+        if any(abs(s - t) < length for t in starts) or exclude & set(range(s, s + length)):
+            continue
+        starts.append(s)
+        if len(starts) >= n_windows:
+            break
+    return sorted(starts)
+
+
+def pick_sequence(det_all: pd.DataFrame, tab: pd.DataFrame, starts: list[int], length: int) -> pd.DataFrame:
+    """答え合わせ用：``starts`` から ``length`` コマずつ、続いたコマをすべて選ぶ（怪しいコマだけだと、
+    再現率・適合率が偏る）。
+
+    候補は選んだ軌道の点。なければ前後の選んだ点を線で結んだ位置（予測）、片側しかなければその点（予測）、
+    どちらもなければほかの軌道でいちばん確からしい点。``reason`` は ``seq``。
+    """
+    frames = det_all[["frame", "timestamp"]].drop_duplicates("frame").set_index("frame").timestamp
+    vis = det_all[(det_all.visible > 0) & det_all.x_px.notna()]
+    sel_ids = set(tab.track_id[tab.selected]) if len(tab) else set()
+    sel = vis[vis.track_id.isin(sel_ids)].sort_values(["frame", "confidence"], ascending=[True, False])
+    sel = sel.drop_duplicates("frame").set_index("frame")
+    other = vis.sort_values("confidence", ascending=False).drop_duplicates("frame").set_index("frame")
+    sf = sel.index.to_numpy(int)
+    rows = []
+    for s in starts:
+        for f in range(int(s), int(s) + length):
+            if f not in frames.index:
+                continue
+            if f in sel.index:
+                x, y, pred = float(sel.x_px[f]), float(sel.y_px[f]), False
+            else:
+                k = int(np.searchsorted(sf, f))
+                a = sf[k - 1] if k > 0 else None
+                b = sf[k] if k < len(sf) else None
+                if a is not None and b is not None and b - a <= 2 * length:
+                    w = (f - a) / (b - a)
+                    x, y = (1 - w) * sel.loc[a, ["x_px", "y_px"]].to_numpy(float) + w * sel.loc[b, ["x_px", "y_px"]].to_numpy(float)
+                    pred = True
+                elif f in other.index:
+                    x, y, pred = float(other.x_px[f]), float(other.y_px[f]), False
+                elif a is not None or b is not None:
+                    x, y = sel.loc[a if a is not None else b, ["x_px", "y_px"]].to_numpy(float)
+                    pred = True
+                else:
+                    continue
+            rows.append({"frame": f, "timestamp": float(frames[f]), "reason": "seq", "cand_x": float(x),
+                         "cand_y": float(y), "predicted": bool(pred)})
+    return pd.DataFrame(rows, columns=["frame", "timestamp", "reason", "cand_x", "cand_y", "predicted"])
+
+
 # =============================================================================
 # 見本帳
 # =============================================================================
@@ -179,18 +244,27 @@ def _cross(tile: np.ndarray, u: float, v: float, col: tuple[int, int, int], r0: 
         cv2.line(tile, (u + a[0], v + a[1]), (u + b[0], v + b[1]), col, 1)
 
 
-def item_tiles(get_frame, item: pd.Series, det_all: pd.DataFrame, half: int, zoom: float) -> np.ndarray:
+def _overview(img: np.ndarray, x0: int, y0: int, size: int, height: int) -> np.ndarray:
+    """コマ全体を縮めたもの（高さ ``height``）に、切り出した範囲の枠を描く（画面の外へ出たか・どこを見ているか）。"""
+    s = height / img.shape[0]
+    t = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    cv2.rectangle(t, (int(x0 * s), int(y0 * s)), (int((x0 + size) * s), int((y0 + size) * s)), (255, 255, 0), 1)
+    return t
+
+
+def item_tiles(get_frame, item: pd.Series, det_all: pd.DataFrame, half: int, zoom: float,
+               overview: bool = False) -> np.ndarray:
     """1 コマ分：前・このコマ・次のコマの切り出し（同じ範囲）。このコマには候補（水色、予測なら紫）と、
-    ほかの検出の点（赤）の印を付ける。"""
+    ほかの検出の点（赤）の印を付ける。``overview`` なら、右にコマ全体を縮めたものを足す。"""
     f = int(item.frame)
-    tiles = []
+    tiles, ov = [], None
     for d in (-1, 0, 1):
         try:
             img = get_frame(f + d)
         except IndexError:
             img = None
         if img is None:
-            tiles.append(np.zeros((int(2 * half * zoom),) * 2 + (3,), np.uint8))
+            tiles.append(np.zeros((int(2 * half * zoom), int(2 * half * zoom) + 2, 3), np.uint8))
             continue
         t, x0, y0 = _crop(img, item.cand_x, item.cand_y, half, zoom)
         _grid(t, x0, y0, zoom, labels=d == 0)
@@ -203,6 +277,10 @@ def item_tiles(get_frame, item: pd.Series, det_all: pd.DataFrame, half: int, zoo
                    (255, 0, 255) if item.predicted else (255, 255, 0))
         cv2.putText(t, f"{f + d}", (3, 13), 0, 0.42, (255, 255, 255), 1)
         tiles.append(cv2.copyMakeBorder(t, 0, 0, 0, 2, cv2.BORDER_CONSTANT, value=(80, 80, 80)))
+        if d == 0 and overview:
+            ov = _overview(img, x0, y0, 2 * half, t.shape[0])
+    if overview:
+        tiles.append(ov if ov is not None else np.zeros((tiles[0].shape[0],) * 2 + (3,), np.uint8))
     row = np.hstack(tiles)
     head = np.zeros((18, row.shape[1], 3), np.uint8)
     cv2.putText(head, f"#{int(item.id)}  {item.reason}", (3, 13), 0, 0.45, (255, 255, 255), 1)
@@ -210,13 +288,13 @@ def item_tiles(get_frame, item: pd.Series, det_all: pd.DataFrame, half: int, zoo
 
 
 def write_sheets(get_frame, items: pd.DataFrame, det_all: pd.DataFrame, out_dir: Path, half: int = 120,
-                 zoom: float = 1.0, per_row: int = 2, rows: int = 4) -> list[Path]:
+                 zoom: float = 1.0, per_row: int = 2, rows: int = 4, overview: bool = False) -> list[Path]:
     """見本帳（1 枚に ``per_row × rows`` コマ）を書く。``items`` には列 ``id`` が要る。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     per = per_row * rows
     for s in range(0, len(items), per):
-        part = [item_tiles(get_frame, it, det_all, half, zoom) for _, it in items.iloc[s:s + per].iterrows()]
+        part = [item_tiles(get_frame, it, det_all, half, zoom, overview) for _, it in items.iloc[s:s + per].iterrows()]
         blank = np.zeros_like(part[0])
         part += [blank] * (-len(part) % per_row)
         part = [cv2.copyMakeBorder(p, 0, 4, 0, 6, cv2.BORDER_CONSTANT, value=(255, 255, 255)) for p in part]
@@ -225,6 +303,31 @@ def write_sheets(get_frame, items: pd.DataFrame, det_all: pd.DataFrame, out_dir:
         cv2.imwrite(str(p), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
         paths.append(p)
     return paths
+
+
+def write_zoom(get_frame, specs: list[tuple[int, float, float]], out: Path, half: int = 60, zoom: float = 3.0,
+               span: int = 2) -> Path:
+    """迷うコマを拡大して、前後 ``span`` コマと並べる（1 行に 1 コマ）。``specs`` は (コマ, x, y)。
+
+    見本帳の等倍の切り出しでは、落ちていくシャトルのぶれや 4K の動画のシャトルが薄くて見落としやすい。
+    """
+    rows = []
+    for f, x, y in specs:
+        tiles = []
+        for d in range(-span, span + 1):
+            try:
+                t, x0, y0 = _crop(get_frame(f + d), x, y, half, zoom)
+                _grid(t, x0, y0, zoom, labels=d == 0)
+            except IndexError:
+                t = np.zeros((int(2 * half * zoom),) * 2 + (3,), np.uint8)
+            if d == 0:
+                _cross(t, (x - x0) * zoom, (y - y0) * zoom, (255, 255, 0), 10, 22)
+            cv2.putText(t, str(f + d), (3, 16), 0, 0.5, (255, 255, 255), 1)
+            tiles.append(cv2.copyMakeBorder(t, 0, 2, 0, 2, cv2.BORDER_CONSTANT, value=(255, 255, 255)))
+        rows.append(np.hstack(tiles))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), np.vstack(rows), [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return out
 
 
 def write_check_sheets(get_frame, labels: pd.DataFrame, out_dir: Path, half: int = 40, zoom: float = 3.0,
@@ -406,8 +509,11 @@ class FrameGetter:
 
 
 def pick_video(video: str, camera_spec: str, out_dir: Path, start_s: float | None, end_s: float | None,
-               n: int, seed: int, half: int) -> pd.DataFrame:
-    """検出（なければ作って ``detections.csv``・``tracks.csv`` に残す）→ コマを選ぶ → 見本帳。"""
+               n: int, seed: int, half: int, seq_len: int = 0, zoom: float = 1.0) -> pd.DataFrame:
+    """検出（なければ作って ``detections.csv``・``tracks.csv`` に残す）→ コマを選ぶ → 見本帳。
+
+    ``seq_len`` が正なら、怪しいコマではなく、続いた ``seq_len`` コマの区間を ``n`` コマ分ほど選ぶ（答え合わせ用）。
+    """
     from smash_speed.config import load_config
     from smash_speed.pipeline import _camera_for_video
     from smash_speed.shot_list import detect_all, track_table, select_tracks
@@ -428,12 +534,17 @@ def pick_video(video: str, camera_spec: str, out_dir: Path, start_s: float | Non
     tab.to_csv(out_dir / "tracks.csv", index=False)
     old = pd.read_csv(out_dir / CANDIDATES_FILE) if (out_dir / CANDIDATES_FILE).exists() else None
     done = set(old.frame) if old is not None else set()
-    cands = pick_frames(det_all, tab, meta.width, meta.height, n=n, seed=seed, exclude=done)
+    if seq_len > 0:
+        starts = seq_windows(det_all, tab, max(1, round(n / seq_len)), seq_len, seed=seed, exclude=done)
+        cands = pick_sequence(det_all, tab, starts, seq_len)
+    else:
+        cands = pick_frames(det_all, tab, meta.width, meta.height, n=n, seed=seed, exclude=done)
     start_id = int(old.id.max()) + 1 if old is not None and len(old) else 0
     cands.insert(0, "id", np.arange(start_id, start_id + len(cands)))
     cands["video"] = Path(meta.path).name
     get = FrameGetter(meta)
-    write_sheets(get, cands, det_all, out_dir / "sheets" / f"from_{start_id:04d}", half=half)
+    write_sheets(get, cands, det_all, out_dir / "sheets" / f"from_{start_id:04d}", half=half, zoom=zoom,
+                 per_row=1 if seq_len > 0 else 2, overview=seq_len > 0)
     all_c = pd.concat([old, cands], ignore_index=True) if old is not None else cands
     all_c.to_csv(out_dir / CANDIDATES_FILE, index=False)
     return cands
@@ -557,6 +668,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--start", type=float); p.add_argument("--end", type=float)
     p.add_argument("--n", type=int, default=150); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--half", type=int, default=120, help="切り出しの半分の幅 [px]")
+    p.add_argument("--zoom", type=float, default=1.0, help="切り出しの拡大")
+    p.add_argument("--seq", type=int, default=0, help="答え合わせ用：続いたこのコマ数の区間を選ぶ（0 は怪しいコマ）")
+    z_ = sub.add_parser("zoom", help="迷うコマを拡大して前後と並べる")
+    z_.add_argument("video"); z_.add_argument("out")
+    z_.add_argument("spec", nargs="+", help="コマ:x:y")
+    z_.add_argument("--half", type=int, default=60); z_.add_argument("--zoom", type=float, default=3.0)
     a_ = sub.add_parser("apply", help="answers.csv を正解ラベルにする")
     a_.add_argument("out"); a_.add_argument("--no-snap", action="store_true")
     r_ = sub.add_parser("recheck", help="答えたコマの一部を付け直す（pick：見本帳を書く、compare：前の答えと比べる）")
@@ -567,8 +684,15 @@ def main(argv: list[str] | None = None) -> int:
     if (sys.stdout.encoding or "").lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8")
     if a.cmd == "pick":
-        c = pick_video(a.video, a.camera, Path(a.out), a.start, a.end, a.n, a.seed, a.half)
+        c = pick_video(a.video, a.camera, Path(a.out), a.start, a.end, a.n, a.seed, a.half, a.seq, a.zoom)
         print(f"{len(c)} コマ（{c.reason.str.split('+').explode().value_counts().to_dict()}）→ {a.out}")
+    elif a.cmd == "zoom":
+        from smash_speed.config import load_config
+        from smash_speed.video_io import probe
+
+        get = FrameGetter(probe(_video_path(a.video), None, load_config(None)))
+        specs = [(int(f), float(x), float(y)) for f, x, y in (s.split(":") for s in a.spec)]
+        print(write_zoom(get, specs, Path(a.out), a.half, a.zoom))
     elif a.cmd == "recheck":
         if a.step == "pick":
             c = recheck_pick(Path(a.out), a.frac, a.seed, a.half)

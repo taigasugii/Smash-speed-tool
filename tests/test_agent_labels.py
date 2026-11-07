@@ -4,9 +4,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from smash_speed.train.agent_labels import (answers_to_labels, compare_answers, implausible_jumps, merge_labels,
-                                            parse_answer, pick_frames, pick_recheck, save_labels, snap, summary,
-                                            write_check_sheets, write_sheets)
+from smash_speed.train.agent_labels import (answers_to_labels, compare_answers, implausible_jumps, item_tiles,
+                                            merge_labels, parse_answer, pick_frames, pick_recheck, pick_sequence,
+                                            save_labels, seq_windows, snap, summary, write_check_sheets,
+                                            write_sheets, write_zoom)
 
 W, H = 640, 360
 
@@ -154,3 +155,28 @@ def test_implausible_jumps():
     j = implausible_jumps(lab, W)                    # 1 コマで 290 px は 640 の 6% を超える。10 コマ離れた組は見ない
     assert list(zip(j.frame_a, j.frame_b)) == [(1, 2)]
     assert implausible_jumps(lab[lab.visible == 0], W).empty
+
+
+def test_pick_sequence():
+    det, tab = _det()
+    c = pick_sequence(det, tab, [8, 28], 6)
+    assert list(c.frame) == [8, 9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 33]
+    assert (c.reason == "seq").all()
+    r = c.set_index("frame")
+    assert not r.loc[9, "predicted"] and r.loc[9, "cand_x"] == pytest.approx(190)
+    assert r.loc[13, "predicted"] and r.loc[13, "cand_x"] == pytest.approx(230)    # 途切れは前後の点を結んだ位置
+    assert not r.loc[31, "predicted"] and r.loc[31, "cand_x"] == pytest.approx(81)  # 軌道の後は、ほかの軌道の点
+    starts = seq_windows(det, tab, 3, 8, seed=0)
+    assert len(starts) >= 2 and all(b - a >= 8 for a, b in zip(starts, starts[1:]))
+    assert all(0 <= s <= 32 for s in starts)
+    assert seq_windows(det, tab, 3, 8, exclude=set(range(40))) == []              # 付けたコマは選ばない
+
+
+def test_overview_and_zoom(tmp_path):
+    get = _frames()
+    det = pd.DataFrame({"frame": [3], "x_px": [160.0], "y_px": [150.0], "visible": [1]})
+    item = pd.Series({"id": 0, "frame": 3, "reason": "seq", "cand_x": 160.0, "cand_y": 150.0, "predicted": False})
+    plain = item_tiles(get, item, det, 40, 1.0)
+    wide = item_tiles(get, item, det, 40, 1.0, overview=True)
+    assert wide.shape[0] == plain.shape[0] and wide.shape[1] > plain.shape[1]
+    assert write_zoom(get, [(5, 200.0, 150.0), (0, 100.0, 150.0)], tmp_path / "z.jpg", half=20).exists()
