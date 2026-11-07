@@ -227,6 +227,8 @@ App.views.plane = {
         <button class="btn block" data-t="hitter"></button>
         <button class="btn block" data-t="landing"></button>
       </div>
+      <div class="row small" style="margin-top:8px;gap:8px;flex-wrap:wrap"><button class="btn sm" id="autohit">① を選手の立ち位置から入れる</button>
+        <span class="muted">打った瞬間のコマに動かしてから押します（数秒〜20 秒ほどかかります）</span></div>
       <div id="dia" style="margin-top:12px"></div>
       <details class="adv"><summary>数値で入力する（コート座標 m）</summary>
         <p class="muted small">原点はネット直下のコート中央、打つ人の側が x &lt; 0。</p>
@@ -263,6 +265,18 @@ App.views.plane = {
       const [k, c] = inp.dataset.k.split(".");
       const cur = { ...(st[k] || { x: 0, y: 0 }) }; cur[c] = +inp.value;
       await App.save({ [k]: cur }); await updateProj(); refresh();
+    };
+    $("#autohit", card).onclick = async (e) => {
+      const btn = e.target;
+      btn.disabled = true; btn.textContent = "選手を探しています…";
+      try {
+        const r = await api.post("/api/hitter/auto", { t: tl.t });
+        if (!r.ok) return toast(r.error, "bad");
+        await App.save({ hitter: { x: r.x, y: r.y } });
+        if (tool === "hitter") tool = st.landing ? "none" : "landing";
+        toast(`打つ人の足元を入れました（x ${fmt(r.x, 2)} / y ${fmt(r.y, 2)} m${r.airborne ? "。跳んでいたので、跳ぶ前後の床の位置です" : ""}）`, "ok");
+        await updateProj(); refresh();
+      } finally { btn.disabled = false; btn.textContent = "① を選手の立ち位置から入れる"; }
     };
     $("#roi", roiCard).onclick = () => { tool = "roi"; fv.mode = "rect"; refresh(); };
     $("#roiclr", roiCard).onclick = async () => { await App.save({ roi: null }); refresh(); fv.redraw(); };

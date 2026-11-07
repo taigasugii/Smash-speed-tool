@@ -69,6 +69,31 @@ def cmd_calibrate(a: argparse.Namespace, cfg: dict) -> int:
     return 0
 
 
+def cmd_propose_calib(a: argparse.Namespace, cfg: dict) -> int:
+    """クリックなしでキャリブレーションの候補を出し、JSON に保存する（GUI の手順 2 が読む）。"""
+    from smash_speed.calibration import landmark_table
+    from smash_speed.calibration.propose import propose_calibrations
+    from smash_speed.video_io import VideoReader, probe
+
+    meta = probe(a.video, a.capture_fps, cfg)
+    with VideoReader(meta) as r:
+        i, frame = r.read_at(a.time)
+    cam = _xy(a.cam) if a.cam else None
+    props = propose_calibrations(frame, landmark_table(cfg), n=a.n, cam_xy=cam,
+                                 progress=lambda f, msg: print(f"{100 * f:3.0f}%  {msg}", flush=True))
+    out = {"video": str(a.video), "frame": i, "time": float(meta.timestamps[i]), "cam_xy": cam,
+           "proposals": [{"points": {n: [float(u), float(v)] for n, (u, v) in p.result.points.items()},
+                          "status": p.result.status, "score": p.score, "n_snapped": p.n_snapped,
+                          "line_rms_px": None if not np.isfinite(p.result.line_rms_px) else p.result.line_rms_px}
+                         for p in props]}
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"候補 {len(props)} 個を保存しました: {a.out}")
+    for k, p in enumerate(props, 1):
+        print(f"  {k}. ラインで測れた点 {p.n_snapped}  ラインらしさ {p.score:.3f}")
+    return 0
+
+
 def cmd_check_calib(a: argparse.Namespace, cfg: dict) -> int:
     """保存済みのキャリブレーションを別の動画に重ね描きして確認する（カメラ固定の撮影で再利用するとき）。"""
     import cv2
@@ -189,13 +214,30 @@ def cmd_find_smashes(a: argparse.Namespace, cfg: dict) -> int:
     o = BatchOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
                      start_s=a.start, end_s=a.end, min_strength=a.min_strength, n_select=a.select,
                      roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
-                     audio=Path(a.audio) if a.audio else None)
+                     audio=Path(a.audio) if a.audio else None, players=a.players)
     cands = find_candidates(o, cfg, progress=lambda m: print(m, flush=True))
     ok = sorted([c for c in cands if c.rough_kmh is not None and not c.doubtful], key=lambda c: -c.rough_kmh)
     print()
     print("速い順（だいたいの初速。打つ人・着地点を確認すると変わります）")
     for c in ok[:15]:
         print(f"  #{c.id:2d}  {c.t_onset:7.2f} s  {c.rough_kmh:6.0f} km/h  {'スマッシュらしい' if c.smash_like else ''}")
+    print(f"出力: {a.out}")
+    return 0
+
+
+def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
+    from smash_speed.shot_list import ShotListOptions, analyze_video
+
+    o = ShotListOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
+                        start_s=a.start, end_s=a.end, roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
+                        audio=Path(a.audio) if a.audio else None, use_audio=not a.no_audio,
+                        players=a.players, hitter_prior=not a.no_hitter_prior)
+    info = analyze_video(o, cfg, progress=lambda m: print(m, flush=True))
+    print()
+    print("種類ごとの本数")
+    for v in info["by_type"].values():
+        print(f"  {v['label']} {v['n']} 本" + (f"（平均 {v['mean_kmh']:.0f} km/h、最高 {v['max_kmh']:.0f} km/h）"
+                                             if v["max_kmh"] is not None else ""))
     print(f"出力: {a.out}")
     return 0
 
@@ -317,6 +359,7 @@ def cmd_summarize(a: argparse.Namespace, cfg: dict) -> int:
 # =============================================================================
 SUBCOMMANDS: dict[str, str] = {
     "calibrate": "コート・ネットをクリックしてカメラパラメータを推定する",
+    "propose-calib": "クリックなしでコートの合わせ方の候補を出す（JSON。GUI の手順 2 で選ぶ）",
     "check-calib": "保存済みのキャリブレーションを別の動画に重ね描きして確認する",
     "plane": "打者の足元と着地点をクリックして飛行平面を指定する",
     "onsets": "打球音の候補時刻を一覧する（スマッシュを探す）",
@@ -333,6 +376,7 @@ SUBCOMMANDS: dict[str, str] = {
     "summarize": "複数本の結果を集計表にまとめる",
     "find-smashes": "動画全体からスマッシュの候補を探し、だいたいの初速を出す（いちばん速いスマッシュ探しの 1 段目）",
     "analyze-smashes": "確認した候補を詳しく解析して速い順に並べる（2 段目）",
+    "shots": "動画のすべてのショットを、種類・初速つきで一覧にする（shots.csv）",
 }
 
 
@@ -363,6 +407,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k1", action="store_true", help="放射歪み k1 も推定する")
     p.add_argument("--preview", help="再投影の確認画像の保存先")
     p.set_defaults(func=cmd_calibrate)
+
+    p = add("propose-calib")
+    video_args(p, time=True)
+    p.add_argument("--cam", help="カメラのおおよその位置 x,y [m]（解析の座標、上から見た位置）")
+    p.add_argument("--n", type=int, default=3, help="候補の数")
+    p.add_argument("--out", required=True, help="候補の保存先 JSON")
+    p.set_defaults(func=cmd_propose_calib)
 
     p = add("check-calib")
     video_args(p, time=True)
@@ -480,6 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--select", type=int, default=8, help="最初から詳しく解析する候補にしておく数（速い順）")
     p.add_argument("--roi", help="シャトルを検出する範囲 x0,y0,x1,y1（元解像度 px）")
     p.add_argument("--audio", help="音声ファイル（動画の音声の代わりに使う）")
+    p.add_argument("--players", action="store_true", help="打つ人の足元の初めの値を、選手の位置から入れる（遅くなる）")
     p.set_defaults(func=cmd_find_smashes)
 
     p = add("analyze-smashes")
@@ -487,6 +539,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ids", help="解析する候補の番号（カンマ区切り。省略時は選んだ候補）")
     p.add_argument("--no-overlay", action="store_true")
     p.set_defaults(func=cmd_analyze_smashes)
+
+    p = add("shots")
+    video_args(p, rng=True)
+    p.add_argument("--calib", required=True)
+    p.add_argument("--out", required=True, help="一覧の保存先フォルダ")
+    p.add_argument("--roi", help="シャトルを検出する範囲 x0,y0,x1,y1（元解像度 px）")
+    p.add_argument("--audio", help="音声ファイル（動画の音声の代わりに使う）")
+    p.add_argument("--no-audio", action="store_true", help="打球音を使わない（軌道だけで打球を見つける）")
+    p.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv。人の検出のモデルを使う）")
+    p.add_argument("--no-hitter-prior", action="store_true",
+                   help="--players のとき、打つ人の足元を打点の手がかりにしない（以前の当てはめ）")
+    p.set_defaults(func=cmd_shots)
 
     p = add("summarize")
     p.add_argument("--results", required=True, help="result.csv を含むディレクトリ")

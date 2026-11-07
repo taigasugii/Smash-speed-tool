@@ -9,6 +9,9 @@
    利用者が上位の候補の「打つ人の足元」「着地点」を確認（推定値を直す）し、その値で通常の解析を行う。
    候補探しで検出したシャトルの位置をそのまま使うので、検出のやり直しはしない。
 
+``BatchOptions.players`` を真にすると、候補探しの後に候補ごとの前後 ``player_window_s`` だけ選手を検出・追跡し、
+打つ人の足元の初めの値を選手の足元（``hitter.hitter_at``）にする（ROADMAP D3b。既定は切）。
+
 結果は ``<出力先>/candidates.json`` にまとめ、GUI はこのファイルを読み書きする。
 """
 
@@ -54,6 +57,8 @@ class Candidate:
     rough_kmh: float | None = None    # 候補探しでのだいたいの初速
     rough_rms_px: float | None = None
     hitter: dict[str, float] | None = None   # 打つ人の足元の推定（確認後は確認した値）[m]
+    hitter_source: str = ""           # 打つ人の足元の出どころ："players"（選手の位置）、""（大まかな推定・確認した値）
+    hitter_rough: dict[str, float] | None = None  # 選手の足元に置き換える前の、大まかな推定 [m]
     landing: dict[str, float] | None = None
     confirmed: bool = False           # 利用者が打つ人・着地点を確認した
     selected: bool = False            # 詳しく解析する
@@ -81,6 +86,8 @@ class BatchOptions:
     n_select: int = 8                 # 最初から「詳しく解析する」にしておく候補の数（速い順）。だいたいの初速は ±30% ほどずれるので多めに
     roi: list[float] | None = None    # 検出する範囲 [x0, y0, x1, y1]（元解像度 px）
     audio: Path | None = None         # 別の音声ファイル（動画の時刻と同じ時刻の WAV）
+    players: bool = False             # 打つ人の足元の初めの値を、選手の位置から入れる（人の検出のモデルを使うので遅くなる）
+    player_window_s: float = 1.0      # 選手を検出する区間：打った時刻の前後この幅 [s]
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -91,6 +98,18 @@ def stream_gray(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
                 start_s: float | None = None, end_s: float | None = None
                 ) -> Iterator[tuple[int, float, np.ndarray]]:
     """ffmpeg で動画を縮小したグレースケールで先頭から順に読み、(番号, 実時間 [s], 画像) を返す。"""
+    return _stream(meta, width, cfg, start_s, end_s, "gray", 1)
+
+
+def stream_bgr(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
+               start_s: float | None = None, end_s: float | None = None
+               ) -> Iterator[tuple[int, float, np.ndarray]]:
+    """``stream_gray`` のカラー版（画像は BGR の (h, w, 3)。人の検出に使う）。"""
+    return _stream(meta, width, cfg, start_s, end_s, "bgr24", 3)
+
+
+def _stream(meta: VideoMeta, width: int, cfg: dict[str, Any] | None, start_s: float | None, end_s: float | None,
+            pix_fmt: str, channels: int) -> Iterator[tuple[int, float, np.ndarray]]:
     w = int(width)
     h = int(round(meta.height * w / meta.width / 2)) * 2
     ts = meta.timestamps
@@ -99,9 +118,10 @@ def stream_gray(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
     # 途中から読む（-ss）と、動画によってはフレーム番号が 1 つずれる（先頭のフレームの時刻が不規則な動画など）。
     # 縮小しながらの読み込みは実時間の数倍速いので、いつも先頭から読み、i0 より前は捨てる
     cmd = [find_tool("ffmpeg", cfg), "-v", "error", "-nostdin", "-i", str(meta.path),
-           "-vf", f"scale={w}:{h}:flags=area", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 4)
-    n = w * h
+           "-vf", f"scale={w}:{h}:flags=area", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
+    n = w * h * channels
+    shape = (h, w) if channels == 1 else (h, w, channels)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=n * 4)
     k = 0
     try:
         while True:
@@ -111,7 +131,7 @@ def stream_gray(meta: VideoMeta, width: int, cfg: dict[str, Any] | None = None,
             if k >= len(ts):
                 break
             if k >= i0:
-                yield k, float(ts[k]), np.frombuffer(buf, np.uint8).reshape(h, w)
+                yield k, float(ts[k]), np.frombuffer(buf, np.uint8).reshape(shape)
             if k >= i1:
                 break
             k += 1
@@ -440,6 +460,10 @@ def find_candidates(o: BatchOptions, cfg: dict[str, Any],
     for cid in list(windows):
         finish(cid)
 
+    info: dict[str, Any] = {"players": None}  # 探し直したとき、前の回の要約を残さない
+    if o.players:
+        info["players"] = players_step(o, cfg, meta, camera, cands, progress=progress)
+
     # 速い順に上位 n_select 個（スマッシュらしいもの）を最初から選んでおく
     ranked = sorted([c for c in cands if c.status == "ok" and c.smash_like], key=lambda c: -(c.rough_kmh or 0))
     for c in ranked[:o.n_select]:
@@ -447,11 +471,82 @@ def find_candidates(o: BatchOptions, cfg: dict[str, Any],
     save_candidates(out, cands, {"video": str(Path(o.video).resolve()), "calib": str(Path(o.calib).resolve()),
                                  "capture_fps": o.capture_fps,
                                  "n_onsets": len(ons), "fps": meta.capture_fps, "roi": o.roi,
-                                 "audio": str(Path(o.audio).resolve()) if o.audio else None})
+                                 "audio": str(Path(o.audio).resolve()) if o.audio else None, **info})
     n_ok = sum(c.status == "ok" for c in cands)
     progress(f"[進行] 完了：候補 {len(cands)} 個のうち、シャトルの軌道が見つかったもの {n_ok} 個"
              f"（スマッシュらしいもの {len(ranked)} 個）")
     return cands
+
+
+def candidate_hitters(cands: list[Candidate], meta: VideoMeta, camera: Camera, cfg: dict[str, Any],
+                      detector: Any, o_players: Any = None, window_s: float = 1.0,
+                      progress: Callable[[str], None] = print, notes: dict[int, str] | None = None) -> int:
+    """軌道が見つかった候補ごとに、打った時刻の前後 ``window_s`` だけ選手を検出・追跡し、
+    打つ人の足元の初めの値を選手の足元にする。置き換えた数を返す。
+
+    打った側は、大まかな推定の打点（``hitter``）に近い選手で決める。選手の位置が足りない・ダブルスで
+    どちらか決められない候補は、大まかな推定のまま残す（``notes`` を渡すと、候補の番号ごとに理由を入れる）。
+    確認済みの候補は変えない。``detector`` は ``players.PersonDetector``（``detect(img)`` で枠を返すもの）。
+    """
+    from smash_speed.hitter import HitterOptions, hitter_at
+    from smash_speed.shots import side_of
+    from smash_speed.players import PlayerOptions, detect_in_windows, track_between
+
+    po = o_players or PlayerOptions()
+    todo = [c for c in cands if c.status == "ok" and c.hitter and not c.confirmed]
+    if not todo:
+        return 0
+    windows = {c.id: (c.t_onset - window_s, c.t_onset + window_s) for c in todo}
+    # 区間が重なる候補（速い打ち合い）もあるので、検出はコマごとに 1 回だけにして、候補ごとに選び直す
+    people, frame_t = detect_in_windows(meta, camera, detector, list(windows.values()), cfg, po)
+    n = 0
+    for c in todo:
+        pl = track_between(people, frame_t, *windows[c.id], camera, cfg, po)
+        t_hit = c.t_impact if c.t_impact is not None else c.t_onset
+        e = hitter_at(pl, t_hit, "", (c.hitter["x"], c.hitter["y"]))
+        if e is None or e.ambiguous:
+            if notes is not None:
+                notes[c.id] = _no_hitter_note(pl, t_hit, side_of(c.hitter["x"]), e, HitterOptions())
+            continue
+        c.hitter_rough = dict(c.hitter)
+        c.hitter = {"x": round(e.x, 3), "y": round(e.y, 3)}
+        c.hitter_source = "players"
+        n += 1
+    progress(f"[進行] 選手の位置から打つ人の足元を入れた候補 {n}/{len(todo)} 個")
+    return n
+
+
+def _no_hitter_note(players: Any, t_hit: float, side: str, e: Any, o: Any) -> str:
+    """``candidate_hitters`` で足元を入れなかった理由（記録用の短い文）。"""
+    if e is not None and e.ambiguous:
+        return "同じ側に 2 人いて、どちらが打ったか決められない"
+    if players is None or players.empty:
+        return "前後の区間で選手が見つからない"
+    near = players[((players["t"] - t_hit).abs() <= o.window_s) & (players["side"] == side)]
+    ok = near[["x", "y"]].notna().all(axis=1)
+    if not ok.any():
+        return f"打った時刻の前後 {o.window_s:g} 秒に、打った側の選手の足元がない"
+    return (f"打った時刻の前後 {o.window_s:g} 秒の打った側の足元が {int(ok.sum())} コマで、"
+            f"揺れ（{o.spread_m:g} m より離れたもの）を外すと {o.min_frames} コマ残らない")
+
+
+def players_step(o: BatchOptions, cfg: dict[str, Any], meta: VideoMeta, camera: Camera, cands: list[Candidate],
+                 progress: Callable[[str], None] = print) -> dict[str, Any]:
+    """``candidate_hitters`` を動かし、``candidates.json`` の ``info`` に入れる要約を返す。
+
+    候補探しは選手がいなくても終えられるので、モデルが取れない・動かないときは止めず、``error`` に理由を残す。
+    """
+    from smash_speed.players import PersonDetector, PlayerOptions, ensure_model
+
+    progress("[進行] 打つ人の足元を選手の位置から探しています")
+    po = PlayerOptions()
+    try:
+        detector = PersonDetector(ensure_model(po.model, progress=progress), po.min_score, po.nms_iou)
+        n = candidate_hitters(cands, meta, camera, cfg, detector, po, o.player_window_s, progress)
+    except Exception as e:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
+        progress(f"[注意] 選手の位置から打つ人の足元は入れられませんでした：{e}")
+        return {"error": str(e)}
+    return {"n_hitters": n, "window_s": o.player_window_s}
 
 
 # =============================================================================
@@ -488,7 +583,7 @@ def load_candidates(out_dir: Path) -> tuple[list[Candidate], dict[str, Any]]:
 
 def analyze_selected(out_dir: Path, cfg: dict[str, Any], ids: list[int] | None = None,
                      overlay: bool = True, progress: Callable[[str], None] = print) -> list[Candidate]:
-    """選んだ候補を、確認した打つ人・着地点で詳しく解析し、結果を ``candidates.json`` と ``ranking.csv`` に書く。"""
+    """選んだ候補を、確認した打つ人・着地点で詳しく解析し、結果を ``candidates.json``・``ranking.csv``・``shots.csv`` に書く。"""
     from smash_speed.pipeline import AnalyzeOptions, analyze
 
     out_dir = Path(out_dir).resolve()
@@ -541,6 +636,8 @@ def analyze_selected(out_dir: Path, cfg: dict[str, Any], ids: list[int] | None =
             progress(f"[進行] {c.t_onset:.2f} s → 解析できませんでした（{e.message}）")
         save_candidates(out_dir, cands)
     write_ranking(out_dir, cands)
+    from smash_speed.shots import export_batch
+    export_batch(out_dir, PhysicsParams.from_config(cfg))  # ショットの形（shots.csv）でも書き出す
     return cands
 
 
