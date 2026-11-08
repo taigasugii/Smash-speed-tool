@@ -92,6 +92,16 @@ def test_evaluate_counts_against_labels(tmp_path):
     assert r["dirs"]["eval_dir"]["current_selected"] == {"recall": 0.5}
     assert (data / "heat_eval.json").exists()
 
+    # 閾値を並べる：コマ 0 だけ弱い（0.4）ので、閾値 0.5 では見落としが 1 つ増える
+    heat[0, 0][heat[0, 0] > 0] = 102
+    np.save(data / "heat.npy", heat)
+    s = tt.sweep_thresholds(data, data / "heat.npy", [0.3, 0.5])
+    ms = s["dirs"]["eval_dir"]["model"]
+    assert (ms["0.3"]["tp"], ms["0.3"]["fn"]) == (7, 1)
+    assert (ms["0.5"]["tp"], ms["0.5"]["fn"]) == (6, 2)
+    assert s["dirs"]["eval_dir"]["current_selected"] == {"recall": 0.5}
+    assert (data / "heat_sweep.json").exists()
+
 
 def test_train_predict_and_load_tracknetv3_weights_on_cpu(tmp_path):
     """小さな作り物のデータで学習すると損失が下がり、熱の地図を書き出せる。TrackNetV3 の名前の重みを順番で読める。"""

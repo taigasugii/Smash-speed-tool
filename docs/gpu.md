@@ -133,6 +133,8 @@ opt = make_adam(model.parameters(), lr=1e-4, device=device)
 .venv-train\Scripts\python -m smash_speed.train.tracknet_train predict outputs\f1b\eval outputs\f1b\run\model.pt
 # .venv：熱の地図を点にして（閾値 0.5 の最も大きな塊の中心）、今の検出（eval_labels の eval.json）と比べる
 .venv\Scripts\python -m smash_speed.train.tracknet_train eval outputs\f1b\eval outputs\f1b\run\model_pred.npy
+# 閾値を並べて比べる（<熱の地図>_sweep.json に書く）
+.venv\Scripts\python -m smash_speed.train.tracknet_train eval outputs\f1b\eval outputs\f1b\run\model_pred.npy --threshold 0.4 0.45 0.5 0.55
 ```
 
 - 重み：学習したものは `<出力>/model.pt`（検証の損失がいちばん小さいとき）と `model_last.pt`。`outputs/` の中なので Git に入らない。
@@ -143,3 +145,24 @@ opt = make_adam(model.parameters(), lr=1e-4, device=device)
   答え合わせ用では、閾値 0.5 でシャトルを 1 つも出さず、正解の所が熱の地図のいちばん高い所になるのは見える 527 コマの 12% だけ
   （閾値を 0.1〜0.2 に下げても適合率 0.02〜0.36）。1,000 コマほどのとびとびの正解では、乱数からはシャトルを覚えない。
   追加学習には TrackNetV3 の学習済みの重みが要る（`agent/QUESTIONS.md` の F1b）。
+
+### 学習済みの重みからの追加学習（2026-11-09）
+
+学習用 12 フォルダー（13 区間）・1,075 区間（正解 1,405 コマ）、3.6 GB・約 10 分で書き出し（`outputs/f1b/train2`）。
+`--init ckpts\tracknetv3\TrackNet_best.pt --epochs 15 --lr 1e-4`（2 組）で 1 周 約 115 秒、15 周 28 分（`outputs/f1b/ft1/model.pt`、
+検証の損失 0.00065 → 0.00007。周ごとの検証の損失は 0.00007〜0.00018 で上下する）。
+
+答え合わせ用（コマごとの熱の地図の点。軌道の絞り込みはしていない。距離の許し：幅 512 px で 4 px）：
+
+| | IMG_4397 80〜100 s（4K） | IMG_5109_2 |
+|---|---|---|
+| 今の検出（選んだ軌道） | 再現率 0.936・適合率 0.953・F1 0.945 | 0.877・0.902・0.889 |
+| 学習済みのまま（閾値 0.5） | 0.962・0.813・0.881（ずれの中央値 13 px） | 0.870・0.855・0.862（8 px） |
+| 追加学習（閾値 0.5） | 0.789・1.000・0.882 | 0.932・0.982・0.957 |
+| 追加学習（閾値 0.25） | 0.929・0.977・0.952（4.5 px） | 0.983・0.983・0.983（3.1 px） |
+| 追加学習（閾値 0.2） | 0.943・0.981・0.962 | 0.987・0.975・0.981 |
+
+- 学習済みのままは熱の地図の高さが 0.5〜0.7 にとどまり、シャトルでない所（遠くの点）も 0.4〜0.6 になる。閾値で適合率を上げると再現率が急に落ちる。
+- 追加学習で「写っていない」コマの最大は中央値 0.05〜0.07 に下がり、シャトルでない所を出さなくなった。代わりにシャトルの所も
+  0.3〜0.8 と低めに出るので、閾値は 0.5 より下（0.2〜0.3）が合う。閾値は答え合わせ用を見て選んだので、数字は少し良く出ている。
+- 位置のずれは 4K で 13 → 4.5 px。正解は候補の点に寄せてあるので、今の検出のずれ（1 px）は小さく出る。

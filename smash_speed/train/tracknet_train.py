@@ -435,6 +435,22 @@ def evaluate(data_dir: Path, heat_path: Path, threshold: float = 0.5, px_at_512:
     return out
 
 
+def sweep_thresholds(data_dir: Path, heat_path: Path, thresholds: list[float], px_at_512: float = 4.0) -> dict[str, Any]:
+    """閾値を変えて ``evaluate`` し、フォルダーごとに閾値 → 学習したモデルの数字を並べる。
+
+    ``<熱の地図>_eval.json`` は最後の閾値のものになるので、並べたものを ``<熱の地図>_sweep.json`` に書く。
+    """
+    out: dict[str, Any] = {"thresholds": list(thresholds), "dirs": {}}
+    for th in thresholds:
+        r = evaluate(data_dir, heat_path, th, px_at_512)
+        for name, m in r["dirs"].items():
+            dm = out["dirs"].setdefault(name, {"current_selected": m.get("current_selected"), "model": {}})
+            dm["model"][f"{th:g}"] = m["model"]
+    path = Path(heat_path).with_name(Path(heat_path).stem + "_sweep.json")
+    path.write_text(json.dumps(out, ensure_ascii=False, indent=1, default=float), encoding="utf-8")
+    return out
+
+
 def _fmt(m: dict[str, Any] | None) -> str:
     if not m:
         return "-"
@@ -469,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("eval", help="熱の地図を正解と比べる（.venv）")
     e.add_argument("data", type=Path)
     e.add_argument("heat", type=Path)
-    e.add_argument("--threshold", type=float, default=0.5)
+    e.add_argument("--threshold", type=float, nargs="+", default=[0.5], help="2 つ以上なら並べて _sweep.json に書く")
     a = p.parse_args(argv)
     if a.cmd == "build":
         info = build_dataset(a.dirs, a.out, contiguous=a.contiguous, seed=a.seed)
@@ -479,8 +495,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"best_epoch": h["best_epoch"], "val_loss": min(h["val_loss"], default=h["val_loss_init"])}))
     elif a.cmd == "predict":
         print(predict(a.data, a.ckpt, a.out, prefer=a.device))
+    elif len(a.threshold) > 1:
+        r = sweep_thresholds(a.data, a.heat, a.threshold)
+        for name, m in r["dirs"].items():
+            print(f"{name}\n  今の検出（選んだ軌道）：{_fmt(m.get('current_selected'))}")
+            for th, mm in m["model"].items():
+                print(f"  学習したモデル（閾値 {th}）：{_fmt(mm)}")
     else:
-        r = evaluate(a.data, a.heat, a.threshold)
+        r = evaluate(a.data, a.heat, a.threshold[0])
         for name, m in r["dirs"].items():
             print(f"{name}\n  学習したモデル：{_fmt(m['model'])}\n  今の検出（選んだ軌道）：{_fmt(m.get('current_selected'))}")
     return 0
