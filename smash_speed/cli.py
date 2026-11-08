@@ -186,6 +186,7 @@ def cmd_analyze(a: argparse.Namespace, cfg: dict) -> int:
     o = AnalyzeOptions(
         video=Path(a.video), calib=Path(a.calib), out_dir=out, capture_fps=a.capture_fps, mode=a.mode,
         start_s=a.start, end_s=a.end, detections=Path(a.detections) if a.detections else None,
+        candidates=Path(a.candidates) if a.candidates else None, candidates_only=a.candidates_only,
         plane_json=Path(a.plane) if a.plane else None,
         hitter_xy=_xy(a.hitter) if a.hitter else None, landing_xy=_xy(a.landing) if a.landing else None,
         hitter_px=_xy(a.hitter_px) if a.hitter_px else None,
@@ -448,6 +449,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
     p.add_argument("--name")
     p.add_argument("--detections", help="既存の検出 CSV（TrackNet の結果やアノテーション）")
+    p.add_argument("--candidates", help="既存の検出 CSV を、打点から打ち出した軌道の探索の候補に足す（学習したモデルの点など）")
+    p.add_argument("--candidates-only", action="store_true", help="--candidates の点だけを候補にする（自前の検出をしない）")
     p.add_argument("--plane", help="plane.json")
     p.add_argument("--hitter", help="打者の足元のコート座標 x,y [m]")
     p.add_argument("--landing", help="着地点のコート座標 x,y [m]")

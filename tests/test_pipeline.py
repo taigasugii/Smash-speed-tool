@@ -73,6 +73,39 @@ def test_analyze_reports_cause_when_shuttle_not_found(session, capsys):
     assert code == 2 and "[エラー]" in out and "[対処]" in out and "Traceback" not in out
 
 
+@pytest.mark.parametrize("only", [True, False])
+def test_analyze_with_external_candidates(session, tmp_path, only):
+    # 外の検出（学習したモデルの点など）を候補として渡す：打点から打ち出した軌道の探索・漏れたコマの探し直しは
+    # 自前で行うので、外の検出が 3 コマに 1 つしかなく、別の物の軌道が混じっていても、打った後の点を補って選ぶ。
+    # only=False（自前の候補に足す）では、保存する candidates.csv は自前の候補のまま
+    cfg, d, info = session
+    det = pd.read_csv(d / "out_True" / "detections.csv")
+    det = det[det.visible == 1].drop_duplicates("frame")[["frame", "timestamp", "x_px", "y_px", "visible"]]
+    det = det.assign(confidence=1.0, track_id=0)
+    sparse = det.iloc[::3]
+    first, t0 = int(det.frame.min()), float(det.timestamp.min())
+    dt = float(det.timestamp.diff().median())
+    n = 40   # 打つ前に、画面の端をゆっくり動く物（打つ前の球の代わり）を、打った後の軌道より長く追っておく
+    decoy = pd.DataFrame({"frame": range(first - n, first), "timestamp": [t0 - (n - k) * dt for k in range(n)],
+                          "x_px": [30.0 + 2 * k for k in range(n)], "y_px": [500.0] * n, "visible": 1,
+                          "confidence": 1.0, "track_id": 1})
+    cand = tmp_path / "model.csv"
+    pd.concat([decoy, sparse]).to_csv(cand, index=False)
+    o = AnalyzeOptions(video=d / "synthetic.mp4", calib=d / "calibration.json", out_dir=tmp_path / "out",
+                       audio_path=d / "synthetic.wav", candidates=cand, candidates_only=only,
+                       hitter_xy=tuple(info["hitter_xy"]), landing_xy=tuple(info["landing_xy"]), overlay=False)
+    row = analyze(o, cfg)
+    assert row["speed_initial_mps"] == pytest.approx(75.0, rel=0.05)
+    assert row["n_frames_used"] > 1.5 * len(sparse)
+    used = pd.read_csv(tmp_path / "out" / "candidates.csv")
+    if only:
+        assert list(used.columns) == ["frame", "timestamp", "x", "y"] and len(used) == len(decoy) + len(sparse)
+    else:
+        assert "strength" in used.columns and not ((used.x == 30.0) & (used.y == 500.0)).any()
+    ev = json.loads((tmp_path / "out" / "events.json").read_text(encoding="utf-8"))
+    assert ev["impact"]["t"] == pytest.approx(info["t_impact_video_s"], abs=0.006)
+
+
 def test_analyze_with_hand_labels(session, tmp_path):
     # 手でつけた位置（打った瞬間の印つき）からも解析できる。打つ前のシャトルは使わない
     cfg, d, info = session
