@@ -34,6 +34,8 @@ IMG_5096 のジャンプスマッシュ（17.8〜19.8 s）では、2 つの関�
 フォアハンドのハイクリアを 10 本ほど撮って `videos_dir` に入れてください。できれば身長も教えてください（画像の縮尺に使います）。
 答え：「撮った（ファイル名・身長）」「まだ撮れない」など。答えが付くまで、E6 は合成での確かめまでにします。
 
+## 済み
+
 ### F1b TrackNetV3 の学習済みの重みを置いてほしい（2026-11-08）
 F1a の正解（学習用 1,100 コマ）で、TrackNetV3 と同じ形のモデルを GPU で学習し、答え合わせ用の正解で今の検出と比べる道具
 （`smash_speed/train/tracknet_train.py`）ができました。ただ、手元に TrackNetV3 の学習済みの重みがなく、エージェントは
@@ -45,8 +47,7 @@ F1a の正解（学習用 1,100 コマ）で、TrackNetV3 と同じ形のモデ�
 `ckpts/` は Git に入らない）に置いてください（`InpaintNet_best.pt` も同じ所に置いてもらえれば、あとで使います）。
 置いてもらえれば、エージェントが `--init ckpts/tracknetv3/TrackNet_best.pt` で追加学習し、今の検出と比べます。
 答え：「置いた」「TrackNetV3 は使わない（乱数からの学習・別の方法で）」など。答えが付くまで、F1b は乱数からの学習での確かめまでにします。
-
-## 済み
+**答え（2026-11-08）：置いた。** README の「checkpoints」のリンク（Google Drive の `TrackNetV3_ckpts.zip`、126 MB）から取り、`ckpts/tracknetv3/TrackNet_best.pt`（136 MB）と `InpaintNet_best.pt`（6 MB）に置いた。どちらも `torch.load(..., weights_only=True)` で読める（中身は epoch・model・optimizer・param_dict。param_dict は seq_len 8・bg_mode concat）。読み込みは `weights_only=True` にした。TrackNetV3 の畳み込みは BatchNorm の前で偏りを持たない（重み 104 個）ので、`load_tracknetv3_weights` はこのモデルの 17 個の偏りを 0 にして読む（テスト `test_load_tracknetv3_weights_without_conv_bias`）。
 
 ### A2b 学習用の PyTorch（GPU）を入れてよいか（2026-10-28）
 推論（モデルを動かすだけ）は onnxruntime-directml（約 25 MB）に決め、入れました（`docs/gpu.md`：CPU の約 70〜90 倍速い）。

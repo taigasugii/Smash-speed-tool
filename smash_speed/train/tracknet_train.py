@@ -240,22 +240,31 @@ class ClipData:
 def load_tracknetv3_weights(model, ckpt_path: Path) -> int:
     """TrackNetV3 の学習済みの重み（``TrackNet_best.pt``）を ``build_tracknet`` のモデルに入れ、入れた数を返す。
 
-    層の並びが同じなので、名前ではなく順番で対応させる（形が違えば止める）。
+    層の並びが同じなので、名前ではなく順番で対応させる（形が違えば止める）。TrackNetV3 の畳み込みは後ろに BatchNorm が
+    続くので偏り（bias）を持たない。このモデルの畳み込みの偏りで学習済みに対応するものがなければ 0 にする
+    （BatchNorm の前の偏りは 0 と同じ働きになるので、学習済みのモデルと同じ出力になる）。
     """
     import torch
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    src = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)  # 重みの数字だけを読む（中のプログラムを動かさない）
+    src = list((ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt).items())
     dst = model.state_dict()
-    if len(src) != len(dst):
-        raise ValueError(f"重みの数が違います（学習済み {len(src)}・モデル {len(dst)}）")
-    new = {}
-    for (kd, vd), (ks, vs) in zip(dst.items(), src.items()):
-        if tuple(vd.shape) != tuple(vs.shape):
+    new, j, prev_dim = {}, 0, 0
+    for kd, vd in dst.items():
+        conv_bias = kd.endswith(".bias") and prev_dim == 4  # 畳み込みの重みのすぐ後の偏り
+        prev_dim = vd.dim()
+        if conv_bias and j < len(src) and not src[j][0].endswith(".bias"):
+            new[kd] = torch.zeros_like(vd)  # 学習済みにない畳み込みの偏り
+        elif j < len(src) and tuple(src[j][1].shape) == tuple(vd.shape):
+            new[kd] = src[j][1]
+            j += 1
+        else:
+            ks, vs = src[j] if j < len(src) else ("（なし）", torch.empty(0))
             raise ValueError(f"重みの形が違います：{kd} {tuple(vd.shape)} ← {ks} {tuple(vs.shape)}")
-        new[kd] = vs
+    if j != len(src):
+        raise ValueError(f"学習済みの重みが余りました（{len(src) - j} 個。モデルの形が違います）")
     model.load_state_dict(new)
-    return len(new)
+    return j
 
 
 def _loss_on(model, data: ClipData, idx, device, batch: int) -> float:
@@ -344,7 +353,7 @@ def predict(data_dir: Path, ckpt: Path, out: Path | None = None, batch: int = 2,
 
     data = ClipData(data_dir)
     device, _ = train_device(prefer)
-    c = torch.load(ckpt, map_location="cpu")
+    c = torch.load(ckpt, map_location="cpu", weights_only=True)
     model = build_tracknet(in_dim=3 * (data.seq_len + 1), out_dim=data.seq_len, width=int(c["param_dict"]["width"]))
     model.load_state_dict(c["model"])
     model = model.to(device).eval()

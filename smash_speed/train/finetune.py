@@ -48,7 +48,7 @@ def prepare_resume(pretrained: Path, save_dir: Path, extra_epochs: int) -> int:
     import torch
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    ckpt = torch.load(pretrained, map_location="cpu")
+    ckpt = torch.load(pretrained, map_location="cpu", weights_only=True)  # 重みの数字だけを読む（中のプログラムを動かさない）
     start_epoch = int(ckpt.get("epoch", 0))
     # ファインチューニングでは最良の検証精度をリセットし、新しいデータでの最良を保存させる
     ckpt["max_val_acc"] = 0.0

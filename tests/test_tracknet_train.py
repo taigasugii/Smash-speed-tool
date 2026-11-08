@@ -137,3 +137,31 @@ print(json.dumps({{"x": list(x.shape), "y": list(y.shape), "mask_frames": int((m
     assert out["train"][-1] < out["train"][0]
     assert out["heat"] == [4, 8, tt.HEIGHT, tt.WIDTH]
     assert out["n_loaded"] > 50 and out["same"] < 1e-6 and out["bad"] == "error"
+
+
+def test_load_tracknetv3_weights_without_conv_bias(tmp_path):
+    """本物の TrackNetV3 のように畳み込みに偏りがない重みも読め、偏りを 0 にしたモデルと同じ出力になる。"""
+    out = _run_in_train_env(f"""
+import json, torch
+from pathlib import Path
+from smash_speed.train import tracknet_train as tt
+from smash_speed.train.torch_device import build_tracknet
+src = build_tracknet(width=4)
+items = list(src.state_dict().items())
+# BatchNorm の前の畳み込みの偏りを 0 にして、学習済みの重みからは外す（TrackNetV3 の形）
+conv_bias = {{items[i][0] for i in range(1, len(items) - 1) if items[i][0].endswith(".bias") and items[i - 1][1].dim() == 4
+             and items[i + 1][1].dim() == 1}}  # 後ろに BatchNorm が続くものだけ（最後の層は偏りを持つ）
+sd = src.state_dict()
+for k in conv_bias:
+    sd[k].zero_()
+src.load_state_dict(sd)
+renamed = {{f"block_{{i}}.{{'conv.' if v.dim() == 4 else 'bn.'}}{{k.split('.')[-1]}}": v
+           for i, (k, v) in enumerate(src.state_dict().items()) if k not in conv_bias}}
+d = Path(r"{tmp_path}")
+torch.save({{"model": renamed}}, d / "tn.pt")
+dst = build_tracknet(width=4)
+n = tt.load_tracknetv3_weights(dst, d / "tn.pt")
+xin = torch.rand(1, 27, 32, 64); src.eval(); dst.eval()
+print(json.dumps({{"n": n, "n_src": len(renamed), "n_bias": len(conv_bias), "same": float((src(xin) - dst(xin)).abs().max())}}))
+""", device="cpu")
+    assert out["n_bias"] > 0 and out["n"] == out["n_src"] and out["same"] < 1e-6
