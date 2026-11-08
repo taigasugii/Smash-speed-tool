@@ -22,6 +22,11 @@ F1a の正解はとびとびのコマ（怪しいコマを選んで付けた）�
     python -m smash_speed.train.tracknet_train predict outputs/f1b/eval outputs/f1b/run1/model.pt
     # .venv：熱の地図を点にして、今の検出（eval.json）と比べる
     python -m smash_speed.train.tracknet_train eval outputs/f1b/eval outputs/f1b/run1/model_pred.npy
+
+動画の区間の全コマを検出して、今の検出と同じ形の CSV（``--detections`` に渡せる）にするには::
+
+    # .venv：区間の全コマを書き出す → 熱の地図（.venv-train を呼ぶ）→ 検出の CSV。3 つをまとめて行う
+    python -m smash_speed.train.tracknet_train detect IMG_4397.MOV outputs/f1b/run1/model.pt outputs/f1b/det/IMG_4397 --start 80 --end 100
 """
 
 from __future__ import annotations
@@ -197,6 +202,58 @@ def build_dataset(label_dirs: list[Path], out: Path, seq_len: int = SEQ_LEN, con
     info = {"seq_len": seq_len, "size": [HEIGHT, WIDTH], "contiguous": contiguous, "seed": seed,
             "n_clips": n_clips, "dirs": dirs_meta}
     (out / "meta.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+    return info
+
+
+def build_video(video: Path, out: Path, start_s: float | None = None, end_s: float | None = None,
+                seq_len: int = SEQ_LEN, progress=print) -> dict[str, Any]:
+    """動画の区間の全コマを、重ならない ``seq_len`` コマずつの区間として書き出す（正解なし。``predict`` に渡す）。
+
+    ``build_dataset`` と同じ形に、区間のコマの番号と実時間（``frame_times.npy``：[番号, 時刻]）を足す。
+    コマの数が ``seq_len`` で割り切れなければ、最後のコマを繰り返して埋める（埋めたコマの予測は使わない）。
+    背景は区間から等間隔に選んだ ``N_BG`` コマの中央値。
+    """
+    from smash_speed.config import load_config
+    from smash_speed.train.agent_labels import _video_path
+    from smash_speed.video_io import VideoReader, probe
+
+    path = _video_path(str(video))
+    meta = probe(path, None, load_config(None))
+    ts = meta.timestamps
+    i0 = 0 if start_s is None else int(np.searchsorted(ts, start_s))
+    i1 = len(ts) - 1 if end_s is None else int(np.searchsorted(ts, end_s, side="right")) - 1
+    n_frames = i1 - i0 + 1
+    if n_frames < 1:
+        raise ValueError("区間にコマがありません")
+    n_clips = -(-n_frames // seq_len)
+    out.mkdir(parents=True, exist_ok=True)
+    frames = np.lib.format.open_memmap(out / "frames.npy", mode="w+", dtype=np.uint8,
+                                       shape=(n_clips * seq_len, HEIGHT, WIDTH, 3))
+    t0 = time.time()
+    k = 0
+    with VideoReader(meta) as reader:
+        for i, _, img in reader.iter_range(float(ts[i0]) - 1e-6, float(ts[i1]) + 1e-6):
+            frames[k] = _to_input(img)
+            k += 1
+            if k % 600 == 0:
+                progress(f"{k}/{n_frames} コマ（{time.time() - t0:.0f} 秒）")
+    if k == 0:
+        raise OSError(f"{path} を読めません")
+    frames[k:] = frames[k - 1]   # 読めなかった分・割り切れない分は最後のコマで埋める
+    frames.flush()
+    bg_idx = np.unique(np.linspace(0, k - 1, N_BG).round().astype(int))
+    np.save(out / "bgs.npy", np.median(frames[bg_idx], axis=0).astype(np.uint8)[None])
+    np.save(out / "clips.npy", np.array([[0, i0 + seq_len * c] for c in range(n_clips)], np.int64))
+    targets = np.full((n_clips, seq_len, 3), np.nan, np.float32)
+    targets[:, :, 0] = IGNORE
+    np.save(out / "targets.npy", targets)
+    np.save(out / "frame_times.npy", np.stack([np.arange(i0, i0 + k), ts[i0:i0 + k]], axis=1))
+    info = {"seq_len": seq_len, "size": [HEIGHT, WIDTH], "contiguous": True, "video": str(path),
+            "start_s": start_s, "end_s": end_s, "n_clips": n_clips, "n_frames": k,
+            "dirs": [{"dir": str(out), "video": path.name, "width": int(meta.width), "height": int(meta.height),
+                      "n_clips": n_clips, "n_labels": 0}]}
+    (out / "meta.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+    progress(f"{path.name}：{k} コマ・{n_clips} 区間（{time.time() - t0:.0f} 秒）")
     return info
 
 
@@ -400,9 +457,11 @@ def predictions_table(data_dir: Path, heat: np.ndarray, threshold: float = 0.5):
         dm = meta["dirs"][int(di)]
         sx, sy = dm["width"] / WIDTH, dm["height"] / HEIGHT
         for j in range(n):
-            pt = heatmap_point(heat[k, j], threshold)
+            hm = np.asarray(heat[k, j])
+            pt = heatmap_point(hm, threshold)
             rows.append({"dir": int(di), "frame": int(s) + j, "visible": int(pt is not None),
-                         "x_px": pt[0] * sx if pt else np.nan, "y_px": pt[1] * sy if pt else np.nan})
+                         "x_px": pt[0] * sx if pt else np.nan, "y_px": pt[1] * sy if pt else np.nan,
+                         "peak": float(hm.max()) / (255.0 if hm.dtype == np.uint8 else 1.0)})
     # 答え合わせ用の最後の区間は前と重なることがあるので、後の方を使う
     return pd.DataFrame(rows).drop_duplicates(["dir", "frame"], keep="last")
 
@@ -451,6 +510,116 @@ def sweep_thresholds(data_dir: Path, heat_path: Path, thresholds: list[float], p
     return out
 
 
+# =============================================================================
+# 動画の全コマの検出（.venv。今の検出と同じ形の CSV にする）
+# =============================================================================
+MAX_JUMP = 0.15   # 同じ軌道とみなす 1 コマあたりの動きの上限 [画像の幅]（30 fps のスマッシュで 0.1 ほど）
+MAX_GAP = 3       # 同じ軌道とみなす、見つからないコマの数の上限
+MIN_TURN_STEP = (0.004, 0.0015)  # 向きの折り返しを見る 1 コマあたりの動きの下限 [画像の幅]（前後の大きい方・小さい方。
+                                 # 頂点の近くのゆっくりした動きでは見ない。打球の前の球は 4K で 1 コマ 12 px まで遅くなる）
+
+
+def split_tracks(frames: np.ndarray, x: np.ndarray, y: np.ndarray, width: float,
+                 max_jump: float = MAX_JUMP, max_gap: int = MAX_GAP, min_turn_step: tuple[float, float] = MIN_TURN_STEP
+                 ) -> np.ndarray:
+    """1 コマ 1 点の検出（見つかったコマだけ、番号の順）を軌道に分け、軌道の番号を返す。
+
+    次のときに新しい軌道にする。``shot_list.shuttle_tracks``・``pipeline`` の打球後の軌道の選び方が
+    軌道ごとに働くようにするため（今の検出は打球をはさんだ軌道を別々に出す）。
+
+    - 前の点から ``max_gap`` コマより多く空いた
+    - 1 コマあたり ``max_jump`` × 画像の幅より大きく跳んだ（別の物に移った）
+    - 前後の 1 コマあたりの動きの大きい方が ``min_turn_step[0]``、小さい方が ``min_turn_step[1]`` × 画像の幅より大きく、
+      向きが 90° より大きく変わった（打球）
+    """
+    frames = np.asarray(frames, int)
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    tid = np.zeros(len(frames), int)
+    prev_step = None   # 同じ軌道の前の 1 コマあたりの動き
+    for i in range(1, len(frames)):
+        gap = frames[i] - frames[i - 1]
+        step = np.array([x[i] - x[i - 1], y[i] - y[i - 1]]) / max(gap, 1)
+        new = gap > max_gap + 1 or float(np.hypot(*step)) > max_jump * width
+        if not new and prev_step is not None:
+            n1, n2 = sorted((float(np.hypot(*prev_step)), float(np.hypot(*step))))
+            big = n2 > min_turn_step[0] * width and n1 > min_turn_step[1] * width
+            new = big and float(prev_step @ step) < 0.0
+        tid[i] = tid[i - 1] + int(new)
+        prev_step = None if new else step
+    return tid
+
+
+def detections_from_heat(data_dir: Path, heat_path: Path, threshold: float = 0.5, out: Path | None = None,
+                         max_jump: float = MAX_JUMP, max_gap: int = MAX_GAP):
+    """``build_video`` で書き出した区間の熱の地図を、今の検出と同じ形の表（``frame, timestamp, x_px, y_px,
+    visible, confidence, track_id, heat``。座標は元の解像度）にする。``out`` があれば CSV に書く。
+
+    ``confidence`` は ``detection.tracknet`` と同じく見つかったかどうか（1/0。0〜1 の間の値は ``pipeline`` が今の検出の
+    軌道のスコアとして読むので入れない）、``heat`` は熱の地図のそのコマの最大（0〜1）、``track_id`` は ``split_tracks`` の軌道
+    （見つからないコマは -1）。
+    """
+    import pandas as pd
+
+    data_dir = Path(data_dir)
+    meta = json.loads((data_dir / "meta.json").read_text(encoding="utf-8"))
+    ft = np.load(data_dir / "frame_times.npy")
+    pred = predictions_table(data_dir, np.load(heat_path, mmap_mode="r"), threshold).set_index("frame")
+    frames = ft[:, 0].astype(int)
+    pred = pred.reindex(frames)   # 埋めたコマ（区間の外）を落とす
+    det = pd.DataFrame({"frame": frames, "timestamp": ft[:, 1], "x_px": pred.x_px.to_numpy(float),
+                        "y_px": pred.y_px.to_numpy(float), "visible": pred.visible.fillna(0).astype(int).to_numpy(),
+                        "track_id": -1, "heat": pred.peak.fillna(0.0).round(4).to_numpy()})
+    det.insert(5, "confidence", det.visible.astype(float))
+    vis = det.visible.to_numpy() == 1
+    det.loc[vis, "track_id"] = split_tracks(frames[vis], det.x_px[vis].to_numpy(), det.y_px[vis].to_numpy(),
+                                            float(meta["dirs"][0]["width"]), max_jump, max_gap)
+    if out is not None:
+        det.to_csv(out, index=False)
+    return det
+
+
+def predict_in_train_env(data_dir: Path, ckpt: Path, out: Path | None = None, prefer: str | None = None) -> Path:
+    """``predict`` を、torch のある Python（この Python か、なければ ``.venv-train``）で動かす。"""
+    import importlib.util
+    import os
+    import subprocess
+
+    if importlib.util.find_spec("torch") is not None:
+        return predict(data_dir, ckpt, out, prefer=prefer)
+    root = Path(__file__).resolve().parents[2]
+    py = root / ".venv-train" / "Scripts" / "python.exe"
+    if not py.exists():
+        py = root / ".venv-train" / "bin" / "python"
+    if not py.exists():
+        raise FileNotFoundError("torch の入った Python（.venv-train）が見つかりません（docs/gpu.md）")
+    out = out or Path(ckpt).with_name(Path(ckpt).stem + "_pred.npy")
+    args = [str(py), "-W", "ignore", "-m", "smash_speed.train.tracknet_train", "predict", str(data_dir), str(ckpt),
+            "--out", str(out)] + (["--device", prefer] if prefer else [])
+    env = dict(os.environ, PYTHONPATH=str(root), PYTHONIOENCODING="utf-8")
+    r = subprocess.run(args, env=env, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError(f"熱の地図を作れませんでした：{r.stderr.strip()[-2000:]}")
+    return out
+
+
+def detect_video(video: Path, ckpt: Path, out_dir: Path, start_s: float | None = None, end_s: float | None = None,
+                 threshold: float = 0.5, prefer: str | None = None, keep_frames: bool = False, progress=print):
+    """動画の区間の全コマを学習したモデルで検出し、``out_dir/detections.csv`` に書いて表を返す。
+
+    コマ（288×512）と熱の地図は大きい（1 コマ 0.6 MB）ので、``keep_frames`` でなければ最後に消す。
+    """
+    out_dir = Path(out_dir)
+    build_video(video, out_dir, start_s, end_s, progress=progress)
+    t0 = time.time()
+    heat = predict_in_train_env(out_dir, Path(ckpt), out_dir / "heat.npy", prefer)
+    progress(f"熱の地図（{time.time() - t0:.0f} 秒）")
+    det = detections_from_heat(out_dir, heat, threshold, out_dir / "detections.csv")
+    if not keep_frames:
+        for name in ("frames.npy", "heat.npy"):
+            (out_dir / name).unlink(missing_ok=True)
+    return det
+
+
 def _fmt(m: dict[str, Any] | None) -> str:
     if not m:
         return "-"
@@ -486,8 +655,39 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("data", type=Path)
     e.add_argument("heat", type=Path)
     e.add_argument("--threshold", type=float, nargs="+", default=[0.5], help="2 つ以上なら並べて _sweep.json に書く")
+    fr = sub.add_parser("frames", help="動画の区間の全コマを書き出す（.venv。predict に渡す）")
+    fr.add_argument("video", type=Path)
+    fr.add_argument("out", type=Path)
+    fr.add_argument("--start", type=float)
+    fr.add_argument("--end", type=float)
+    dt = sub.add_parser("detections", help="frames の熱の地図を検出の CSV にする（.venv）")
+    dt.add_argument("data", type=Path)
+    dt.add_argument("heat", type=Path)
+    dt.add_argument("--threshold", type=float, default=0.5)
+    dt.add_argument("--out", type=Path, help="既定は <data>/detections.csv")
+    dv = sub.add_parser("detect", help="frames → predict（.venv-train）→ detections をまとめて行う（.venv）")
+    dv.add_argument("video", type=Path)
+    dv.add_argument("ckpt", type=Path)
+    dv.add_argument("out", type=Path)
+    dv.add_argument("--start", type=float)
+    dv.add_argument("--end", type=float)
+    dv.add_argument("--threshold", type=float, default=0.5)
+    dv.add_argument("--device", default=None)
+    dv.add_argument("--keep-frames", action="store_true", help="書き出したコマと熱の地図を消さない")
     a = p.parse_args(argv)
-    if a.cmd == "build":
+    if a.cmd == "frames":
+        info = build_video(a.video, a.out, a.start, a.end)
+        print(json.dumps({"n_frames": info["n_frames"], "n_clips": info["n_clips"]}, ensure_ascii=False))
+    elif a.cmd == "detections":
+        det = detections_from_heat(a.data, a.heat, a.threshold, a.out or a.data / "detections.csv")
+        print(json.dumps({"n_frames": len(det), "n_visible": int(det.visible.sum()),
+                          "n_tracks": int(det.track_id.max() + 1)}, ensure_ascii=False))
+    elif a.cmd == "detect":
+        det = detect_video(a.video, a.ckpt, a.out, a.start, a.end, a.threshold, a.device, a.keep_frames)
+        print(json.dumps({"n_frames": len(det), "n_visible": int(det.visible.sum()),
+                          "n_tracks": int(det.track_id.max() + 1), "csv": str(a.out / "detections.csv")},
+                         ensure_ascii=False))
+    elif a.cmd == "build":
         info = build_dataset(a.dirs, a.out, contiguous=a.contiguous, seed=a.seed)
         print(json.dumps({"n_clips": info["n_clips"]}, ensure_ascii=False))
     elif a.cmd == "train":

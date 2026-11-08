@@ -103,6 +103,74 @@ def test_evaluate_counts_against_labels(tmp_path):
     assert (data / "heat_sweep.json").exists()
 
 
+def test_split_tracks_at_gaps_and_jumps():
+    """長く途切れた所・1 コマで大きく跳んだ所で軌道を分ける（跳びの上限は空いたコマの数だけ広げる）。"""
+    frames = np.array([0, 1, 2, 3, 10, 11, 12, 14, 15])
+    x = np.array([100, 110, 120, 130, 300, 310, 900, 920, 940], float)
+    y = np.full(len(frames), 50.0)
+    tid = tt.split_tracks(frames, x, y, width=1000, max_jump=0.15, max_gap=3)
+    # 3 → 10 は 6 コマ空いた、11 → 12 は 590 px 跳んだ、12 → 14 は 1 コマ空き・20 px で同じ軌道
+    assert tid.tolist() == [0, 0, 0, 0, 1, 1, 2, 2, 2]
+    assert tt.split_tracks(np.array([5]), np.array([1.0]), np.array([1.0]), 100).tolist() == [0]
+    # 打球：速く右下へ動いていた点が左上へ折り返したら分ける。頂点の近くのゆっくりした折り返しでは分けない
+    f = np.arange(8)
+    hit = tt.split_tracks(f, np.array([0, 40, 80, 120, 90, 60, 30, 0.0]), np.array([0, 20, 40, 60, 30, 0, -30, -60.0]), 1000)
+    assert hit.tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+    # 打つ前の球が遅くなっていても（1 コマ 12 px・幅 3840 px）、速く返っていく折り返しは分ける
+    slow = tt.split_tracks(np.arange(4), np.array([0, 4, 8, 4.0]), np.array([0, 11, 22, -38.0]), 3840)
+    assert slow.tolist() == [0, 0, 0, 1]
+    apex = tt.split_tracks(f, np.arange(8) * 2.0, np.array([0, 2, 3, 3.5, 3.5, 3, 2, 0.0]), 1000)
+    assert apex.tolist() == [0] * 8
+
+
+@pytest.mark.skipif(__import__("shutil").which("ffprobe") is None, reason="ffmpeg がありません")
+def test_build_video_and_detections_from_heat(tmp_path):
+    """動画の区間の全コマを書き出し、熱の地図を元の解像度・コマ番号・時刻の検出の表にする（埋めたコマは使わない）。"""
+    from smash_speed import synth
+    from smash_speed.config import load_config
+    from smash_speed.physics import PhysicsParams
+
+    cfg = load_config()
+    cfg["synthetic"]["camera"].update(width=640, height=360, f_px=500.0)
+    phys = PhysicsParams.from_config(cfg)
+    truth = synth.render_video(synth.make_shot(70.0, cfg, phys), synth.default_camera(cfg), cfg, phys,
+                               tmp_path / "v.mp4", fps=60.0)
+    i0, i1 = 5, 24   # 20 コマ → 8 コマずつの 3 区間（最後の 4 コマは埋める）
+    ts = truth.timestamp.to_numpy()
+    d = tmp_path / "data"
+    info = tt.build_video(tmp_path / "v.mp4", d, ts[i0] - 1e-3, ts[i1] + 1e-3, progress=lambda s: None)
+    assert (info["n_frames"], info["n_clips"]) == (20, 3)
+    assert np.load(d / "frames.npy").shape == (24, tt.HEIGHT, tt.WIDTH, 3)
+    assert np.load(d / "clips.npy")[:, 1].tolist() == [5, 13, 21]
+    ft = np.load(d / "frame_times.npy")
+    assert ft[:, 0].tolist() == list(range(5, 25))
+    np.testing.assert_allclose(ft[:, 1], ts[i0:i1 + 1], atol=1e-3)
+
+    # 正解の位置に塊のある熱の地図（埋めたコマには離れた所に塊を置く。使われないこと）
+    heat = np.zeros((3, 8, tt.HEIGHT, tt.WIDTH), np.uint8)
+    sx, sy = tt.WIDTH / 640, tt.HEIGHT / 360
+    for k in range(24):
+        f = 5 + k
+        if f > i1:
+            heat[k // 8, k % 8, 5:8, 5:8] = 255
+            continue
+        r = truth.iloc[f]
+        if r.visible == 1 and f != 12:   # コマ 12 は見落とし
+            cx, cy = int(round(r.x_px * sx)), int(round(r.y_px * sy))
+            heat[k // 8, k % 8, max(cy - 1, 0):cy + 2, max(cx - 1, 0):cx + 2] = 200
+    np.save(d / "heat.npy", heat)
+    det = tt.detections_from_heat(d, d / "heat.npy", 0.5, d / "detections.csv")
+    assert det.frame.tolist() == list(range(5, 25))
+    assert list(det.columns) == ["frame", "timestamp", "x_px", "y_px", "visible", "confidence", "track_id", "heat"]
+    vis = det[det.visible == 1]
+    m = vis.merge(truth, on="frame", suffixes=("", "_gt"))
+    assert len(m) > 10 and np.hypot(m.x_px - m.x_px_gt, m.y_px - m.y_px_gt).max() < 3.0
+    assert det.loc[det.frame == 12, "visible"].item() == 0 and det.loc[det.frame == 12, "track_id"].item() == -1
+    assert set(vis.track_id) == {0} and np.allclose(vis.heat, 200 / 255, atol=1e-3)
+    assert (det.confidence == det.visible).all()   # 0〜1 の間の値は今の検出のスコアと取り違えられる
+    assert pd.read_csv(d / "detections.csv").shape == det.shape
+
+
 def test_train_predict_and_load_tracknetv3_weights_on_cpu(tmp_path):
     """小さな作り物のデータで学習すると損失が下がり、熱の地図を書き出せる。TrackNetV3 の名前の重みを順番で読める。"""
     out = _run_in_train_env(f"""
