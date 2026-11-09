@@ -327,6 +327,65 @@ def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):
     assert "本" in capsys.readouterr().out
 
 
+
+def test_analyze_video_with_external_detections(rally_video, tmp_path, monkeypatch):
+    """自前の検出の代わりに、外の検出 CSV（学習したモデルの検出の形）や学習したモデルを使える（F1b）。
+
+    時刻はコマの番号から付け直すので、CSV の時刻が違っていても（撮影の fps を知らない検出）同じ一覧になる。
+    """
+    d, truth = rally_video
+    ref = analyze_video(ShotListOptions(d / "rally.mp4", d / "calibration.json", tmp_path / "ref", use_audio=False),
+                        CFG, progress=lambda m: None)
+    det = pd.read_csv(tmp_path / "ref" / DETECTIONS_FILE)
+    ext = det[["frame", "timestamp", "x_px", "y_px", "visible", "track_id"]].copy()
+    ext["timestamp"] *= 2.0
+    ext.to_csv(tmp_path / "ext.csv", index=False)
+    monkeypatch.setattr(shot_list, "detect_all", lambda *a, **k: pytest.fail("自前の検出を使った"))
+    info = analyze_video(ShotListOptions(d / "rally.mp4", d / "calibration.json", tmp_path / "ext", use_audio=False,
+                                         detections=tmp_path / "ext.csv"), CFG, progress=lambda m: None)
+    assert info["detector"] == "file" and info["n_hits"] == ref["n_hits"] and info["n_visible"] == ref["n_visible"]
+    a, b = read_shots(tmp_path / "ref" / SHOTS_FILE), read_shots(tmp_path / "ext" / SHOTS_FILE)
+    assert [s.t_hit_s for s in a] == pytest.approx([s.t_hit_s for s in b])
+    assert [s.speed_kmh for s in a] == pytest.approx([s.speed_kmh for s in b], rel=1e-6)
+    assert sum(f is not None for f in _match(b, truth)) >= len(truth) - 1
+
+    # 学習したモデル：detect_video が <出力先>/tracknet/detections.csv を書き、それを使う
+    calls = []
+
+    def fake_detect(video, ckpt, out_dir, start_s, end_s, threshold, **k):
+        calls.append((Path(ckpt).name, threshold))
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        ext.to_csv(Path(out_dir) / "detections.csv", index=False)
+
+    import smash_speed.train.tracknet_train as tt
+    monkeypatch.setattr(tt, "detect_video", fake_detect)
+    (tmp_path / "model.pt").write_bytes(b"")
+    info = analyze_video(ShotListOptions(d / "rally.mp4", d / "calibration.json", tmp_path / "tn", use_audio=False,
+                                         tracknet=tmp_path / "model.pt", tracknet_threshold=0.3),
+                         CFG, progress=lambda m: None)
+    assert calls == [("model.pt", 0.3)]
+    assert info["detector"] == "tracknet" and info["tracknet_threshold"] == 0.3 and info["n_hits"] == ref["n_hits"]
+    assert Path(info["detections"]) == (tmp_path / "tn" / "tracknet" / "detections.csv").resolve()
+
+
+def test_load_detections_checks_columns_and_cuts_the_range(tmp_path):
+    from smash_speed.errors import AnalysisError
+    from smash_speed.shot_list import load_detections
+
+    class Meta:
+        timestamps = np.arange(100) / 30.0
+
+    pd.DataFrame({"frame": [0, 1], "x_px": [1.0, 2.0]}).to_csv(tmp_path / "bad.csv", index=False)
+    with pytest.raises(AnalysisError, match="visible"):
+        load_detections(tmp_path / "bad.csv", Meta())
+    pd.DataFrame({"frame": np.arange(0, 120, 10), "x_px": 1.0, "y_px": 2.0, "visible": 1}).to_csv(
+        tmp_path / "ok.csv", index=False)
+    det = load_detections(tmp_path / "ok.csv", Meta(), 0.5, 2.0)
+    # 動画にないコマ（100 以上）と区間の外を落とし、時刻はコマの番号から、軌道は 1 本にする
+    assert list(det.frame) == [20, 30, 40, 50, 60]
+    assert det.timestamp.to_numpy() == pytest.approx(det.frame.to_numpy() / 30.0)
+    assert (det.track_id == 0).all() and (det.confidence == 1.0).all()
+
 def test_players_step_does_not_stop_the_shot_list(tmp_path, monkeypatch):
     """人の検出のモデルが取れなくても、ショットの一覧は止めず、理由を残す。"""
     def broken(*a, **k):

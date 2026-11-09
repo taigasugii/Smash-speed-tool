@@ -223,3 +223,31 @@ opt = make_adam(model.parameters(), lr=1e-4, device=device)
   点の位置が熱の地図の格子（4K で 7.5 px）に丸められる。30fps では初速が最初の数コマで決まるので、これが効く。
 - まとめ：学習したモデルは打球の見つけ方（上の表）を良くするが、スマッシュの初速は良くしない。スマッシュの解析の既定の検出は
   替えず、切り替えるならショットの一覧（打球の見つけ方）から考える（F1c）。
+
+閾値の決め方（打球の見つけ方。上と同じ 4 区間、2026-11-09）：
+
+| 閾値 | 0.15 | 0.2 | 0.25 | 0.3 | 0.35 | 0.4 | 0.5 |
+|---|---|---|---|---|---|---|---|
+| 再現率（/70） | 0.986（69） | 0.986（69） | 0.971（68） | 0.986（69） | 0.971（68） | 0.943（66） | 0.929（65） |
+| 適合率 | 0.920 | 0.945 | 0.944 | 0.945 | 0.932 | 0.943 | 0.942 |
+
+- 0.2〜0.3 はほぼ同じ（違いは IMG_5109_1 の 1 本が出るか出ないか）。0.15 では余計な打球が増え、0.4 からは見落としが増える。
+  間の 0.25 をそのまま使う（`shot_list.TRACKNET_THRESHOLD`）。答え合わせ用のコマの数字（前の節）でも 0.15〜0.35 は同じくらいだった。
+
+### ショットの一覧で使う（2026-11-09）
+
+ショットの一覧（`shot_list`）は、自前の検出の代わりに学習したモデルの検出を使える。既定は今の検出のまま。
+
+```
+.venv\Scripts\python.exe -m smash_speed.shot_list IMG_5109_2.MP4 --calib calibration.json --out outputs\list_tn --tracknet outputs\f1b\ft1\model.pt
+.venv\Scripts\python.exe -m smash_speed.shot_list IMG_5109_2.MP4 --calib calibration.json --out outputs\list_tn --detections outputs\f1b\det\IMG_5109_2\detections.csv
+```
+
+- `--tracknet`（`ShotListOptions.tracknet`）：区間の全コマを `tracknet_train.detect_video` で検出し（`<出力先>/tracknet/detections.csv`）、それを使う。
+  `--tracknet-threshold` の既定は 0.25。`.venv-train` が要る。`smash-speed shots` にも同じ引数がある。
+- `--detections`（`ShotListOptions.detections`）：前に作った検出 CSV を使う。時刻はコマの番号から付け直す（`tracknet_train` は撮影の fps を
+  知らないので、スロー動画では CSV の時刻が違う）。
+- 後の流れ（軌道の絞り込み → 打球 → 当てはめ）は同じ。`shot_list.json` の `detector`（`baseline`・`tracknet`・`file`）に、どれを使ったかを残す。
+- IMG_5109_2（287 コマ）での例：打球はどちらも 12 本。初速が出たショットは今の検出 9 本 → モデル 12 本。検出は 3.6 → 11.3 秒に
+  増えるが、当てはめは 218 → 76 秒に減った（シャトルらしい軌道の候補が 181 本 → 13 本）。初速の正しさは、ショットの一覧の正しい初速がないので
+  まだ比べていない（F1c）。

@@ -1,6 +1,7 @@
 """動画 1 本のすべてのショットを、種類・初速つきで一覧にする（ROADMAP B5 の解析の部分）。
 
 1. 動画全体を 1 回だけ縮小して読み、シャトルを検出する（``detection.baseline``。1 コマ 1 点）。
+   学習したモデル（``tracknet``）か、外の検出 CSV（``detections``）を代わりに使うこともできる（F1b）。
 2. 打球音（音声があれば）と軌道の向きの変化から、すべての打球の時刻と打った側を出す（``hits.find_hits``）。
 3. 打球の間隔で組に分け、組ごとに軌道と初速を当てはめる（``shot_fit.fit_shots``）。ほかの組の検出が
    混ざらないよう、組の前後で検出を切り分ける。
@@ -57,6 +58,8 @@ from smash_speed.video_io import VideoMeta, extract_audio, load_wav, probe
 
 SHOT_LIST_FILE = "shot_list.json"
 DETECTIONS_FILE = "detections.csv"
+TRACKNET_DIR = "tracknet"         # 学習したモデルの検出の作業場所（``<出力先>/tracknet/detections.csv``）
+TRACKNET_THRESHOLD = 0.25         # 学習したモデルの熱の地図の閾値（F1b：打球の見つけ方で 0.25 が良い）
 
 
 @dataclass
@@ -79,6 +82,11 @@ class ShotListOptions:
     hitter_prior: bool = True         # 選手の位置があれば、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     hit_players: bool = True          # 選手の位置があれば、打球を見つけるのにも使う（``find_hits`` の ``players``。
                                       # どちらの選手にも届かない所の打球を捨て、近い方を打った側にする）
+    detections: Path | None = None    # 自前の検出の代わりに使う検出 CSV（``tracknet_train detect`` の出力など。
+                                      # 列 frame, x_px, y_px, visible[, track_id]。時刻はコマの番号から付け直す）
+    tracknet: Path | None = None      # 学習したモデル（``tracknet_train`` の model.pt）。あればこれで全コマを検出し
+                                      # （``tracknet_train.detect_video``。torch は ``.venv-train``）、自前の検出の代わりに使う
+    tracknet_threshold: float = TRACKNET_THRESHOLD
 
 
 # =============================================================================
@@ -114,6 +122,51 @@ def detect_all(meta: VideoMeta, cfg: dict[str, Any], start_s: float | None = Non
     n_total = max(1, int(np.sum((ts >= lo) & (ts <= hi))))
     frames = stream_gray(meta, int(round(meta.width * scale)), cfg, start_s, end_s)
     return detect_frames(_with_progress(frames, n_total, progress), scale, p, n_tracks=n_tracks, exclusive=exclusive)
+
+
+def load_detections(path: Path, meta: VideoMeta, start_s: float | None = None, end_s: float | None = None
+                    ) -> pd.DataFrame:
+    """外の検出 CSV を、``detect_all(exclusive=False)`` と同じ形（列 ``frame, timestamp, x_px, y_px, visible,
+    confidence, track_id``）にして、区間で切る。
+
+    時刻はコマの番号から付け直す（``tracknet_train`` は撮影の fps を知らないので、スロー動画では時刻が違う）。
+    ``track_id`` がなければ、見えている点を 1 本の軌道にする。
+    """
+    det = pd.read_csv(path)
+    missing = {"frame", "x_px", "y_px", "visible"} - set(det.columns)
+    if missing:
+        raise AnalysisError(f"検出のファイル {Path(path).name} に列 {', '.join(sorted(missing))} がありません。",
+                            ["学習したモデルの検出（tracknet_train detect）の detections.csv を選んでください。"])
+    ts = meta.timestamps
+    det = det[(det.frame >= 0) & (det.frame < len(ts))].copy()
+    det["frame"] = det.frame.astype(int)
+    det["timestamp"] = ts[det.frame.to_numpy()]
+    det["visible"] = det.visible.fillna(0).astype(int)
+    if "confidence" not in det:
+        det["confidence"] = det.visible.astype(float)
+    if "track_id" not in det:
+        det["track_id"] = np.where(det.visible > 0, 0, -1)
+    det["track_id"] = det.track_id.fillna(-1).astype(int)
+    lo = -np.inf if start_s is None else start_s
+    hi = np.inf if end_s is None else end_s
+    det = det[(det.timestamp >= lo - 1e-6) & (det.timestamp <= hi + 1e-6)]
+    cols = ["frame", "timestamp", "x_px", "y_px", "visible", "confidence", "track_id"]
+    return det[cols + [c for c in det.columns if c not in cols]].sort_values("frame", kind="stable"
+                                                                             ).reset_index(drop=True)
+
+
+def tracknet_detections(o: ShotListOptions, out: Path, progress: Callable[[str], None] = print) -> Path:
+    """学習したモデル（``o.tracknet``）で区間の全コマを検出し、``<出力先>/tracknet/detections.csv`` のパスを返す。"""
+    from smash_speed.train.tracknet_train import detect_video
+
+    if not Path(o.tracknet).exists():
+        raise AnalysisError(f"学習したモデル {o.tracknet} が見つかりません。",
+                            ["docs/gpu.md の「エージェントの正解での学習」の手順で作った model.pt を選んでください。"])
+    progress("[進行] 学習したモデルでシャトルを検出しています")
+    d = out / TRACKNET_DIR
+    detect_video(o.video, o.tracknet, d, o.start_s, o.end_s, o.tracknet_threshold,
+                 progress=lambda m: progress(f"[進行] {m}"))
+    return d / "detections.csv"
 
 
 # =============================================================================
@@ -429,7 +482,11 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     if onsets is not None:
         progress(f"[進行] 打球音の候補 {len(onsets)} 個")
     lap("audio")
-    det = detect_all(meta, cfg, o.start_s, o.end_s, o.roi, o.n_tracks, exclusive=False, progress=progress)
+    det_path = tracknet_detections(o, out, progress) if o.tracknet is not None else o.detections
+    if det_path is not None:
+        det = load_detections(det_path, meta, o.start_s, o.end_s)
+    else:
+        det = detect_all(meta, cfg, o.start_s, o.end_s, o.roi, o.n_tracks, exclusive=False, progress=progress)
     lap("shuttle_detect")
     tracks = None
     if o.filter_tracks:
@@ -471,6 +528,9 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "capture_fps": o.capture_fps, "fps": meta.capture_fps, "width": meta.width, "height": meta.height,
         "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi, "recorded_at": recorded_at(meta),
         "audio": str(Path(o.audio).resolve()) if o.audio else None,
+        "detector": "tracknet" if o.tracknet is not None else ("file" if o.detections is not None else "baseline"),
+        "detections": str(Path(det_path).resolve()) if det_path is not None else None,
+        "tracknet_threshold": o.tracknet_threshold if o.tracknet is not None else None,
         "used_audio": onsets is not None, "n_onsets": None if onsets is None else len(onsets),
         "n_frames": len(det), "n_visible": n_vis,
         "n_tracks": None if tracks is None else len(tracks),
@@ -564,13 +624,18 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
     ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
     ap.add_argument("--no-hit-players", action="store_true", help="打球を見つけるのに選手の位置を使わない")
+    ap.add_argument("--detections", type=Path, default=None,
+                    help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
+    ap.add_argument("--tracknet", type=Path, default=None, help="学習したモデル（model.pt）で全コマを検出して使う")
+    ap.add_argument("--tracknet-threshold", type=float, default=TRACKNET_THRESHOLD)
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
                                          players=a.players, hitter_prior=not a.no_hitter_prior,
-                                         hit_players=not a.no_hit_players), cfg)
+                                         hit_players=not a.no_hit_players, detections=a.detections,
+                                         tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 
