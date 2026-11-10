@@ -427,8 +427,11 @@ smash-speed validate --dataset data/validation/index.csv --out outputs/validatio
   サーブ（ショート 35〜55 km/h、ロング 70〜160 km/h）。シャトルは減速が大きいので、奥まで上げるロブ・クリアの初速は高めになる。
 
 ```powershell
-# 合成ラリーの動画（rally.mp4・打球音 rally.wav）と正解（shots.csv・rallies.csv・各コマの truth_frames.csv）
+# 合成ラリーの動画（rally.mp4・打球音 rally.wav）と正解（shots.csv・rallies.csv・各コマの truth_frames.csv）、
+# 仮想カメラのキャリブレーション（calibration.json）
 python -m smash_speed.synth_rally outputs/synth_rally --seed 0 --shots 10 --fps 120
+# そのままショットの一覧を作って、正解の shots.csv と見比べられる
+python -m smash_speed.shot_list outputs/synth_rally/rally.mp4 --calib outputs/synth_rally/calibration.json --out outputs/synth_rally_shots
 ```
 
 カメラは設定の `synthetic.rally_camera`（コートの横・遠く。高いロブも画面に入る）。

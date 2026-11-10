@@ -133,3 +133,16 @@ def test_render_rally_video_with_a_click_per_hit(tmp_path):
     for t, s in zip(onsets, shots):
         delay = np.linalg.norm(cam.center - s.hit_point) / 343.0
         assert t == pytest.approx(s.t_hit_s + delay, abs=0.002)
+
+
+def test_cli_writes_video_truth_and_calibration(tmp_path):
+    """コマンドは、動画・正解と一緒に、そのまま解析に渡せるキャリブレーションも書く。"""
+    from smash_speed.calibration.io import load_calibration
+    from smash_speed.config import load_config
+    from smash_speed.synth_rally import main, rally_camera
+
+    main([str(tmp_path), "--seed", "1", "--shots", "2", "--fps", "30"])
+    for name in ("rally.mp4", "rally.wav", "shots.csv", "rallies.csv", "truth_frames.csv", "calibration.json"):
+        assert (tmp_path / name).exists(), name
+    cam, _ = load_calibration(tmp_path / "calibration.json")
+    assert np.allclose(cam.center, rally_camera(load_config()).center)
