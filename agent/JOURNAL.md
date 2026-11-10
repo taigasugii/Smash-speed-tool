@@ -14,6 +14,36 @@
 
 ---
 
+## 2026-11-10 21:00 PR #1 の見直し（人が頼んだ別のセッション。ブランチ `fable/main-review`）
+- 選んだ理由：人の頼み。`agent/dev` が main より約 130 コミット進んでいるので、main に入れる前に全体を見直して直す。
+- やったこと：`git diff origin/main...origin/agent/dev`（124 ファイル）を見直した。Web サーバー・画面・コマンド・品質チェックは中身を読み、
+  ほかは静的チェック（ruff）・文書のコマンドと `--help` の突き合わせ・GUI を予備のポートで開く・合成ラリーの通しで確かめた。
+  `shot_fit.py`・`physics.py` は別のセッションが変更中なので見ていない。直したもの：
+  - `/file`：道を文字の並びで比べていたので、隣の `smash-speed-agent` が `smash-speed` の中とみなされた。フォルダの包含で比べる。
+    合言葉のファイル（`remote_access.json`）と `.git` の中は返さない（ログインした離れた端末が取れた）。
+  - 起動の引数：`python -m smash_speed.webapp --help`・打ち間違い・`--port 8768` が読み飛ばされて 8765 で起動していた。argparse で読む
+    （`smash_speed.webapp.parse_args`）。
+  - API の中の思わぬ失敗を JSON で返す（HTML の 500 だと画面は何も出さない）。`shot_labels.csv` を Excel で開いたままのときは理由を出す。
+  - 「関節・打点を付ける」の候補が「-0.01 s」になるのを 0 で止めた。
+  - `real_videos_baseline.json` の動画の場所（人のフォルダの名前、8 か所）を名前だけにした。`make_baseline` も場所を残さない。
+    初速などの値は変えていない（`video_path` の 4 行を消し、`calibration.video` の 4 行を名前にしただけ）。`find_video`・`truth/frames.py` は
+    `video_path` がなくても動く。
+  - `synth_rally` のコマンドが `calibration.json` も書く。`QUESTIONS.md` の服の色で人を指した書き方を直した。
+  - テスト 7 件を足した（`/file` の守り、起動の引数、JSON のエラー、開いたままのラベルのファイル、すべての道が入口の制限を通る、
+    合成ラリーのコマンド、基準に場所が残らない）。`onnx` がないときは `test_players` の 1 件だけ飛ばす。
+  - README（初めに機能の一覧、再生の説明、テストの時間、モジュールの一覧）・`agent/README.md`（`.[dev,gpu]`・時間）。
+- 結果（数字）：合成ラリー 8 本を `smash-speed shots` で解析して、種類 8/8・初速は正解から 0.1〜4 km/h。GUI は 14 画面とも開き、
+  ショットの一覧の表・場面の再生・正しい種類の保存・レポートが動いた。文書のコマンド 50 個の引数に食い違いなし。
+- 品質チェック：通った（テスト 443 件・1140 秒、合成 MAPE 30fps 3.688% / 240fps 4.193%、hitter_position 6.955% / 6.059%、check_real_hits 再現率 0.929・適合率 0.823、実動画 4 本 最大のずれ 0.00%・正しい初速との差の中央値 0.45σ、check_shot_speeds 2.43%・1.74%、ほかも前と同じ）。
+  ただし 1 回では通っていない：1 回目はテストとほかのチェックは通り、`check_real_videos` だけがメモリ不足（`ArrayMemoryError`、4 MiB が取れない）で止まった。
+  同じ中身で `--skip-tests` でやり直すと 12 個とも通った（`check_real_videos` は単独でも 0.00%）。基準は作り直していない。
+- 次にやること：
+  - CLAUDE.md が古い（`.[dev]`・テスト約 3 分・品質チェック約 5 分）。人が決めて直す。
+  - `check_real_videos` は 4 本を並べて解析するので、メモリが足りないと止まる（今回も 1 回）。並べる数を減らすか、止まったら 1 本ずつやり直す。
+  - `eval_gate.py` のテストの件数が「0 件通過」と出る（通っている。最後の行の読み取りが合っていない）。
+  - `/api/shots`・`/api/shot_view`・`/api/form/pose` の `dir=` を出力の場所の中に限るか。
+  - `smash-speed shots` に `--all-tracks` がない。未使用の import 8 個。
+
 ## 2026-11-09 10:22 F1a 実動画のシャトルの正解を作る（8 回目。量を足す。F1a は `[~]` のまま）
 - 選んだ理由：コメント・Issue はなし。E1b は人の打点のラベル待ち（`outputs/pose_labels/` がない）。ROADMAP の上から最初の `[~]` は F1a なので、
   F1c より先に F1a の量（`IMG_4521 (1).MOV` の残りの区間）。
