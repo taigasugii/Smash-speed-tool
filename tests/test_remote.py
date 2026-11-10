@@ -101,3 +101,16 @@ def test_tailnet_address_ranges():
     assert not remote.is_tailnet("100.128.0.1") and not remote.is_tailnet("192.168.0.2")
     assert remote.is_tailnet("fd7a:115c:a1e0::1") and remote.is_tailnet("::ffff:100.100.1.1")
     assert remote.is_local("127.0.0.1") and remote.is_local("::1") and not remote.is_local("100.100.1.1")
+
+
+def test_launch_arguments():
+    """起動の引数：``--port 8768`` と ``--port=8768`` のどちらも読み、知らない引数・``--help`` では起動しない。"""
+    from smash_speed.webapp import parse_args
+
+    a = parse_args(["--remote", "--no-browser", "--port", "8768"])
+    assert a.remote and a.no_browser and a.port == 8768 and not a.set_passphrase
+    assert parse_args(["--port=8766"]).port == 8766
+    assert parse_args([]).port is None and not parse_args([]).remote
+    for bad in (["--help"], ["--prot=1"], ["remote"]):
+        with pytest.raises(SystemExit):
+            parse_args(bad)

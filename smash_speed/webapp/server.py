@@ -1240,6 +1240,7 @@ def main(open_browser: bool = True, port: int = DEFAULT_PORT, remote: bool = Fal
 
 
 if __name__ == "__main__":
-    main(open_browser="--no-browser" not in sys.argv,
-         port=int(next((a.split("=")[1] for a in sys.argv if a.startswith("--port=")), DEFAULT_PORT)),
-         remote="--remote" in sys.argv)
+    from smash_speed.webapp import parse_args
+
+    _a = parse_args()
+    main(open_browser=not _a.no_browser, port=_a.port or DEFAULT_PORT, remote=_a.remote)
