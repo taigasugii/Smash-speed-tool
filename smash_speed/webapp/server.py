@@ -165,6 +165,19 @@ def body() -> dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
+@app.errorhandler(Exception)
+def _unexpected(e: Exception):
+    """思わぬ失敗も、API では画面が読める形（JSON）で返す（HTML の 500 だと、画面は何も出さずに止まる）。"""
+    from werkzeug.exceptions import HTTPException
+
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("%s で失敗しました", request.path)
+    if request.path.startswith("/api/"):
+        return err(f"思わぬ失敗がありました（{type(e).__name__}: {e}）", 500)
+    return "Internal Server Error", 500
+
+
 def video_args() -> list[str]:
     a = ["--video", S.state["video"]]
     if S.state.get("capture_fps"):
@@ -1013,6 +1026,8 @@ def shot_label():
         labels = set_label(out_root() / LABELS_FILE, video, shots[k], label)
     except ValueError as e:
         return err(str(e))
+    except OSError as e:  # Windows では、Excel などで開いているファイルは書き換えられない
+        return err(f"{LABELS_FILE} に保存できませんでした。Excel などで開いていたら閉じてください（{e}）")
     return ok(id=k, truth=label, label_stats=_label_stats(labels, video))
 
 

@@ -401,3 +401,37 @@ def test_report_and_history_pages(client, tmp_path):
     client.post("/api/state", json={"out_root": str(tmp_path / "new_out")})
     h = client.post("/api/history").get_json()
     assert h["ok"] and h["n_days"] == 0
+
+
+def test_api_failures_come_back_as_json(client, tmp_path, monkeypatch):
+    """API の中の思わぬ失敗は、HTML の 500 ではなく ``ok: false`` の JSON で返る（画面が理由を出せる）。"""
+    from smash_speed.webapp import server
+
+    def boom():
+        raise RuntimeError("こわれた")
+
+    monkeypatch.setattr(server, "busy", boom)
+    r = client.get("/api/ping")
+    assert r.status_code == 500 and r.get_json() == {"ok": False, "error": "思わぬ失敗がありました（RuntimeError: こわれた）"}
+    assert client.get("/api/no_such").status_code == 404  # ふつうの 404 はそのまま
+
+
+def test_shot_label_reports_a_locked_file(client, tmp_path, monkeypatch):
+    """ラベルのファイルが書き換えられない（Excel で開いている）ときは、理由を返す。"""
+    from smash_speed import shot_labels
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOTS_FILE, Shot, write_shots
+    from smash_speed.webapp import server
+
+    d = tmp_path / "v_shots"
+    d.mkdir()
+    write_shots(d / SHOTS_FILE, [Shot(t_hit_s=1.0, side="h", shot_type="smash")])
+    (d / SHOT_LIST_FILE).write_text(json.dumps({"video": "v.mp4"}), encoding="utf-8")
+    server.S.state.update(out_root=str(tmp_path), shots_dir=str(d))
+
+    def locked(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(shot_labels, "write_labels", locked)
+    r = client.post("/api/shot_label", json={"i": 0, "label": "clear"})
+    assert r.status_code == 400 and "閉じてください" in r.get_json()["error"]
