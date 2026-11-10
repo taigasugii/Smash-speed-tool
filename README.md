@@ -46,8 +46,8 @@
 種類と初速つきで並べる（手順 2 のコート合わせが済んでいること）。動画全体か区間を選んで「解析を始める」を押すと、進み具合が
 画面の下に出る（4K 30fps の 20 秒で約 70 秒）。種類ごとの本数・平均と最高の初速のカードを押すとその種類だけに絞り込め、
 表は時刻の順と速い順に並べ替えられる。表の行を押すと、打った少し後の場面に見つけたシャトルと計算した飛び方を重ねた画像と、
-コートを上から見た飛び方（打った所・落ちた所）が出る。場面は「前のコマ」「次のコマ」・スライダー・キーボードの ← → で、
-打つ 0.2 秒前から次の打球までを 1 コマずつ送れる（そのコマのシャトルと、計算した飛び方のその時刻の位置に印が付く）。一覧は CSV で保存できる。
+コートを上から見た飛び方（打った所・落ちた所）が出る。場面は「▶ 再生」（スペース。ゆっくりにもできる）で打つ 0.8 秒前から次の打球までを
+繰り返し見られ、「前のコマ」「次のコマ」・スライダー・キーボードの ← → で 1 コマずつ送れる（そのコマのシャトルと、計算した飛び方のその時刻の位置に印が付く）。一覧は CSV で保存できる。
 「いちばん速いスマッシュ」と「ショットの一覧」は、それぞれの画面のボタンから行き来できる。種類は決まりに沿って分けた目安で、実際の試合の動画での精度はまだ確かめていない。
 正しい種類が分かるショットは、表の「正しい種類」の欄か、行を押して出る詳しい所のボタン（キーボードの 1〜8 でも）で選ぶ。
 「選んだら次のショットへ進む」を入れておくと、続けて付けられる。選んだ種類は出力の場所の `shot_labels.csv`（動画をまたいで 1 つ）に残り、
@@ -89,11 +89,12 @@ python -m pip install --no-deps mediapipe absl-py certifi sounddevice
 # 任意：姿勢推定（RTMPose）。onnxruntime-directml と同じ環境に入れるので、依存は入れずに入れる（docs/pose_features.md）
 python -m pip install --no-deps rtmlib tqdm
 
-# 任意：GPU での推論（onnxruntime-directml。約 33 MB）。速さの確かめ方は docs/gpu.md
+# 選手の位置（「選手の立ち位置も記録する」「① を選手の立ち位置から入れる」・--players）を使うとき：
+# ONNX のモデルの推論（onnxruntime-directml。約 33 MB。GPU があれば使う）。速さの確かめ方は docs/gpu.md
 python -m pip install -e ".[gpu]"
 python -m smash_speed.accel --bench
 
-# テスト（合成データで全モジュールを確認。1 分ほど）
+# テスト（合成データで全モジュールを確認。デスクトップで 25 分ほど。1 つだけなら pytest tests	est_physics.py）
 pytest
 ```
 
@@ -1023,6 +1024,7 @@ smash_speed/
   train/                疑似低 fps・学習データ・ファインチューニング・検出の評価
   validate.py           精度検証（合成・実データ）、Bland–Altman、補正
   report.py             CSV・グラフ・オーバーレイ動画
+  batch.py              動画の中のスマッシュをまとめて解析する（候補探し → 詳しい解析 → 順位表）
   shots.py              ショットとラリーのデータ形式（shots.csv・rallies.csv）
   hits.py               すべての打球（打った時刻と打った側）を見つける
   shot_fit.py           ショットごとの軌道と初速（打点をつないで飛行平面を決める）
@@ -1032,13 +1034,30 @@ smash_speed/
   rally_stats.py        ラリーの統計（長さ・種類の割合・種類ごとの速さ・着地点の分布図）
   rally_report.py       1 本の動画の統計を 1 枚のページ（report.html）にまとめる
   history.py            日付ごとの記録の推移（history.csv・history.html）
+  shot_labels.py        ショットの種類の正解ラベル（shot_labels.csv）
+  shot_learn.py         ショットの種類の判定（学習。ラベルが集まるまでは比べるだけ）
+  side_clear.py         側方から撮ったクリアの初速（打った直後の数コマと姿勢の手首から）
+  players.py            選手の検出と追跡（YOLOX の ONNX。コートの上の位置）
+  movement.py           選手の移動距離・速さ・いた場所
+  hitter.py             打つ人の足元（選手の位置から）
+  feet_speed.py         足元からの初速の目安
+  pose.py               姿勢推定（RTMPose・MediaPipe）と、手で付けた関節との比べ方（PCK）
+  pose_prep.py          姿勢の前処理（ショット単位の切り出し・打点・顔のぼかし・正規化）
+  pose_features.py      フォームの特徴量（肘・肩の角度、手首の速さ、体の回る順番など）
+  form.py               フォームの解析（姿勢推定 → 打点 → 特徴量）
+  form_score.py         お手本との近さの点（DTW・コサイン）
+  form_table.py         1 ショット 1 行の表（特徴量・点・打球の初速など）
+  pose_label.py         関節・打点を手で付けたラベルの読み書きと集計
+  accel.py              ONNX の推論の装置選び（DirectML の GPU / CPU）
   synth.py              合成データ・合成動画
   synth_rally.py        すべての種類のショットと、1 ラリー分・続けて打った複数のラリーの合成データ
   synth_ambiguous.py    種類の範囲を重ねた（あいまいな）合成ラリーの設定
   synth_clutter.py      実動画に近い条件（検出の抜け・人・隣のコート・低いカメラ）の合成ラリーと、その測り方
+  synth_players.py ほか  選手・姿勢の合成データ（synth_rally_players.py・synth_pose.py）
   cli.py                コマンドライン
   webapp/               GUI（ローカル Web アプリ。smash-speed-gui.bat から起動）
 agent/                  自律開発エージェント（ロードマップ・1 回分の指示・品質チェック・繰り返し起動するスクリプト）
+docs/                   速さ（speed.md）・GPU と学習（gpu.md）・フォームの特徴量（pose_features.md）の詳しい記録
 notebooks/              Colab でのファインチューニング
 tests/                  合成データによるテスト
 data/, outputs/         動画・ラベル・出力（Git 管理外）
