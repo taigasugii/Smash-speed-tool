@@ -31,9 +31,11 @@ from smash_speed.court import court_segments
 from smash_speed.geometry import floor_point
 from smash_speed.video_io import VideoMeta, probe, seek_read
 from smash_speed.webapp import agent, form_api, label_api
+from smash_speed.webapp.remote import CONFIG_FILE as _REMOTE_CONFIG
 from smash_speed.webapp.remote import REMOTE
 
 APP_ID = "smash-speed-web"
+REMOTE_CONFIG_NAME = _REMOTE_CONFIG.name.lower()   # 合言葉のファイルの名前（/file では返さない）
 STATIC = Path(__file__).parent / "static"
 STATE_FILE = PROJECT_ROOT / "outputs" / "web_state.json"
 DEFAULT_PORT = 8765
@@ -233,7 +235,10 @@ def file():
     """出力フォルダ・プロジェクトの中のファイルだけを返す（画像・動画・CSV）。"""
     p = Path(request.args.get("path", "")).resolve()
     roots = [out_root().resolve(), PROJECT_ROOT.resolve()]
-    if not any(str(p).startswith(str(r)) for r in roots) or not p.is_file():
+    # 文字の並びでなくフォルダの包含で比べる（隣の smash-speed-agent などは smash-speed の中ではない）
+    if not any(p.is_relative_to(r) for r in roots) or not p.is_file():
+        abort(404)
+    if p.name.lower() == REMOTE_CONFIG_NAME or ".git" in p.parts:   # 合言葉のファイルと Git の中身は返さない
         abort(404)
     return send_file(p, conditional=True)
 

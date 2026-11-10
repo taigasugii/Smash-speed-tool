@@ -102,6 +102,30 @@ def test_labels_roundtrip_and_file_guard(client, session, tmp_path):
     assert client.get("/file", query_string={"path": "C:/Windows/win.ini"}).status_code == 404
 
 
+def test_file_guard_refuses_siblings_and_passphrase(client, session, tmp_path, monkeypatch):
+    """/file は出力の場所とプロジェクトの中だけ。名前が似た隣のフォルダと、合言葉のファイルは返さない。"""
+    from smash_speed.webapp import server
+
+    root = tmp_path / "proj"
+    out = root / "outputs"
+    out.mkdir(parents=True)
+    (out / "a.csv").write_text("x", encoding="utf-8")
+    (out / "remote_access.json").write_text("{}", encoding="utf-8")
+    sibling = tmp_path / "proj-agent"            # 文字の並びでは proj で始まるが、中ではない
+    sibling.mkdir()
+    (sibling / "b.csv").write_text("x", encoding="utf-8")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(server, "PROJECT_ROOT", root)
+    server.S.state["out_root"] = str(out)
+    get = lambda p: client.get("/file", query_string={"path": str(p)}).status_code  # noqa: E731
+    assert get(out / "a.csv") == 200
+    assert get(sibling / "b.csv") == 404
+    assert get(out / "remote_access.json") == 404
+    assert get(out / ".." / "outputs" / "REMOTE_ACCESS.JSON") == 404
+    assert get(root / ".git" / "config") == 404
+
+
 def _wait(client, tid, limit=600):
     t0 = time.time()
     while time.time() - t0 < limit:
