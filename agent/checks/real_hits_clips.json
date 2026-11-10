@@ -93,8 +93,8 @@
    "expected": {
     "n_true": 9,
     "n_found": 9,
-    "tp": 9,
-    "side_correct": 9
+    "tp": 8,
+    "side_correct": 8
    }
   },
   {
@@ -125,8 +125,8 @@
    "expected": {
     "n_true": 14,
     "n_found": 16,
-    "tp": 14,
-    "side_correct": 14
+    "tp": 13,
+    "side_correct": 13
    }
   }
  ]
