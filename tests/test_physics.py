@@ -38,6 +38,20 @@ def test_simulate_matches_analytic_without_gravity():
     np.testing.assert_allclose(vel[:, 0], v_analytic, rtol=2e-3)
 
 
+def test_rhs_matches_the_numpy_formula_bit_for_bit():
+    """Python の数で計算する運動方程式（F3b で速くした）は、numpy の式と 1 ビットも違わない。"""
+    from smash_speed.physics import _rhs
+
+    rng = np.random.default_rng(0)
+    g, k = 9.80665, 9.80665 / 6.8 ** 2
+    for _ in range(3000):
+        st = rng.normal(0.0, 1.0, 6) * 10 ** rng.uniform(-3, 3, 6)
+        v = st[3:]
+        a = -k * np.sqrt(v @ v) * v
+        a[2] -= g
+        assert np.array_equal(_rhs(0.0, st, g, k), np.concatenate([v, a]))
+
+
 def test_backward_integration_is_consistent(phys):
     p0, v0 = np.array([-4.0, 0.0, 2.5]), np.array([60.0, 5.0, -10.0])
     t = np.array([-0.01, 0.0, 0.05, 0.1])

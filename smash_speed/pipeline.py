@@ -55,6 +55,8 @@ class AnalyzeOptions:
     start_s: float | None = None
     end_s: float | None = None
     detections: Path | None = None          # 既存の検出 CSV を使う（TrackNet の結果など）
+    candidates: Path | None = None          # 既存の検出 CSV を、自前の軌道の探索の候補として使う（学習したモデルの点など）
+    candidates_only: bool = False           # True：自前の検出をせず candidates だけを使う／False：自前の候補に足す
     plane_json: Path | None = None
     hitter_xy: tuple[float, float] | None = None
     landing_xy: tuple[float, float] | None = None
@@ -71,6 +73,12 @@ class AnalyzeOptions:
     name: str | None = None
     roi: list[float] | None = None          # 検出する範囲 [x0, y0, x1, y1]（元解像度 px）
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _external_candidates(det: pd.DataFrame) -> pd.DataFrame:
+    """検出 CSV（列 ``frame, timestamp, x_px, y_px[, visible]``）の見えている点を、軌道の探索の候補の形にする。"""
+    vis = det[det.visible > 0] if "visible" in det else det
+    return vis.rename(columns={"x_px": "x", "y_px": "y"})[["frame", "timestamp", "x", "y"]].reset_index(drop=True)
 
 
 def _same_json(path: Path, obj: dict[str, Any]) -> bool:
@@ -276,6 +284,14 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
     if not own_detection:
         det = pd.read_csv(o.detections)
         det.to_csv(det_path, index=False)
+    elif o.candidates is not None and o.candidates_only:
+        # 外の検出を、従来の軌道の選び方と、打点から打ち出した軌道の探索・探し直しの候補の両方に使う
+        # （探索・探し直しは自前で行うので、外の検出が打つ前の球を追っていても打った後の軌道を選べる）
+        det = pd.read_csv(o.candidates)
+        det.to_csv(det_path, index=False)
+        cands = _external_candidates(det)
+        cands.to_csv(cand_path, index=False)
+        det_meta_path.unlink(missing_ok=True)
     elif det_path.exists() and cand_path.exists() and not o.force and _same_json(det_meta_path, det_key):
         det = pd.read_csv(det_path)
         cands = pd.read_csv(cand_path)
@@ -284,6 +300,10 @@ def analyze(o: AnalyzeOptions, cfg: dict[str, Any]) -> dict[str, Any]:
         det.to_csv(det_path, index=False)
         cands.to_csv(cand_path, index=False)
         det_meta_path.write_text(json.dumps(det_key, ensure_ascii=False, default=str), encoding="utf-8")
+    if o.candidates is not None and not o.candidates_only and own_detection:
+        # 自前の候補に外の検出の点を足す（保存する candidates.csv は自前のまま。次の回の使い回しのため）。
+        # 軌道の探索・探し直しでは、コマごとに予測位置にいちばん近い点が選ばれる
+        cands = pd.concat([cands, _external_candidates(pd.read_csv(o.candidates))], ignore_index=True)
     unit_px = max(1.0, meta.width / bp.process_width)  # 検出に使った縮小画像の 1 px が元の解像度で何 px か
 
     # --- 打球音

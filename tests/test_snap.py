@@ -129,3 +129,69 @@ def test_one_click_rejects_non_floor_point():
         assert "床の点" in str(e)
     else:
         raise AssertionError("支柱の先端で通った")
+
+
+def test_propose_finds_court_without_clicks():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    table = landmark_table(load_config())
+    Hm = _side_view_h()
+    frame = _court_image(Hm)
+    props = propose_calibrations(frame, table, n=3)
+    assert props and props[0].n_snapped >= 15
+    err = [np.linalg.norm(np.array(props[0].result.points[n]) - _apply_h(Hm, table[n][None, :2])[0])
+           for n in props[0].result.points]
+    assert np.median(err) < 1.5
+    assert [p.score for p in props] == sorted((p.score for p in props), reverse=True)
+
+
+def test_propose_puts_hitter_on_the_camera_end():
+    from smash_speed.calibration.propose import _orient
+
+    Hm = _camera_h()                                         # カメラは x < 0 の端の後ろ
+    flipped = Hm @ np.diag([-1.0, -1.0, 1.0])
+    assert np.allclose(_orient(flipped, (1080, 1920), None), Hm)
+    assert np.allclose(_orient(Hm, (1080, 1920), None), Hm)
+    # 手順 ① でカメラを x > 0 の側に置いたなら入れ替える
+    assert np.allclose(_orient(Hm, (1080, 1920), (8.0, -8.0)), flipped)
+
+
+def test_propose_returns_nothing_for_blank_frame():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    assert propose_calibrations(np.zeros((360, 640, 3), np.uint8), landmark_table(load_config())) == []
+
+
+def _median_err(Hm: np.ndarray, Ht: np.ndarray, table) -> float:
+    """床のランドマークの、2 つのホモグラフィでの画像の位置のずれの中央値 [px]（180° 回したコートも同じとみなす）。"""
+    W = np.array([v[:2] for v in table.values() if abs(v[2]) < 1e-6])
+    ref = _apply_h(Ht, W)
+    return min(float(np.median(np.linalg.norm(_apply_h(H, W) - ref, axis=1)))
+               for H in (Hm, Hm @ np.diag([-1.0, -1.0, 1.0])))
+
+
+def test_vanishing_candidates_find_low_corner_camera():
+    from smash_speed.calibration.propose import vanishing_candidates
+
+    table = landmark_table(load_config())
+    # 低い位置（0.95 m）・手前の角から撮った画像。手順 ① のカメラの位置は 1.5 m ずれている
+    Hm = _camera_h(C=(-9.5, -5.2, 0.95), target=(-1.5, 0.5, 0.0), f=1000.0)
+    frame = _court_image(Hm, seed=4, cross_seams=True)
+    cands = vanishing_candidates(frame, (-8.4, -4.2))
+    assert cands
+    assert min(_median_err(H, Hm, table) for H, _ in cands[:3]) < 5.0
+
+
+def test_propose_uses_camera_position_for_vanishing_candidates():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    table = landmark_table(load_config())
+    Hm = _camera_h(C=(-9.5, -5.2, 0.95), target=(-1.5, 0.5, 0.0), f=1000.0)
+    frame = _court_image(Hm, seed=4, cross_seams=True)
+    steps = []
+    props = propose_calibrations(frame, table, n=3, cam_xy=(-8.4, -4.2), progress=lambda f, m: steps.append((f, m)))
+    assert props and _median_err(props[0].result.homography, Hm, table) < 2.0
+    # 進み具合は 0 → 1 に増えていき、流れすぎない（GUI の処理の欄に出す）
+    fr = [f for f, _ in steps]
+    assert fr[0] == 0.0 and fr[-1] == 1.0 and fr == sorted(fr) and 5 <= len(steps) <= 60
+    assert all(isinstance(m, str) and m for _, m in steps)

@@ -29,12 +29,17 @@ App.views.fastest = {
         ①のだいたいの初速は、打つ人と着地点を推定して出しているため <b>±30% ほどずれる</b>ことがあります（速そうな 8 個を最初から選んでおきます）。順位は ③ の結果で決めてください。</div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="find">${cands.length ? "候補を探し直す" : "① 候補を探す"}</button>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${r.info && r.info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す（選手の動きと間違えやすい動画で）</label>` : ""}
-        ${cands.length ? `<span class="muted small">前回の結果：打球音 ${cands.length} 個のうち、シャトルの軌道が見つかったもの ${cands.filter((c) => c.status === "ok").length} 個</span>` : ""}</div></div>`);
+        <label class="row small"><input type="checkbox" id="players" ${r.info && r.info.players && !r.info.players.error ? "checked" : ""}> 打つ人の足元を、選手の立ち位置から入れる（時間が延びます）</label>
+        ${cands.length ? `<span class="muted small">前回の結果：打球音 ${cands.length} 個のうち、シャトルの軌道が見つかったもの ${cands.filter((c) => c.status === "ok").length} 個</span>` : ""}</div>
+      <div class="row small" style="margin-top:10px;gap:8px;flex-wrap:wrap"><span class="muted">スマッシュ以外（クリア・ドロップ・ロブなど）も含めて、すべての球の種類と速さを並べて見るなら</span>
+        <button class="btn sm" id="toshots">▤ ショットの一覧 へ</button></div></div>`);
+    $("#toshots", intro).onclick = () => go("shots");
     el.appendChild(intro);
     $("#find", intro).onclick = () => {
       if (cands.some((c) => c.confirmed || c.result) && !confirm("探し直すと、確認した打つ人・着地点と詳しい解析の結果が消えます。よろしいですか？")) return;
       const useRoi = !!($("#useroi", intro) && $("#useroi", intro).checked);
-      Task.start("batch_find", { select: 8, use_roi: useRoi }, (okk) => { if (okk) toast("候補を探し終わりました", "ok"); go("fastest"); }, "スマッシュの候補を探しています");
+      const players = $("#players", intro).checked;
+      Task.start("batch_find", { select: 8, use_roi: useRoi, players }, (okk) => { if (okk) toast("候補を探し終わりました", "ok"); go("fastest"); }, "スマッシュの候補を探しています");
     };
     if (!cands.length) return;
 
@@ -98,6 +103,7 @@ App.views.fastest = {
       const st = c.status !== "ok" ? `<span class="badge">${esc(c.note || "シャトルが見つからない")}</span>`
         : [c.confirmed ? '<span class="badge ok">確認済み</span>' : "", c.doubtful ? `<span class="badge bad" title="${esc(c.note)}">推定が怪しい</span>` : "",
           c.smash_like ? '<span class="badge info">スマッシュらしい</span>' : '<span class="badge">スマッシュ以外かも</span>',
+          !c.confirmed && c.hitter_source === "players" ? '<span class="badge" title="打った時の選手の立ち位置を、打つ人の足元に入れました">足元は選手の位置から</span>' : "",
           c.result && c.result.kmh != null ? `<span class="badge ok">解析済み ${fmt(c.result.kmh, 0)} km/h</span>` : "",
           c.doubtful ? `<div class="muted small">${esc(c.note)}</div>` : ""].join(" ");
       const tr = h(`<tr><td><input type="checkbox" ${c.selected ? "checked" : ""} ${c.status === "ok" ? "" : "disabled"}></td>

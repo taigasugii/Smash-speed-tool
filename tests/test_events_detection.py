@@ -161,3 +161,119 @@ def test_remove_outliers_keeps_early_points_of_decelerating_track():
     xy = np.column_stack([np.cumsum(steps), 0.4 * np.cumsum(steps)])
     keep = remove_outliers(t, xy, 4.0)
     assert keep[:3].all()
+
+
+def _predict_numpy(tr, t):
+    """F3c の前の ``_Track.predict``（numpy の配列の式）。"""
+    if len(tr.t) == 1:
+        return tr.xy[-1]
+    p1, p2 = tr.xy[-2], tr.xy[-1]
+    dt1 = tr.t[-1] - tr.t[-2]
+    v1 = (p2 - p1) / max(dt1, 1e-9)
+    steps = (t - tr.t[-1]) / max(dt1, 1e-9)
+    if len(tr.t) == 2:
+        return p2 + v1 * dt1 * steps
+    p0 = tr.xy[-3]
+    v0 = (p1 - p0) / max(tr.t[-2] - tr.t[-3], 1e-9)
+    n0, n1 = np.linalg.norm(v0), np.linalg.norm(v1)
+    if n0 < 1e-9 or n1 < 1e-9:
+        return p2 + v1 * dt1 * steps
+    r = float(np.clip(n1 / n0, 0.3, 1.6))
+    ang = np.arctan2(v0[0] * v1[1] - v0[1] * v1[0], v0 @ v1)
+    ang = float(np.clip(ang, -np.radians(30), np.radians(30)))
+    c, s_ = np.cos(ang), np.sin(ang)
+    rot = np.array([[c, -s_], [s_, c]])
+    pos, v = p2.copy(), v1 * dt1
+    k = 0.0
+    while k < steps - 1e-9:
+        frac = min(1.0, steps - k)
+        v = r * (rot @ v)
+        pos = pos + v * frac
+        k += 1.0
+    return pos
+
+
+def test_track_predict_matches_the_numpy_formula_bit_for_bit():
+    """Python の数で計算する軌道の予測（F3c で速くした）は、numpy の式と 1 ビットも違わない。"""
+    from smash_speed.detection.baseline import _Track
+
+    rng = np.random.default_rng(0)
+    for n in range(5000):
+        m = int(rng.integers(1, 6))
+        ts = list(rng.uniform(0, 100) + np.cumsum(rng.choice([1 / 30, 1 / 60, 1 / 240, 2 / 30], size=m)))
+        if n % 2:
+            x0, v = rng.uniform(0, 1280, 2), rng.normal(0, 30, 2)
+            xys = [x0 + v * k * rng.uniform(0.5, 1.5) for k in range(m)]
+        else:
+            xys = list(rng.uniform(0, 1280, size=(m, 2)))
+        if n % 37 == 0 and m >= 3:
+            xys[-2] = xys[-3].copy()                     # 止まった点（速さ 0）
+        tr = _Track(list(range(m)), list(range(m)), ts, xys)
+        t = ts[-1] + rng.choice([0.5, 1, 2, 2.7, 3]) / 30
+        assert np.array_equal(tr.predict(t), _predict_numpy(tr, t))
+
+
+def test_dedupe_overlapping_matches_comparing_every_pair():
+    """候補を共有する軌道とだけ比べる重なりの整理（F3c）は、すべての組を比べたときと同じ軌道を残す。"""
+    from smash_speed.detection.baseline import _dedupe_overlapping, _Track, track_score
+
+    rng = np.random.default_rng(1)
+    tracks = []
+    for _ in range(300):
+        n = int(rng.integers(3, 12))
+        start = int(rng.integers(0, 200))
+        ids = sorted(rng.choice(np.arange(start, start + 2 * n), size=n, replace=False).tolist())
+        t = [i / 30 for i in ids]
+        xy = [np.array([5.0 * i + rng.normal(0, 2), 3.0 * i + rng.normal(0, 2)]) for i in ids]
+        tracks.append(_Track(ids, ids, t, xy, strengths=list(rng.uniform(1000, 3000, n))))
+    expect, sets = [], []
+    for tr in sorted(tracks, key=lambda a: (-track_score(a), a.t[0])):
+        s = set(tr.ids)
+        if not any(len(s & o) >= 0.5 * min(len(s), len(o)) for o in sets):
+            expect.append(tr)
+            sets.append(s)
+    scores = {id(tr): track_score(tr) for tr in tracks}
+    assert [id(tr) for tr in _dedupe_overlapping(tracks, scores=scores)] == [id(tr) for tr in expect]
+    assert [id(tr) for tr in _dedupe_overlapping(tracks)] == [id(tr) for tr in expect]
+
+
+def test_detect_frames_gives_the_same_result_with_candidate_threads(monkeypatch):
+    """差分の候補をスレッドで並べて求めても（F3c）、1 つずつ求めたときと検出の結果は同じ。"""
+    import pandas as pd
+
+    from smash_speed.detection import baseline
+
+    rng = np.random.default_rng(2)
+    frames = []
+    for k in range(60):
+        g = rng.integers(0, 6, size=(180, 320), dtype=np.uint8)
+        for j in range(4):                                # 速さ・向きの違う動く点
+            x = int(20 + (3 + 2 * j) * k) % 300
+            y = int(30 + 30 * j + 0.05 * (k - 30) ** 2) % 170
+            g[y:y + 3, x:x + 3] = 200
+        frames.append((k, k / 30.0, g))
+    p = BaselineParams(process_width=320)
+    monkeypatch.setattr(baseline, "CANDIDATE_THREADS", 1)
+    one, cands_one = baseline.detect_frames(iter(frames), 1.0, p, n_tracks=None, return_candidates=True,
+                                            exclusive=False)
+    monkeypatch.setattr(baseline, "CANDIDATE_THREADS", 4)
+    many, cands_many = baseline.detect_frames(iter(frames), 1.0, p, n_tracks=None, return_candidates=True,
+                                              exclusive=False)
+    assert (one.visible == 1).sum() > 50
+    pd.testing.assert_frame_equal(one, many, check_exact=True)
+    pd.testing.assert_frame_equal(cands_one, cands_many, check_exact=True)
+
+
+def test_polyfit_xy_matches_fitting_each_column():
+    """x・y をまとめて当てはめる ``_polyfit_xy``（F3c）は、列ごとに polyfit・polyval したときと 1 ビットも同じ。"""
+    from smash_speed.detection.baseline import _polyfit_xy
+
+    rng = np.random.default_rng(3)
+    for n in range(3000):
+        m, deg = int(rng.integers(3, 9)), int(rng.integers(1, 3))
+        t = (np.arange(m) - rng.integers(0, m)) / 30.0
+        xy = np.column_stack([rng.uniform(0, 1280) + rng.normal(0, 300) * t + rng.normal(0, 2, m),
+                              rng.uniform(0, 720) + 400 * t ** 2 + rng.normal(0, 2, m)])
+        cs = [np.polyfit(t, xy[:, j], deg) for j in range(2)]
+        assert np.array_equal(_polyfit_xy(t, xy, deg), np.column_stack([np.polyval(c, t) for c in cs]))
+        assert np.array_equal(_polyfit_xy(t, xy, deg, at=0.0), np.array([np.polyval(c, 0.0) for c in cs]))
