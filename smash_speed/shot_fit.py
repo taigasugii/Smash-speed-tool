@@ -38,7 +38,7 @@ import pandas as pd
 
 from smash_speed.camera import Camera
 from smash_speed.geometry import FlightPlane
-from smash_speed.physics import (MPS_TO_KMH, FitOptions, FitResult, Observations, PhysicsParams, fit_trajectory,
+from smash_speed.physics import (MAX_FIT_SPEED_MPS, MPS_TO_KMH, FitOptions, FitResult, Observations, PhysicsParams, fit_trajectory,
                                  simulate, simulate_until_ground)
 from smash_speed.shots import Shot, side_of
 
@@ -188,7 +188,7 @@ def loose_fit(obs: Observations, t_hit: float, best: FitResult | None, phys: Phy
     if best is None:
         return None
     loose = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
-                       plane_sigma_deg=30.0, plane_sigma_m=3.0)
+                       plane_sigma_deg=30.0, plane_sigma_m=3.0, quadratic_priors=opts.quadratic_priors)
     if hitter_xy is not None:
         loose.p0_prior_m = np.r_[np.asarray(hitter_xy, float)[:2], np.clip(best.p0[2], 0.3, 3.5)]
         loose.p0_prior_sigma_m = hitter_sigma_m
@@ -459,6 +459,40 @@ def audio_hit_times(fits: list[ShotFit], t_audio: list[float | None], camera: Ca
     return out
 
 
+def foot_hit_times(fits: list[ShotFit], feet: list[np.ndarray | None], t_audio: list[float | None],
+                   phys: PhysicsParams, times: list[float], reach_m: float = 1.5, max_shift_s: float = 0.1,
+                   step_s: float = 0.002, max_speed_mps: float = MAX_FIT_SPEED_MPS) -> list[float]:
+    """打球音のないショットの打った時刻を、当てはめた軌道が打つ人の足元に水平にいちばん近づく時刻へ戻す。
+
+    軌道の向きの変化から決めた打球の時刻は、打った後に最初に見えたコマに寄って遅れやすい（実動画の 30 fps で 70 ms）。
+    遅れた時刻の「打点」は飛んだ先にあり（速いショットは 2 m）、初速はその時刻の速さなので大きく下がる。
+    当てはめた軌道を前へ戻すと打つ人の所を通るので、打点が足元から ``reach_m`` より離れているときだけ、
+    ``max_shift_s`` 前までの間でいちばん足元に近い時刻にする（そこでも ``reach_m`` より離れていれば、足元か軌道が
+    合っていないので直さない）。前へ戻すと速さは急に上がるので、
+    ``max_speed_mps`` を超える所までは戻さない。前のショットの最後の観測より前にも戻さない。
+    """
+    out = list(times)
+    for i, sf in enumerate(fits):
+        if feet[i] is None or t_audio[i] is not None or sf.fit is None:
+            continue
+        lo = times[i] - max_shift_s
+        prev = fits[i - 1] if i > 0 else None
+        if prev is not None and prev.obs is not None and len(prev.obs.t):
+            lo = max(lo, float(prev.obs.t[-1]))
+        t = np.arange(times[i], lo - step_s / 2, -step_s)
+        if len(t) < 2:
+            continue
+        pos, vel = simulate(sf.fit.p0, sf.fit.v0, sf.fit.t_ref, t, sf.fit.phys(phys))
+        ok = np.isfinite(pos).all(axis=1) & (np.linalg.norm(vel, axis=1) <= max_speed_mps)
+        gap = np.where(ok, np.hypot(pos[:, 0] - feet[i][0], pos[:, 1] - feet[i][1]), np.inf)
+        if not np.isfinite(gap[0]) or gap[0] <= reach_m:
+            continue
+        k = int(np.argmin(gap))
+        if gap[k] <= reach_m and gap[k] < gap[0] - 0.3:
+            out[i] = float(t[k])
+    return out
+
+
 # 並べて動かすプロセスでは、numpy・scipy の行列計算（OpenBLAS）を 1 スレッドにする。プロセスの数だけで並べているので
 # スレッドを増やしても速くならず、28 スレッドの PC では読み込むだけで 1 プロセス 1.5 GB を確保する（1 スレッドなら 0.1 GB。
 # 15 プロセスで 23 GB になり、ほかのアプリが動いていると確保に失敗して 1 つずつの計算に戻っていた）
@@ -549,7 +583,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               speed_of_sound_mps: float = 343.0, max_kmh: float = np.inf,
               bad_max_nfev_per_param: int = 30, hitter_xy: list[Any] | None = None,
               hitter_sigma_m: tuple[float, float] = (0.5, 2.0), max_hitter_gap_m: float = 2.5,
-              serve_depth_m: tuple[float, float] | None = None) -> list[ShotFit]:
+              serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5
+              ) -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -579,6 +614,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         hitter_sigma_m: 足元を打点の目安にするときの不確かさ（水平, 高さ）[m]。高さは分からないので大きくする
             （水平は IMG_4397 80〜100 s で 1.0 m より 0.5 m の方が足元から 2.5 m 以上離れた打点が少なく、14 → 12 → 8 本）
         max_hitter_gap_m: 足元からこれより離れた打点は外れとみなす [m]
+        hitter_reach_m: 足元から打点まで水平に届く距離 [m]。打球音のないショットの打点がこれより離れていたら、
+            打った時刻を、当てはめた軌道が足元にいちばん近づく時刻へ戻す（``foot_hit_times``。None なら直さない）
         serve_depth_m: 最初のショットをサーブとみなすときの、打点のネットからの深さの目安（平均, 標準偏差）[m]。
             サーブは前の軌道がないので、角・後ろのカメラでは打点の奥行きが決まらず、初速が 15〜40% ずれる。
             最初の当てはめの打点を、飛行平面に沿ってこの目安と重みつきで平均する（``serve_hit_point``）。
@@ -589,6 +626,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
     """
     opts = opts or FitOptions(refine_plane=True)
+    opts = FitOptions(**{**opts.__dict__, "quadratic_priors": True})
     t_hits = [float(t) for t in t_hits]
     sides = list(sides) if sides is not None else [""] * len(t_hits)
     vis_t = det.timestamp[(det.visible > 0) & det.x_px.notna()].to_numpy(float)
@@ -633,7 +671,11 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         times = refine_hit_times(fits, camera, phys) if refine_times else [sf.t_hit for sf in fits]
         if any(t is not None for t in t_audio):
             times = audio_hit_times(fits, t_audio, camera, phys, times, speed_of_sound_mps)
-        if refine_times or any(t is not None for t in t_audio):
+        moved = False
+        if hitter_reach_m is not None and any(f is not None for f in feet):
+            new = foot_hit_times(fits, feet, t_audio, phys, times, hitter_reach_m)
+            moved, times = new != times, new
+        if refine_times or moved or any(t is not None for t in t_audio):
             split(times)
         pts = hit_point_options(fits, phys, feet=feet if any(f is not None for f in feet) else None,
                                 max_foot_m=max_hitter_gap_m)
