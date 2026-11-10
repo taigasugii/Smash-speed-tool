@@ -50,7 +50,7 @@ def reader(name: str, videos: str | None) -> VideoReader:
     cfg = ROOT / ".agent" / "config.json"
     d = videos or (json.loads(cfg.read_text(encoding="utf-8")).get("videos_dir") if cfg.exists() else None)
     e = _entry(name)
-    for p in ([Path(d) / e["video"]] if d else []) + [Path(e["video_path"])]:
+    for p in ([Path(d) / e["video"]] if d else []) + ([Path(e["video_path"])] if e.get("video_path") else []):
         if p.exists():
             return VideoReader(probe(p))
     raise FileNotFoundError(f"{e['video']} が見つかりません（--videos で場所を指定してください）")

@@ -6,7 +6,6 @@
   {
    "name": "IMG_3391",
    "video": "IMG_3391.MOV",
-   "video_path": "C:\\Users\\taiga\\Downloads\\Badminton解析用\\IMG_3391.MOV",
    "capture_fps": null,
    "audio": null,
    "calibration": {
@@ -237,7 +236,7 @@
      "short_service_side_h_n: 再投影誤差 5.8 px（閾値 5.0 px）。クリック位置を確認してください。",
      "post_base_n: 再投影誤差 6.9 px（閾値 5.0 px）。クリック位置を確認してください。"
     ],
-    "video": "C:\\Users\\taiga\\Downloads\\Badminton解析用\\IMG_3391.MOV",
+    "video": "IMG_3391.MOV",
     "frame_time_s": 1.83333,
     "meta": {
      "smash_speed_version": "0.0.1",
@@ -340,7 +339,6 @@
   {
    "name": "IMG_4397",
    "video": "IMG_4397.MOV",
-   "video_path": "C:\\Users\\taiga\\Downloads\\IMG_4397.MOV",
    "capture_fps": null,
    "audio": null,
    "calibration": {
@@ -607,7 +605,7 @@
      "short_service_center_o: 再投影誤差 9.5 px（閾値 5.0 px）。クリック位置を確認してください。",
      "long_service_o_n: 再投影誤差 9.9 px（閾値 5.0 px）。クリック位置を確認してください。"
     ],
-    "video": "C:\\Users\\taiga\\Downloads\\IMG_4397.MOV",
+    "video": "IMG_4397.MOV",
     "frame_time_s": 25.52167,
     "meta": {
      "smash_speed_version": "0.0.1",
@@ -762,7 +760,6 @@
   {
    "name": "IMG_4521",
    "video": "IMG_4521.MOV",
-   "video_path": "C:\\Users\\taiga\\Downloads\\IMG_4521.MOV",
    "capture_fps": null,
    "audio": null,
    "calibration": {
@@ -886,7 +883,7 @@
      "post_base_p: 再投影誤差 5.7 px（閾値 5.0 px）。クリック位置を確認してください。",
      "short_service_singles_h_n: 再投影誤差 9.0 px（閾値 5.0 px）。クリック位置を確認してください。"
     ],
-    "video": "C:\\Users\\taiga\\Downloads\\IMG_4521.MOV",
+    "video": "IMG_4521.MOV",
     "frame_time_s": 125.50333,
     "meta": {
      "smash_speed_version": "0.0.1",
@@ -1015,7 +1012,6 @@
   {
    "name": "IMG_5096",
    "video": "IMG_5096.MOV",
-   "video_path": "C:\\Users\\taiga\\Downloads\\Badminton解析用\\IMG_5096.MOV",
    "capture_fps": null,
    "audio": null,
    "calibration": {
@@ -1218,7 +1214,7 @@
     "warnings": [
      "post_top_n: 再投影誤差 153 px。ほかの点と合わないため、推定から外しました（別の場所をクリックした可能性があります）。"
     ],
-    "video": "C:\\Users\\taiga\\Downloads\\Badminton解析用\\IMG_5096.MOV",
+    "video": "IMG_5096.MOV",
     "frame_time_s": 18.40083,
     "meta": {
      "smash_speed_version": "0.0.1",

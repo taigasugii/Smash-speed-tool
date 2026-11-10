@@ -30,6 +30,8 @@ def _constant_model(raw: np.ndarray, size: int) -> bytes:
 
 
 def test_person_detector_decodes_boxes_and_suppresses_duplicates():
+    pytest.importorskip("onnx")           # pip install -e ".[gpu]" で入る（なければこのテストだけ飛ばす）
+    pytest.importorskip("onnxruntime")
     size = 64
     n = sum((size // s) ** 2 for s in (8, 16, 32))
     raw = np.zeros((n, 6), np.float32)

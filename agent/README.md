@@ -43,15 +43,15 @@
    cd C:\Users\Public\Claude
    git clone https://github.com/taigasugii/Smash-speed-tool.git smash-speed-agent
    cd smash-speed-agent
-   py -3 -m venv .venv
-   .venv\Scripts\pip install -e .[dev]
+   py -3.12 -m venv .venv
+   .venv\Scripts\pip install -e .[dev,gpu]
    ```
 3. `smash-speed-agent\.agent\config.json` を作る。実動画のチェックで使う。
    ```json
    {"main_repo": "C:\\Users\\Public\\Claude\\smash-speed", "videos_dir": "C:\\Users\\<ユーザー名>\\Downloads\\Badminton解析用", "notify_url": ""}
    ```
    `notify_url` に ntfy.sh などの URL を入れると、1 回終わるごとにスマホへ通知する。その場合、課題名と要約がそのサービスに送られる。
-4. 品質チェックが動くことを確かめる（5 分ほどかかる）。
+4. 品質チェックが動くことを確かめる（テストを含めて 25〜30 分ほどかかる）。
    ```
    .venv\Scripts\python.exe agent\eval_gate.py
    ```

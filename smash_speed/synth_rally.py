@@ -560,6 +560,7 @@ def render_rally_video(rally: SyntheticRally, camera: Camera, cfg: dict[str, Any
 
 def main(argv: list[str] | None = None) -> None:
     import argparse
+    import json
 
     from smash_speed.config import load_config
     from smash_speed.shots import RALLIES_FILE, SHOTS_FILE, write_rallies, write_shots
@@ -575,9 +576,12 @@ def main(argv: list[str] | None = None) -> None:
     phys = PhysicsParams.from_config(cfg)
     rally = make_rally(np.random.default_rng(a.seed), phys, n_shots=a.shots)
     pre_s = 0.3
-    truth = render_rally_video(rally, rally_camera(cfg), cfg, phys, a.out_dir / "rally.mp4", fps=a.fps, pre_s=pre_s,
+    cam = rally_camera(cfg)
+    truth = render_rally_video(rally, cam, cfg, phys, a.out_dir / "rally.mp4", fps=a.fps, pre_s=pre_s,
                                audio_path=a.out_dir / "rally.wav", seed=a.seed)
     truth.to_csv(a.out_dir / "truth_frames.csv", index=False)
+    # そのまま shot_list・GUI に渡せるよう、仮想カメラもキャリブレーションの形で書く
+    (a.out_dir / "calibration.json").write_text(json.dumps({"camera": cam.to_dict()}), encoding="utf-8")
     offset = pre_s - rally.t_start
     write_shots(a.out_dir / SHOTS_FILE, rally.to_shots(offset, phys=phys))
     write_rallies(a.out_dir / RALLIES_FILE, [rally.to_rally(offset)])

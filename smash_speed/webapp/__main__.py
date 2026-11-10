@@ -2,13 +2,16 @@
 
 - ``--remote``：離れた端末（Tailscale でつないだスマホ・PC）からも使えるようにする（合言葉が必要）
 - ``--set-passphrase``：その合言葉を決める（変える）
-- ``--port=8765`` ・ ``--no-browser``
+- ``--port 8765`` ・ ``--no-browser``
+
+知らない引数（``--help`` も）では起動しない（以前は読み飛ばして既定のポートで起動していた）。
 """
 
 import sys
 import traceback
 
 from smash_speed.config import PROJECT_ROOT
+from smash_speed.webapp import parse_args
 
 
 def _set_passphrase() -> None:
@@ -30,15 +33,15 @@ def _set_passphrase() -> None:
         return
 
 
-if "--set-passphrase" in sys.argv:
+args = parse_args()
+if args.set_passphrase:
     _set_passphrase()
     sys.exit(0)
 
 try:
     from smash_speed.webapp.server import DEFAULT_PORT, main
 
-    port = int(next((a.split("=")[1] for a in sys.argv if a.startswith("--port=")), DEFAULT_PORT))
-    main(open_browser="--no-browser" not in sys.argv, port=port, remote="--remote" in sys.argv)
+    main(open_browser=not args.no_browser, port=args.port or DEFAULT_PORT, remote=args.remote)
 except Exception:  # noqa: BLE001  pythonw ではエラーが見えないので必ず残す
     log = PROJECT_ROOT / "outputs" / "gui_error.log"
     log.parent.mkdir(parents=True, exist_ok=True)

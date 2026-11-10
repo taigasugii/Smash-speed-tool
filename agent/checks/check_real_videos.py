@@ -12,7 +12,7 @@
 （30 fps では打った時刻の誤差だけで ±20〜110 km/h ある）ので、参考として出すだけで失敗にはしない。
 
 解析し直しは GUI の「詳しく解析する」（``batch.analyze_selected``）と同じ手順で、動画は ``.agent/config.json`` の
-``videos_dir`` か、基準を作ったときの場所から探す。動画がない PC では「飛ばした」として通す。
+``videos_dir`` から名前で探す（基準には動画の場所を残さない）。動画がない PC では「飛ばした」として通す。
 
 使い方::
 
@@ -69,9 +69,13 @@ def make_baseline(outputs_dir: Path) -> dict[str, Any]:
                 "kmh": float(r["speed_initial_kmh"]),
                 "ranking_kmh": float(r["speed_initial_kmh"]),     # ranking.csv の値（作った時点のコードの結果。参考）
             })
-        videos.append({"name": stem, "video": Path(info["video"]).name, "video_path": info["video"],
+        # 動画の場所（人のフォルダの名前が入る）は基準に残さない。動画は ``videos_dir`` から名前で探す
+        calibration = json.loads(calib.read_text(encoding="utf-8"))
+        if isinstance(calibration.get("meta"), dict) and calibration["meta"].get("video"):
+            calibration["meta"]["video"] = Path(calibration["meta"]["video"]).name
+        videos.append({"name": stem, "video": Path(info["video"]).name,
                        "capture_fps": info.get("capture_fps"), "audio": info.get("audio"),
-                       "calibration": json.loads(calib.read_text(encoding="utf-8")), "candidates": cands})
+                       "calibration": calibration, "candidates": cands})
     return {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "source": str(outputs_dir), "tolerance": TOLERANCE,
             "videos": videos}
 
@@ -80,7 +84,9 @@ def make_baseline(outputs_dir: Path) -> dict[str, Any]:
 # 解析し直す
 # =============================================================================
 def find_video(entry: dict[str, Any], videos_dir: str | None) -> Path | None:
-    for p in ([Path(videos_dir) / entry["video"]] if videos_dir else []) + [Path(entry["video_path"])]:
+    # ``video_path`` は古い基準にだけある（今の基準には動画の場所を入れない）
+    old = [Path(entry["video_path"])] if entry.get("video_path") else []
+    for p in ([Path(videos_dir) / entry["video"]] if videos_dir else []) + old:
         if p.exists():
             return p
     return None

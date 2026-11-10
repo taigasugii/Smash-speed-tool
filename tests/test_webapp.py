@@ -102,6 +102,30 @@ def test_labels_roundtrip_and_file_guard(client, session, tmp_path):
     assert client.get("/file", query_string={"path": "C:/Windows/win.ini"}).status_code == 404
 
 
+def test_file_guard_refuses_siblings_and_passphrase(client, session, tmp_path, monkeypatch):
+    """/file は出力の場所とプロジェクトの中だけ。名前が似た隣のフォルダと、合言葉のファイルは返さない。"""
+    from smash_speed.webapp import server
+
+    root = tmp_path / "proj"
+    out = root / "outputs"
+    out.mkdir(parents=True)
+    (out / "a.csv").write_text("x", encoding="utf-8")
+    (out / "remote_access.json").write_text("{}", encoding="utf-8")
+    sibling = tmp_path / "proj-agent"            # 文字の並びでは proj で始まるが、中ではない
+    sibling.mkdir()
+    (sibling / "b.csv").write_text("x", encoding="utf-8")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(server, "PROJECT_ROOT", root)
+    server.S.state["out_root"] = str(out)
+    get = lambda p: client.get("/file", query_string={"path": str(p)}).status_code  # noqa: E731
+    assert get(out / "a.csv") == 200
+    assert get(sibling / "b.csv") == 404
+    assert get(out / "remote_access.json") == 404
+    assert get(out / ".." / "outputs" / "REMOTE_ACCESS.JSON") == 404
+    assert get(root / ".git" / "config") == 404
+
+
 def _wait(client, tid, limit=600):
     t0 = time.time()
     while time.time() - t0 < limit:
@@ -377,3 +401,37 @@ def test_report_and_history_pages(client, tmp_path):
     client.post("/api/state", json={"out_root": str(tmp_path / "new_out")})
     h = client.post("/api/history").get_json()
     assert h["ok"] and h["n_days"] == 0
+
+
+def test_api_failures_come_back_as_json(client, tmp_path, monkeypatch):
+    """API の中の思わぬ失敗は、HTML の 500 ではなく ``ok: false`` の JSON で返る（画面が理由を出せる）。"""
+    from smash_speed.webapp import server
+
+    def boom():
+        raise RuntimeError("こわれた")
+
+    monkeypatch.setattr(server, "busy", boom)
+    r = client.get("/api/ping")
+    assert r.status_code == 500 and r.get_json() == {"ok": False, "error": "思わぬ失敗がありました（RuntimeError: こわれた）"}
+    assert client.get("/api/no_such").status_code == 404  # ふつうの 404 はそのまま
+
+
+def test_shot_label_reports_a_locked_file(client, tmp_path, monkeypatch):
+    """ラベルのファイルが書き換えられない（Excel で開いている）ときは、理由を返す。"""
+    from smash_speed import shot_labels
+    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shots import SHOTS_FILE, Shot, write_shots
+    from smash_speed.webapp import server
+
+    d = tmp_path / "v_shots"
+    d.mkdir()
+    write_shots(d / SHOTS_FILE, [Shot(t_hit_s=1.0, side="h", shot_type="smash")])
+    (d / SHOT_LIST_FILE).write_text(json.dumps({"video": "v.mp4"}), encoding="utf-8")
+    server.S.state.update(out_root=str(tmp_path), shots_dir=str(d))
+
+    def locked(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(shot_labels, "write_labels", locked)
+    r = client.post("/api/shot_label", json={"i": 0, "label": "clear"})
+    assert r.status_code == 400 and "閉じてください" in r.get_json()["error"]

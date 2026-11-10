@@ -31,9 +31,11 @@ from smash_speed.court import court_segments
 from smash_speed.geometry import floor_point
 from smash_speed.video_io import VideoMeta, probe, seek_read
 from smash_speed.webapp import agent, form_api, label_api
+from smash_speed.webapp.remote import CONFIG_FILE as _REMOTE_CONFIG
 from smash_speed.webapp.remote import REMOTE
 
 APP_ID = "smash-speed-web"
+REMOTE_CONFIG_NAME = _REMOTE_CONFIG.name.lower()   # 合言葉のファイルの名前（/file では返さない）
 STATIC = Path(__file__).parent / "static"
 STATE_FILE = PROJECT_ROOT / "outputs" / "web_state.json"
 DEFAULT_PORT = 8765
@@ -163,6 +165,19 @@ def body() -> dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
+@app.errorhandler(Exception)
+def _unexpected(e: Exception):
+    """思わぬ失敗も、API では画面が読める形（JSON）で返す（HTML の 500 だと、画面は何も出さずに止まる）。"""
+    from werkzeug.exceptions import HTTPException
+
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("%s で失敗しました", request.path)
+    if request.path.startswith("/api/"):
+        return err(f"思わぬ失敗がありました（{type(e).__name__}: {e}）", 500)
+    return "Internal Server Error", 500
+
+
 def video_args() -> list[str]:
     a = ["--video", S.state["video"]]
     if S.state.get("capture_fps"):
@@ -233,7 +248,10 @@ def file():
     """出力フォルダ・プロジェクトの中のファイルだけを返す（画像・動画・CSV）。"""
     p = Path(request.args.get("path", "")).resolve()
     roots = [out_root().resolve(), PROJECT_ROOT.resolve()]
-    if not any(str(p).startswith(str(r)) for r in roots) or not p.is_file():
+    # 文字の並びでなくフォルダの包含で比べる（隣の smash-speed-agent などは smash-speed の中ではない）
+    if not any(p.is_relative_to(r) for r in roots) or not p.is_file():
+        abort(404)
+    if p.name.lower() == REMOTE_CONFIG_NAME or ".git" in p.parts:   # 合言葉のファイルと Git の中身は返さない
         abort(404)
     return send_file(p, conditional=True)
 
@@ -1008,6 +1026,8 @@ def shot_label():
         labels = set_label(out_root() / LABELS_FILE, video, shots[k], label)
     except ValueError as e:
         return err(str(e))
+    except OSError as e:  # Windows では、Excel などで開いているファイルは書き換えられない
+        return err(f"{LABELS_FILE} に保存できませんでした。Excel などで開いていたら閉じてください（{e}）")
     return ok(id=k, truth=label, label_stats=_label_stats(labels, video))
 
 
@@ -1235,6 +1255,7 @@ def main(open_browser: bool = True, port: int = DEFAULT_PORT, remote: bool = Fal
 
 
 if __name__ == "__main__":
-    main(open_browser="--no-browser" not in sys.argv,
-         port=int(next((a.split("=")[1] for a in sys.argv if a.startswith("--port=")), DEFAULT_PORT)),
-         remote="--remote" in sys.argv)
+    from smash_speed.webapp import parse_args
+
+    _a = parse_args()
+    main(open_browser=not _a.no_browser, port=_a.port or DEFAULT_PORT, remote=_a.remote)

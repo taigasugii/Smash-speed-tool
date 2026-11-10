@@ -78,3 +78,17 @@ def test_find_video_prefers_videos_dir(chk, tmp_path):
     entry = {"video": "CLIP.MOV", "video_path": str(tmp_path / "old" / "CLIP.MOV")}
     assert chk.find_video(entry, str(tmp_path / "v")) == tmp_path / "v" / "CLIP.MOV"
     assert chk.find_video(entry, str(tmp_path / "none")) is None
+    # 今の基準には動画の場所がない（名前だけ）。videos_dir がなければ見つからない
+    assert chk.find_video({"video": "CLIP.MOV"}, str(tmp_path / "v")) == tmp_path / "v" / "CLIP.MOV"
+    assert chk.find_video({"video": "CLIP.MOV"}, None) is None
+
+
+def test_baseline_keeps_no_folder_names(chk, tmp_path):
+    """基準（公開のリポジトリに入る）には、動画の場所（人のフォルダの名前）を残さない。"""
+    made = chk.make_baseline(_fake_outputs(tmp_path))
+    assert all("video_path" not in v and v["video"] == Path(v["video"]).name for v in made["videos"])
+    committed = json.loads((ROOT / "agent" / "checks" / "real_videos_baseline.json").read_text(encoding="utf-8"))
+    for v in committed["videos"]:
+        assert "video_path" not in v and v["video"] == Path(v["video"]).name
+        video = (v["calibration"].get("meta") or {}).get("video")
+        assert video is None or video == Path(video).name

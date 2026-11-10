@@ -204,6 +204,12 @@ def test_api_impacts_onsets_and_swings(client, videos):
     assert r["ok"] and r["n"] == 2 and [s["source"] for s in r["swings"]] == ["打った音", "打った音"]
     assert [s["t"] for s in r["swings"]] == pytest.approx(sorted(swings), abs=0.01)
     assert [p["frame"] for p in r["swings"][0]["plan"]][4:7] == [95, 96, 97]
+    # 動画の始まりすぐの音：カメラまでの遅れを引いても 0 秒より前にしない
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("smash_speed.form.video_onsets", lambda *a, **k: [(0.005, 1e9)])
+        early = client.post("/api/poselab/onsets", json={"video": "clear_01.mp4"}).get_json()
+    assert [s["t"] for s in early["swings"]] == [0.0]
+    client.post("/api/poselab/onsets", json={"video": "clear_01.mp4"})  # 元の音に戻す
     r = client.post("/api/poselab/impacts", json={"video": "clear_01.mp4", "frame": 97}).get_json()
     assert r["ok"] and r["impacts"] == [{"video": "clear_01.mp4", "frame": 97, "t_s": pytest.approx(97 / 60, abs=1e-4)}]
     # 手で付けた打点が、近くの音より先に来る

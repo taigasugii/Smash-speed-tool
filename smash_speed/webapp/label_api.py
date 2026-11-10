@@ -249,7 +249,8 @@ def install(app: Flask, out_root: Callable[[], Path], state: Callable[[], dict[s
 
         opts = FormOptions()
         on = video_onsets(p, m.time_scale) if m.has_audio else []
-        _ONSETS[p.name] = [t - SOUND_DELAY_S for t in _merge_close([t for t, s in on if s >= opts.audio_min_strength],
+        # 動画の始まりすぐの音は、遅れを引くと 0 秒より前になるので 0 で止める（候補に「-0.01 s」と出ていた）
+        _ONSETS[p.name] = [max(0.0, t - SOUND_DELAY_S) for t in _merge_close([t for t, s in on if s >= opts.audio_min_strength],
                                                                      opts.min_gap_s)]
         return jsonify(ok=True, n=len(_ONSETS[p.name]), has_audio=m.has_audio,
                        swings=swings(out_root(), p.name, np.asarray(m.timestamps, float)))

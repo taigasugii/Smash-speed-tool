@@ -53,6 +53,26 @@ def test_tailnet_device_must_log_in(client):
     assert r.status_code == 200 and r.get_json()["remote"] is True
 
 
+def test_every_route_is_behind_the_guard(client):
+    """あとから足した画面の API（ショットの一覧・フォーム・関節・レポートなど）も含め、すべての道が入口の制限を通る。"""
+    public = set(remote.PUBLIC_PATHS)
+    n = 0
+    for rule in app.url_map.iter_rules():
+        url = rule.rule.replace("<path:name>", "core.js").replace("<kind>", "shots").replace("<tid>", "x")
+        assert "<" not in url, f"テストが知らない引数つきの道: {rule.rule}"
+        if url in public:
+            continue
+        for method in sorted(rule.methods - {"HEAD", "OPTIONS"}):
+            outside = client.open(url, method=method, environ_base={"REMOTE_ADDR": "192.168.1.20"})
+            assert outside.status_code == 403, (method, url)
+            tail = client.open(url, method=method, environ_base={"REMOTE_ADDR": TAILNET_IP})
+            assert tail.status_code in (401, 302), (method, url, tail.status_code)
+            if tail.status_code == 302:
+                assert tail.headers["Location"].endswith("/login"), (method, url)
+            n += 1
+    assert n > 60   # 道が読めていること（今は 70 ほど）
+
+
 def test_repeated_wrong_passphrase_locks_out(client):
     for _ in range(remote.MAX_FAILS):
         client.post("/login", data={"passphrase": "nope-nope-nope"}, environ_base={"REMOTE_ADDR": TAILNET_IP})
@@ -101,3 +121,16 @@ def test_tailnet_address_ranges():
     assert not remote.is_tailnet("100.128.0.1") and not remote.is_tailnet("192.168.0.2")
     assert remote.is_tailnet("fd7a:115c:a1e0::1") and remote.is_tailnet("::ffff:100.100.1.1")
     assert remote.is_local("127.0.0.1") and remote.is_local("::1") and not remote.is_local("100.100.1.1")
+
+
+def test_launch_arguments():
+    """起動の引数：``--port 8768`` と ``--port=8768`` のどちらも読み、知らない引数・``--help`` では起動しない。"""
+    from smash_speed.webapp import parse_args
+
+    a = parse_args(["--remote", "--no-browser", "--port", "8768"])
+    assert a.remote and a.no_browser and a.port == 8768 and not a.set_passphrase
+    assert parse_args(["--port=8766"]).port == 8766
+    assert parse_args([]).port is None and not parse_args([]).remote
+    for bad in (["--help"], ["--prot=1"], ["remote"]):
+        with pytest.raises(SystemExit):
+            parse_args(bad)
