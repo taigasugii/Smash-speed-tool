@@ -53,6 +53,26 @@ def test_tailnet_device_must_log_in(client):
     assert r.status_code == 200 and r.get_json()["remote"] is True
 
 
+def test_every_route_is_behind_the_guard(client):
+    """あとから足した画面の API（ショットの一覧・フォーム・関節・レポートなど）も含め、すべての道が入口の制限を通る。"""
+    public = set(remote.PUBLIC_PATHS)
+    n = 0
+    for rule in app.url_map.iter_rules():
+        url = rule.rule.replace("<path:name>", "core.js").replace("<kind>", "shots").replace("<tid>", "x")
+        assert "<" not in url, f"テストが知らない引数つきの道: {rule.rule}"
+        if url in public:
+            continue
+        for method in sorted(rule.methods - {"HEAD", "OPTIONS"}):
+            outside = client.open(url, method=method, environ_base={"REMOTE_ADDR": "192.168.1.20"})
+            assert outside.status_code == 403, (method, url)
+            tail = client.open(url, method=method, environ_base={"REMOTE_ADDR": TAILNET_IP})
+            assert tail.status_code in (401, 302), (method, url, tail.status_code)
+            if tail.status_code == 302:
+                assert tail.headers["Location"].endswith("/login"), (method, url)
+            n += 1
+    assert n > 60   # 道が読めていること（今は 70 ほど）
+
+
 def test_repeated_wrong_passphrase_locks_out(client):
     for _ in range(remote.MAX_FAILS):
         client.post("/login", data={"passphrase": "nope-nope-nope"}, environ_base={"REMOTE_ADDR": TAILNET_IP})
