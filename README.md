@@ -295,6 +295,51 @@ smash-speed stereo --videos camA.mp4 camB.mp4 --calibs calibA.json calibB.json -
 
 時刻合わせは打球音の相互相関（`--offset` で手動指定・微調整も可）。平面拘束を使わず 6 自由度で当てはめる。
 
+### 4b. 2 台のスマホで「正しい初速」を作る（1 台の解析の答え合わせ）
+
+同じラリーを 2 台のスマホで撮ると、スピードガンがなくても、すべてのショットの 3 次元の軌道と初速（± 不確かさ）が出る。
+1 台のカメラの解析は奥行きが決まりにくいので、この値を「正解」にして 1 台の解析の誤差を測る。
+撮り方は [docs/stereo_shooting_guide.md](docs/stereo_shooting_guide.md)（スマホの置き方の図・撮る前後に確かめること）。
+
+```powershell
+# 1. 2 本の動画をそれぞれコートに合わせる（今までと同じ。GUI の手順 2 でもよい）
+smash-speed calibrate --video camA.mov --out calibA.json
+smash-speed calibrate --video camB.mov --out calibB.json
+# 2. 2 台から正しい初速を出す（時刻合わせ → 検出 → 当てはめ）
+smash-speed stereo-truth --videos camA.mov camB.mov --calibs calibA.json calibB.json --out outputs/truth01
+# 3. どちらかの動画を 1 台で解析して、答え合わせ
+smash-speed shots --video camA.mov --calib calibA.json --out outputs/single01
+smash-speed stereo-compare --truth outputs/truth01 --shots outputs/single01 --camera 1
+```
+
+`stereo-truth` の流れ（`smash_speed/stereo_sync.py`・`stereo_truth.py`）：
+
+1. **時刻合わせ**：音（打球音・手をたたく音）の相互相関で大まかに合わせ（録画を始めた時刻が何秒違ってもよい）、
+   映像で細かく合わせる。ずれが正しければ同じ時刻の 2 台の視線はシャトルで交わるので、fps の高い方の検出を時刻で補間し、
+   2 本の視線のすき間がいちばん小さくなるずれを探す。フレームの時刻そのものを合わせるので、スマホごとの「音と映像のずれ」に
+   左右されない。区間ごとに出したずれから、時計の進み方の違い（ppm）とばらつきも出す。fps が違っても（30 と 240 など）・
+   可変フレームレートでも、フレームごとの時刻を使うので同じに動く。音がなければ `--offset`（±0.05 秒ほど合っていればよい）。
+2. **当てはめ**：打球から次の打球までの飛行ごとに、空気抵抗つきの運動方程式を連続した時間の中で 2 台の画像の位置へ一緒に
+   当てはめる（6 自由度、Huber 損失。2 台のコマは同じ瞬間ではないので、コマの組を三角測量しない）。床に着いた後のコマと、
+   ずれの大きいコマ（別の物の検出）は外して当て直す。前後で位置も速度もつながっている「打球」は打球ではなかったとしてつなぐ。
+3. **終端速度**：空気抵抗の強さ（終端速度）はシャトルごとに違い、高いロブ・クリアの初速に大きく効く。長い飛行から 1 本ずつ
+   出した値の中央値を、そのセッションのすべてのショットに使う（`--terminal-velocity fixed` で設定の 6.7 m/s のまま）。
+4. **打った時刻**：前のショットの軌道と次のショットの軌道が 3 次元で交わる時刻（速いショットほど鋭く決まる）。
+   ラリーの最初のショットは打球音（打点から 2 台への音の遅れを引き、交わる時刻との差から出したスマホごとの音と映像のずれも引く）。
+5. **書き出し**：`stereo_truth.json`（ショットごとの `kmh`・`sigma_kmh` と内訳・打点・打ち出し角・軌道の初期値 `state`。
+   `agent/checks/real_videos_truth.json` と同じ考え方。時刻合わせの確かめ `sync` も入る）、`shots.csv`（今までと同じ形。
+   `source` が `stereo`）、`trajectories.csv`（軌道の点）。片方のカメラにしか写っていないショット・画像とのずれが大きいショットは
+   `ok` が false で、答え合わせには使わない。
+
+結果の見方：`sync.gap_cm`（合わせた後の 2 台の視線のすき間。5 cm 以下がふつうで、15 cm を超えたらコート合わせを見直す）、
+`sync.audio.audio_minus_video_ms`（音から出したずれと映像から出したずれの差。スマホの音と映像のずれの目安）、
+ショットごとの `rms_px`（画像とのずれ）・`n_points`（使ったコマ）・`sigma_parts_kmh`（当てはめ・打った時刻・終端速度・時刻合わせ）。
+不確かさにキャリブレーションの誤差は入っていない。
+
+`stereo-compare` は、1 台の解析の `shots.csv` を、打った時刻の差 0.3 秒以内で近い順に 1 対 1 で正解と組にして、
+初速の誤差（%）・打った時刻の差・同じ時刻の速さで比べた誤差・打点のずれを `stereo_compare.csv` に書く
+（`--camera 2` なら 2 台目の動画の時刻に直して比べる）。
+
 ### 5. 正解ラベル・学習データ・TrackNetV3
 
 ```powershell
@@ -1030,7 +1075,10 @@ smash_speed/
   geometry.py           飛行平面・三角測量
   physics.py            運動方程式・フィッティング・信頼区間・速度指標
   pipeline.py           analyze の一連の処理
-  stereo.py             2台カメラ
+  stereo.py             2台カメラ（スマッシュ 1 本）
+  stereo_sync.py        2 台の時刻合わせ（音と映像）と確かめ
+  stereo_truth.py       2 台からの、ラリーのすべてのショットの正しい初速と 3 次元の軌道・1 台の解析との答え合わせ
+  stereo_study.py       2 台のカメラの合成データと、置き方・fps・時刻合わせの誤差の調べ
   annotate/             アノテーションツール
   train/                疑似低 fps・学習データ・ファインチューニング・検出の評価
   validate.py           精度検証（合成・実データ）、Bland–Altman、補正
