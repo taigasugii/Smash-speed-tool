@@ -39,6 +39,19 @@ ShuttleSet / CoachAI（ショットの種類の分類体系と、ラリー単位
   打った時刻の速さと不確かさ（`agent/truth/true_speeds.py` → `agent/checks/real_videos_truth.json`）を、
   `check_real_videos.py` が参考として比べる（失敗にはしない）。IMG_5096（240 fps）3 本・IMG_3391 3 本・IMG_4397 5 本。
   IMG_4521 はシャトルが見えにくく入れていない。作り方は `agent/truth/README.md`。
+- [~] **A5 2 台のスマホで「正しい初速」を作る**（人からの依頼。`smash_speed/stereo_sync.py`・`stereo_truth.py`・`stereo_study.py`、
+  コマンド `stereo-truth`・`stereo-compare`・`stereo-study`、撮り方は `docs/stereo_shooting_guide.md`）
+  A4 の正しい初速は 11 本・±40〜145 km/h（30 fps）しかない。同じラリーを 2 台で撮れば、すべてのショットの 3 次元の軌道と初速が出る。
+  - [x] **A5a 道具と合成データでの確かめ**：音と映像での時刻合わせ、2 台への一緒の当てはめ、3 次元の点からの打球の見つけ方、
+    終端速度をセッションの長い飛行から決める、`stereo_truth.json`、1 台の解析との答え合わせ。合成（後ろの両角・60 fps）で初速の誤差は
+    平均 0.46%、打球を自動で見つけても 0.45%（JOURNAL の 2026-11-12）。
+  - [ ] **A5b 最初の 2 台の撮影で動かす**（`QUESTIONS.md` の「2 台のスマホで撮った動画がほしい」待ち）：動画が `videos_dir` に入ったら、
+    2 本をコートに合わせて `stereo-truth` を動かし、(1) 2 台の視線のすき間・音と映像のずれ・初速が出た割合、(2) 画像とのずれが大きい
+    ショットの原因（検出・打球の見落とし・キャリブレーション）、(3) `stereo-compare` での 1 台の解析（`shots`）の誤差を JOURNAL に残す。
+    実動画の検出（人に隠れる・背景）が合成といちばん違う所なので、初速が出た割合が低ければ、学習したモデルの検出（`--tracknet`）と比べる。
+  - [ ] **A5c 品質チェックに入れる**：A5b の `stereo_truth.json` を `agent/checks/` に置き（動画は置かない）、`check_real_videos.py` の
+    正しい初速（A4）と同じように、ショットの一覧の初速との差を参考として出す。スマホの読み出しの時間（ローリングシャッター。
+    合成では 10 ms で初速が 1% 低く出る）を、同じ場面を撮った 2 台の食い違いから測れるかも調べる。
 
 ## B. すべてのショットの速度と種類（最優先）
 
