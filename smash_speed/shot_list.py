@@ -4,7 +4,8 @@
    学習したモデル（``tracknet``）か、外の検出 CSV（``detections``）を代わりに使うこともできる（F1b）。
 2. 打球音（音声があれば）と軌道の向きの変化から、すべての打球の時刻と打った側を出す（``hits.find_hits``）。
 3. 打球の間隔で組に分け、組ごとに軌道と初速を当てはめる（``shot_fit.fit_shots``）。ほかの組の検出が
-   混ざらないよう、組の前後で検出を切り分ける。
+   混ざらないよう、組の前後で検出を切り分ける。``joint_fit=True`` なら、その後に組の中のショットをつないで
+   まとめて当てはめ直し、長いショットからシャトルの終端速度も求める（``rally_fit.fit_rallies``）。
 4. 打球の間隔・シャトルの着地・シャトルが飛んでいるかから、ラリーに区切る（``rallies.split_rallies``）。
 5. 軌道から種類を決める（``shot_types.classify_shots``。ラリーの最初のショットはサーブ）。
 6. 選手の位置も出すとき（``players=True``）は、選手の動きで短いラリーを確かめ、ラリーの間に拾って返した・
@@ -50,7 +51,9 @@ from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
-from smash_speed.shot_fit import fit_shots, pool_active, shot_fits_to_shots, worker_pool
+from smash_speed.rally_fit import JointOptions, fit_rallies
+from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, shot_fits_to_shots,
+                                  worker_pool)
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
                                write_shots)
@@ -87,6 +90,9 @@ class ShotListOptions:
     tracknet: Path | None = None      # 学習したモデル（``tracknet_train`` の model.pt）。あればこれで全コマを検出し
                                       # （``tracknet_train.detect_video``。torch は ``.venv-train``）、自前の検出の代わりに使う
     tracknet_threshold: float = TRACKNET_THRESHOLD
+    joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
+                                      # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
+    joint_options: JointOptions | None = None
 
 
 # =============================================================================
@@ -341,7 +347,8 @@ def rally_groups(hits: list[Hit], gap_s: float) -> list[list[int]]:
 def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: PhysicsParams, cfg: dict[str, Any],
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
-                 players: pd.DataFrame | None = None, rally_threads: int = 4) -> list[Shot]:
+                 players: pd.DataFrame | None = None, rally_threads: int = 4, joint: JointOptions | None = None,
+                 joint_info: dict[str, Any] | None = None) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -355,21 +362,28 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         workers: 当てはめを並べて動かすプロセスの数（``fit_shots``）
         players: 選手の位置（``players.csv``）。あれば打球ごとの打つ人の足元（``hitter_at``）を打点の手がかりにする
         rally_threads: 同時に当てはめを進めるラリーの数（``workers`` が 2 以上のとき。結果は 1 つずつと同じ）
+        joint: 与えると、ショットごとの当てはめの後に、打球の組ごとにショットをつないでまとめて当てはめ直す
+            （``rally_fit.fit_rallies``。終端速度は動画全体で 1 つ）
+        joint_info: 辞書を渡すと、まとめた当てはめの記録（つないだショットの数・終端速度・かかった時間）を入れる
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
     vis_t = det.timestamp.to_numpy(float)
     groups = rally_groups(hits, rally_gap_s)
     shots: list[Shot] = []
 
-    def one(g: int) -> list[Shot]:
-        return _analyze_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
-                              max_rms_frac, workers, players)
+    def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
+        return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
+                          workers, players)
+
+    def to_shots(g: int, fits: list[ShotFit]) -> list[Shot]:
+        return _rally_shots([hits[i] for i in groups[g]], fits, camera, phys, max_kmh, max_rms_frac)
 
     # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）。
     # ラリーどうしは関係しないので、``rally_threads`` 個のラリーを同時に進めて同じプロセスの組に仕事を渡す
     # （1 つのラリーの中では段階ごとに全部の当てはめの終わりを待つので、その間ほかのプロセスが空いていた。F3b）
     with worker_pool(workers):
         n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
+        fitted: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
         by_group: dict[int, list[Shot]] = {}
         if n_threads > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -377,22 +391,48 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
             with ThreadPoolExecutor(n_threads) as ex:
                 futs = {ex.submit(one, g): g for g in range(len(groups))}
                 for fut in as_completed(futs):
-                    by_group[futs[fut]] = fut.result()
-                    _rally_progress(progress, futs[fut], len(groups), by_group[futs[fut]], len(by_group))
+                    g = futs[fut]
+                    fitted[g] = fut.result()
+                    by_group[g] = to_shots(g, fitted[g][0])
+                    _rally_progress(progress, g, len(groups), by_group[g], len(by_group))
         else:
             for g in range(len(groups)):
-                by_group[g] = one(g)
+                fitted[g] = one(g)
+                by_group[g] = to_shots(g, fitted[g][0])
                 _rally_progress(progress, g, len(groups), by_group[g], g + 1)
+        if joint is not None and groups:
+            t0 = time.time()
+            n_before = sum(s.speed_kmh is not None for g in by_group for s in by_group[g])
+            res, vt = fit_rallies([fitted[g][1] for g in range(len(groups))], phys, opts, joint,
+                                  mapper=lambda fn, args: _parallel_map(fn, args, workers))
+            for g, r in enumerate(res):
+                by_group[g] = to_shots(g, r.fits)
+            rec = {"n_joint": int(sum(sum(r.joint) for r in res)),
+                   "n_links": int(sum(sum(r.links) for r in res)),
+                   "n_cut": int(sum(len(r.cut) for r in res)), "terminal_velocity": vt,
+                   "n_speed_before": n_before,
+                   "n_speed": sum(s.speed_kmh is not None for g in by_group for s in by_group[g]),
+                   "elapsed_s": round(time.time() - t0, 1)}
+            if joint_info is not None:
+                joint_info.update(rec)
+            progress(f"[進行] ラリーの中のショットをつないで当てはめ直しました：{rec['n_joint']} 本"
+                     f"（{rec['elapsed_s']:.0f} 秒）")
+            if vt["value_mps"] is not None:
+                progress(f"[進行] シャトルの終端速度：{vt['value_mps']:.2f} ± {vt['sigma_mps']:.2f} m/s"
+                         + ("（この値で計算しました）" if vt["used"]
+                            else f"（{vt['reason']}ので、設定の {vt['default_mps']} m/s のまま）"))
     for g in range(len(groups)):
         shots += by_group[g]
     split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
 
 
-def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
-                   camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
-                   max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None) -> list[Shot]:
-    """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）の ``Shot`` の列。"""
+def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
+               camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
+               max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None
+               ) -> tuple[list[ShotFit], dict[str, Any]]:
+    """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）のショットごとの当てはめと、まとめて当てはめ直すときの
+    引数（``shot_fit.joint_job``）。"""
     hs = [hits[i] for i in groups[g]]
     lo = hs[0].t - 0.5
     hi = hs[-1].t + tail_s
@@ -403,10 +443,17 @@ def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], 
     if players is not None and not players.empty:
         feet = [None if e is None else np.array([e.x, e.y])
                 for e in (hitter_at(players, h.t, h.side) for h in hs)]
+    sound = cfg.get("events", {}).get("speed_of_sound_mps", 343.0)
     fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
                      max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
-                     speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0),
-                     hitter_xy=feet)
+                     speed_of_sound_mps=sound, hitter_xy=feet)
+    return fits, joint_job(fits, part, camera, feet, [h.t_audio for h in hs], speed_of_sound_mps=sound,
+                           max_rms_px=max_rms_frac * camera.width)
+
+
+def _rally_shots(hs: list[Hit], fits: list[ShotFit], camera: Camera, phys: PhysicsParams, max_kmh: float,
+                 max_rms_frac: float) -> list[Shot]:
+    """1 ラリー分の当てはめ ``fits``（打球 ``hs`` と同じ順）を ``Shot`` の列にする。"""
     rally_shots = shot_fits_to_shots(fits, phys, source="shot_list")
     for s, h, sf in zip(rally_shots, hs, fits):
         # ありえない速さ・画像の上で軌道が検出と合わない（別の物の検出が混ざった軌道など）ものは、
@@ -516,8 +563,10 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     progress(f"[進行] 打球 {len(hits)} 本")
     lap("hits")
     workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
+    joint_info: dict[str, Any] = {}
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
-                         players=players if o.hitter_prior else None)
+                         players=players if o.hitter_prior else None,
+                         joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info)
     lap("fit")
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
@@ -539,6 +588,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "n_hits": len(hits), "n_rallies": len(rallies),
         "hit_methods": pd.Series([h.method for h in hits], dtype=object).value_counts().to_dict(),
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),
+        "joint_fit": joint_info if o.joint_fit else None,
         "meta": run_metadata(),
     }
     if players_info is not None:
@@ -628,6 +678,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
     ap.add_argument("--tracknet", type=Path, default=None, help="学習したモデル（model.pt）で全コマを検出して使う")
     ap.add_argument("--tracknet-threshold", type=float, default=TRACKNET_THRESHOLD)
+    ap.add_argument("--joint-fit", action="store_true",
+                    help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
+    ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
@@ -635,7 +688,9 @@ def main(argv: list[str] | None = None) -> None:
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
                                          players=a.players, hitter_prior=not a.no_hitter_prior,
                                          hit_players=not a.no_hit_players, detections=a.detections,
-                                         tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold), cfg)
+                                         tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold,
+                                         joint_fit=a.joint_fit,
+                                         joint_options=JointOptions(estimate_vt=not a.no_estimate_vt)), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 
