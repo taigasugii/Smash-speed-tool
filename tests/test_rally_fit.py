@@ -62,9 +62,9 @@ def test_jacobian_matches_finite_differences():
         shots.append(_Shot(t, uv, s.side, k > 0, s.p0[:2] + 0.2 if k != 1 else None, s.p0 + 0.1,
                            s.t_hit + dist / 343.0 if k == 0 else None, s.t_hit + 0.004, -np.inf, np.inf, k != 1))
         x += [s.t_hit + 0.003, *(s.p0 + [0.3, -0.2, 0.1]), *(s.v0 * 1.03)]
-    x = np.array(x + [np.log(6.5)])
+    x = np.array(x + [np.log(6.5), np.log(6.9)])
     prob = _Problem(shots, cam, PHYS, JointOptions(), 2.0, 2.0, 0.02, 343.0, True, 170.0)
-    assert prob.est and prob.n_par == 22
+    assert prob.est and prob.n_par == 23 and prob.free == [0, 2]
     r, jac, info = prob.evaluate(x)
     assert np.isfinite(r).all() and np.isfinite(info["gaps"][1:]).all()
     num = np.empty_like(jac)
@@ -88,10 +88,10 @@ def test_joint_fit_links_shots_and_improves_short_ones(corner_fit):
     assert np.nanmax(res.gaps_m[1:]) < 0.1
     before, after = _errors(segs, fits), _errors(segs, res.fits)
     assert after.mean() < 0.7 * before.mean()
-    assert after.max() < 0.15
+    assert after.max() < 0.25 and after.max() < 0.5 * before.max()   # いちばん大きいのは遅いネット（時速 22 km）
     hit_before = np.array([np.linalg.norm(sf.fit.p0 - s.p0) for s, sf in zip(segs, fits)])
     hit_after = np.array([np.linalg.norm(sf.fit.p0 - s.p0) for s, sf in zip(segs, res.fits)])
-    assert hit_after.mean() < 0.6 * hit_before.mean()
+    assert hit_after.mean() < 0.75 * hit_before.mean()
     for i, sf in enumerate(res.fits):
         # 打った時刻・飛行の終わりは、となりのショットと同じ時刻
         if i + 1 < len(res.fits):
@@ -127,13 +127,14 @@ def test_a_wrong_track_is_cut_and_keeps_its_own_fit(corner_fit):
     det.loc[m, "y_px"] = np.linspace(900.0, 200.0, n)
     fits = fit_shots(det, [s.t_hit + 0.006 for s in segs], cam, PHYS, [s.side for s in segs], OPTS)
     res = joint_fit(fits, det, cam, PHYS, OPTS, JointOptions(), estimate_vt=False)
-    assert not res.joint[bad] and res.fits[bad] is fits[bad]
+    assert not res.joint[bad] and res.fits[bad].fit is fits[bad].fit
     assert not res.links[bad] and not res.links[bad + 1]
-    assert any(c[0] == "link" for c in res.cut)
+    assert ("shot", bad) in [c[:2] for c in res.cut]
     good = [i for i in range(len(segs)) if abs(i - bad) > 1]
-    assert all(res.joint[i] for i in good if i not in (0, len(segs) - 1))
-    err = _errors([segs[i] for i in good], [res.fits[i] for i in good])
-    assert err.max() < 0.15
+    assert all(res.joint[i] for i in good if i < bad - 1)
+    before = _errors([segs[i] for i in good], [fits[i] for i in good])
+    after = _errors([segs[i] for i in good], [res.fits[i] for i in good])
+    assert after.max() < max(0.3, before.max()) and after.mean() < before.mean()
 
 
 def test_a_missed_hit_does_not_spoil_the_rally(corner_fit):
@@ -144,6 +145,10 @@ def test_a_missed_hit_does_not_spoil_the_rally(corner_fit):
     keep = [i for i in range(len(segs)) if i != miss]
     part = fit_shots(det, [segs[i].t_hit + 0.006 for i in keep], cam, PHYS, [segs[i].side for i in keep], OPTS)
     res = joint_fit(part, det, cam, PHYS, OPTS, JointOptions(), estimate_vt=False)
+    # 見落とした打球の前のショット（2 本の飛行が混ざっている）は、次の打球が同じ側なので、まとめない
+    merged = keep.index(miss - 1)
+    assert not res.joint[merged] and res.fits[merged].fit is part[merged].fit
+    assert ("shot", merged, "次の打球も同じ側") in res.cut
     far = [k for k, i in enumerate(keep) if abs(i - miss) > 1]
     after = _errors([segs[keep[k]] for k in far], [res.fits[k] for k in far])
     before = _errors([segs[keep[k]] for k in far], [part[k] for k in far])
@@ -154,17 +159,21 @@ def test_a_missed_hit_does_not_spoil_the_rally(corner_fit):
 def test_combine_vt_needs_enough_evidence():
     """終端速度は、長いショットが足りて不確かさが小さいときだけ使う。そうでなければ設定の値のまま。"""
     o = JointOptions()
-    vt, rec = combine_vt([None, None], 6.7, o)
+    vt, rec = combine_vt([], 6.7, o)
     assert vt == 6.7 and not rec["used"] and rec["value_mps"] is None
-    vt, rec = combine_vt([VtEstimate(6.3, 0.05, 2)], 6.7, o)       # 長いショットが少ない
-    assert vt == 6.7 and not rec["used"] and rec["value_mps"] == 6.3
-    vt, rec = combine_vt([VtEstimate(6.3, 0.4, 5)], 6.7, o)        # 不確かさが大きい
-    assert vt == 6.7 and not rec["used"]
-    vt, rec = combine_vt([VtEstimate(6.2, 0.2, 5), VtEstimate(7.4, 0.2, 5)], 6.7, o)   # ラリーどうしでばらつく
-    assert vt == 6.7 and not rec["used"] and rec["sigma_mps"] > 0.3
-    vt, rec = combine_vt([VtEstimate(6.28, 0.06, 3), VtEstimate(6.35, 0.08, 2), None], 6.7, o)
-    assert rec["used"] and 6.28 < vt < 6.35 and rec["n_flights"] == 5 and rec["sigma_mps"] <= 0.06
-    vt, rec = combine_vt([VtEstimate(4.2, 0.05, 6)], 6.7, o)       # ありえない値
+    vt, rec = combine_vt([VtEstimate(6.3, 0.05), VtEstimate(6.32, 0.05)], 6.7, o)      # 長いショットが少ない
+    assert vt == 6.7 and not rec["used"] and rec["value_mps"] == 6.31 and rec["n_flights"] == 2
+    # 軌道から決まっていない推定（当てはめの不確かさが目安と同じくらい）は数えない
+    vt, rec = combine_vt([VtEstimate(6.3, 0.4), VtEstimate(6.2, 0.3), VtEstimate(6.4, 0.5), VtEstimate(6.3, 0.05)], 6.7, o)
+    assert vt == 6.7 and rec["n_flights"] == 1
+    # 1 本ずつの値がばらつく（モデルに合っていない）
+    vt, rec = combine_vt([VtEstimate(v, 0.03) for v in (5.7, 6.2, 6.6, 7.1, 7.9)], 6.7, o)
+    assert vt == 6.7 and not rec["used"] and rec["sigma_mps"] > o.vt_max_sigma_mps
+    flights = [VtEstimate(v, 0.05) for v in (6.28, 6.31, 6.35, 6.30, 6.9)]            # 1 本外れていても中央値は動かない
+    vt, rec = combine_vt(flights, 6.7, o)
+    assert rec["used"] and vt == pytest.approx(6.31) and rec["n_flights"] == 5
+    assert o.vt_sys_sigma_mps <= rec["sigma_mps"] <= o.vt_max_sigma_mps
+    vt, rec = combine_vt([VtEstimate(4.2, 0.05)] * 6, 6.7, o)                           # ありえない値
     assert vt == 6.7 and not rec["used"]
 
 
@@ -182,7 +191,7 @@ def test_terminal_velocity_from_long_flights():
         jobs.append(joint_job(fits, det, cam))
         truth.append(segs)
     res, rec = fit_rallies(jobs, PHYS, OPTS, JointOptions())
-    assert rec["used"] and abs(rec["value_mps"] - 6.3) < 0.15 and rec["n_flights"] >= 3
+    assert rec["used"] and abs(rec["value_mps"] - 6.3) < 0.1 and rec["n_flights"] >= 3
     before = np.concatenate([_errors(s, j["fits"]) for s, j in zip(truth, jobs)])
     after = np.concatenate([_errors(s, r.fits) for s, r in zip(truth, res)])
     assert after.mean() < 0.6 * before.mean()

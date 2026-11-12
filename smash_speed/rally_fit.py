@@ -33,8 +33,9 @@
 ばらつきから出すので、モデルに合わない動画（実動画の高いロブは画像の上で 10 px 以上ずれることがある）では
 大きくなる。不確かさが大きい・長いショットが少ないときは設定の値のままにする。
 
-軌道の積分は、ラリーの全ショットと、ヤコビアン用に速度・終端速度を少し動かしたものを、決まった刻みの
-RK4 でまとめて進める（``integrate``。``physics.simulate`` との差は 0.1 mm 以下）。
+軌道の積分は、つながったショットの組と、ヤコビアン用に速度・終端速度を少し動かしたものを、決まった刻みの
+RK4 でまとめて進める（``integrate``。``physics.simulate`` との差は 0.1 mm 以下）。つなぎ目を切ると組が分かれるので、
+変わった組だけを解き直す。
 """
 
 from __future__ import annotations
@@ -78,24 +79,32 @@ class JointOptions:
     track_sigma_s: float | None = None  # 軌道から決めた打った時刻の不確かさ [s]（None ならコマの間隔）
     order_sigma_s: float = 0.003      # 打った時刻が前後の観測の順を越えたときの罰の幅 [s]
     hit_z_m: tuple[float, float] = (0.0, 3.6)   # 打点の高さの範囲 [m]
-    obs_cap: int = 0                  # 0 より大きければ、1 本のショットの観測の重みの合計を、このコマ数の分までにする
-                                      # （長いショットのコマが多くても、モデルの合わなさは平均しても減らないため）
+    max_shot_rms_frac: float = 0.01   # ショットごとの当てはめのずれがこれ（画像の幅の割合）を超えたショットはまとめない
+                                      # （別の物の軌道。ショットの一覧が「軌道が検出と合わない」とする大きさと同じ）
+    min_obs: int = 5                  # これより少ないコマのショットはまとめない（つなぎ目だけで決まってしまう）
     max_rms_ratio: float = 1.5        # つないだ後の画像の上のずれが「ショットごとのずれ × これ + rms_slack_px」を
     rms_slack_px: float = 1.0         # 超えたショットは、つなぎ目を切る（最後まで超えていれば元の当てはめに戻す）
-    max_rounds: int = 4               # 切って解き直す回数の上限
+    max_rounds: int = 6               # 切って解き直す回数の上限
     n_splits: int = 2                 # 直した打った時刻で観測を分け直して解く回数
     max_nfev: int = 60                # 1 回の最適化の評価の回数の上限
     step_fast_s: float = 0.002        # 積分の刻み [s]（打ってから ``fast_s`` まで。速い間は空気抵抗が大きい）
     fast_s: float = 0.3
     step_slow_s: float = 0.008        # 積分の刻み [s]（その後）
-    max_flight_s: float = 4.5         # これより後の観測は使わない [s]
+    max_flight_s: float = 3.5         # 打ってからこれより後の観測は使わない [s]（床に落ちた後の検出）
     # --- 終端速度 ---
     estimate_vt: bool = True          # 長く飛んだショットから終端速度を一緒に求める
     long_flight_s: float = 0.6        # 長く飛んだショットとみなす飛行の時間 [s]
     long_min_obs: int = 12            # 同・見えたコマの数
+    vt_max_rms_frac: float = 0.002    # ショットごとの当てはめのずれがこれ（画像の幅の割合。と損失の切り替え点の 2 倍の
+                                      # 大きい方）を超えた長いショットは、終端速度を求めるのに使わない
+    vt_flight_sigma_mps: float = 0.2  # 当てはめからの不確かさがこれより大きい 1 本の推定（軌道から終端速度が決まって
+                                      # いない。低いカメラの山なりのショットなど）は数えない [m/s]
     vt_prior_sigma: float = 0.15      # 設定の値からの log(v_t) の不確かさ（弱い目安。±1 m/s）
     vt_min_flights: int = 3           # 動画全体で、長く飛んだショットがこれより少なければ設定の値のまま
+    vt_sys_sigma_mps: float = 0.1     # カメラ 1 台の終端速度の、ばらつきに出ない不確かさ [m/s]（コート合わせの高さ方向の
+                                      # 縮尺が 4% ずれると、どのショットの終端速度も同じ向きに 2% = 0.13 m/s ずれる）
     vt_max_sigma_mps: float = 0.15    # 動画全体の推定の不確かさがこれより大きければ設定の値のまま [m/s]
+    vt_refit_mps: float = 0.05        # 決めた終端速度が設定の値とこれ以上違えば、つなぎ目を見直して解き直す [m/s]
     vt_range_mps: tuple[float, float] = (5.0, 8.5)  # これを外れた推定は使わない（羽根・ナイロンのシャトルは 6〜7.5）
 
 
@@ -120,7 +129,7 @@ class JointResult:
         joint: ショットごとに、まとめた当てはめの結果を使ったか
         links: つなぎ目 k（ショット k − 1 → k。k = 0 は使わない）を使ったか
         gaps_m: つなぎ目のすき間 [m]（使わなかった所は NaN）
-        cut: 切ったつなぎ目・足元の記録（``(種類, ショットの番号, 理由)``）
+        cut: 切ったつなぎ目（link）・まとめなかったショット（shot）の記録（``(種類, ショットの番号, 理由)``）
         vt: 長いショット 1 本ずつの終端速度の推定（求めなかった・長いショットがなければ空）
         terminal_velocity: 最後の当てはめに使った終端速度 [m/s]
         n_solves: 最適化を解いた回数
@@ -435,8 +444,9 @@ def crossing_gap_px(prev: FitResult, nxt: FitResult, camera: Camera, phys: Physi
     return np.inf if c is None else c[1]
 
 
-def _is_long(sf: Any, o: JointOptions) -> bool:
-    return sf.duration >= o.long_flight_s and sf.n_obs >= o.long_min_obs
+def _is_long(sf: Any, o: JointOptions, rms_px: float = 0.0, max_rms_px: float = np.inf) -> bool:
+    """終端速度を求めるのに使う長いショットか（長く飛び、コマが多く、ショットごとの当てはめが合っている）。"""
+    return sf.duration >= o.long_flight_s and sf.n_obs >= o.long_min_obs and rms_px <= max_rms_px
 
 
 def joint_fit(fits: list[Any], det: pd.DataFrame, camera: Camera, phys: PhysicsParams,
@@ -486,11 +496,19 @@ def joint_fit(fits: list[Any], det: pd.DataFrame, camera: Camera, phys: PhysicsP
     for i, sf in enumerate(fits):
         if sf.fit is None or not np.isfinite(base[i].fit.rms_px if base[i].fit is not None else np.nan):
             continue
-        if not base[i].fit.rms_px <= max_rms_px:
+        if sf.n_obs < o.min_obs:
+            continue
+        if not base[i].fit.rms_px <= min(max_rms_px, o.max_shot_rms_frac * camera.width):
+            out.cut.append(("shot", i, f"ずれ {base[i].fit.rms_px:.0f} px"))
             continue
         st = _state_at(sf.fit, sf.t_hit, phys)
         if st is not None and np.linalg.norm(st[1]) > 0:
             state[i] = np.r_[sf.t_hit, st[0], st[1]]
+    # 同じ側が続けて打っているショットは、間の打球を見落としている（2 本の飛行が 1 本になっている）ので、まとめない
+    for i in range(n - 1):
+        if i in state and fits[i].side in ("h", "o") and fits[i].side == fits[i + 1].side:
+            del state[i]
+            out.cut.append(("shot", i, "次の打球も同じ側"))
     ref_rms = {i: float(base[i].fit.rms_px) for i in state}
     use_link = [False] * n
     for i in range(1, n):
@@ -517,138 +535,147 @@ def joint_fit(fits: list[Any], det: pd.DataFrame, camera: Camera, phys: PhysicsP
     anchors = [None if sf.hit_point is None or not np.isfinite(sf.hit_point).all() else np.asarray(sf.hit_point, float)
                for sf in base]
     lv: dict[int, float] = {}     # ショット → log(v_t)（終端速度を求めるショット）
-    sol = prob = active = None
-    info: dict[str, Any] = {}
+    vt_rms = max(2 * opts.loss_scale_px, o.vt_max_rms_frac * camera.width)
+    long = {i for i in state if est and _is_long(base[i], o, ref_rms[i], vt_rms)}
+    solved: dict[tuple[Any, ...], tuple[_Problem, Any, dict[str, Any]]] = {}   # 解いた組（つながったショットの並び）
+    chains: list[list[int]] = []
+    rms_now: dict[int, float] = {}
+    gaps: dict[int, float] = {}
+    feet_now: dict[int, float] = {}
 
-    def build() -> tuple[_Problem, list[int]] | None:
-        """いまのつなぎ目で、どちらかの側がつながっているショットだけの問題を作る。"""
-        act = [i for i in state if use_link[i] or (i + 1 < n and use_link[i + 1])]
-        if not act:
-            return None
-        obs = split_observations(det, camera, times, margin_s, t_last)
-        shots = []
-        for i in act:
-            ob = obs[i]
-            keep = ob.t <= times[i] + o.max_flight_s
-            prev_t = obs[i - 1].t if i > 0 else np.empty(0)
-            shots.append(_Shot(ob.t[keep], ob.uv[keep], fits[i].side, use_link[i],
-                               feet[i] if use_feet[i] else None, anchors[i], t_audio[i], t_track[i],
-                               float(prev_t[-1]) if len(prev_t) else -np.inf,
-                               float(ob.t[0]) if len(ob.t) else np.inf,
-                               est and _is_long(fits[i], o),
-                               min(1.0, opts.loss_scale_px / max(ref_rms[i], 1e-9))
-                               * (min(1.0, np.sqrt(o.obs_cap / max(int(keep.sum()), 1))) if o.obs_cap > 0 else 1.0)))
-        return _Problem(shots, camera, phys, o, weight, huber, track_sigma, speed_of_sound_mps, est,
-                        opts.max_speed_mps), act
+    def linked(i: int) -> bool:
+        return use_link[i] or (i + 1 < n and use_link[i + 1])
+
+    def solve_chains(obs: list[Any]) -> None:
+        """いまのつなぎ目でつながったショットの組ごとに解く（組どうしは関係しないので、変わった組だけを解き直す）。
+        終端速度を求めるときは、つながっていない長いショットも 1 本だけの組として解く。"""
+        chains.clear()
+        for i in sorted(state):
+            if not (linked(i) or i in long):
+                continue
+            if chains and use_link[i] and chains[-1][-1] == i - 1:
+                chains[-1].append(i)
+            else:
+                chains.append([i])
+        for ch in chains:
+            key = (tuple(ch), tuple(use_feet[i] for i in ch))
+            if key not in solved:
+                shots = []
+                for i in ch:
+                    ob = obs[i]
+                    keep = ob.t <= times[i] + o.max_flight_s
+                    prev_t = obs[i - 1].t if i > 0 else np.empty(0)
+                    shots.append(_Shot(ob.t[keep], ob.uv[keep], fits[i].side, use_link[i] and i != ch[0],
+                                       feet[i] if use_feet[i] else None, anchors[i], t_audio[i], t_track[i],
+                                       float(prev_t[-1]) if len(prev_t) else -np.inf,
+                                       float(ob.t[0]) if len(ob.t) else np.inf, i in long,
+                                       min(1.0, opts.loss_scale_px / max(ref_rms[i], 1e-9))))
+                prob = _Problem(shots, camera, phys, o, weight, huber, track_sigma, speed_of_sound_mps, est,
+                                opts.max_speed_mps)
+                x0 = np.concatenate([state[i] for i in ch]
+                                    + [[lv.get(ch[k], np.log(phys.terminal_velocity)) for k in prob.free]])
+                sol = prob.solve(x0)
+                out.n_solves += 1
+                solved[key] = (prob, sol, prob.evaluate(sol.x)[2])
+            prob, sol, info = solved[key]
+            for k, i in enumerate(ch):
+                state[i] = sol.x[7 * k:7 * k + 7].copy()
+                rms_now[i], feet_now[i] = float(info["rms"][k]), float(info["feet_gap"][k])
+                if use_link[i] and k > 0:
+                    gaps[i] = float(info["gaps"][k])
+            for k in prob.free:
+                lv[ch[k]] = float(sol.x[prob.lv_col[k]])
+
+    def cut_links() -> bool:
+        """切るもの：すき間の大きいつなぎ目 → ずれが大きくなったショットのつなぎ目 → 打点が足元から離れたショットのつなぎ目。"""
+        act = [i for ch in chains for i in ch]
+        big = [i for i in act if use_link[i] and gaps.get(i, 0.0) > o.max_link_gap_m]
+        if big:
+            for i in big:
+                use_link[i] = False
+                out.cut.append(("link", i, f"すき間 {gaps[i]:.2f} m"))
+            return True
+        changed = False
+        for why in ("rms", "feet"):
+            for i in act:
+                if why == "rms":
+                    if rms_now[i] <= o.max_rms_ratio * ref_rms[i] + o.rms_slack_px:
+                        continue
+                    text = f"ショット {i} のずれ {rms_now[i]:.1f} px（元は {ref_rms[i]:.1f} px）"
+                else:
+                    if not (use_feet[i] and feet_now[i] > max(o.reach_m, base_feet_gap[i] + o.reach_slack_m)):
+                        continue
+                    text = f"ショット {i} の打点が足元から {feet_now[i]:.1f} m（元は {base_feet_gap[i]:.1f} m）"
+                near = [j for j in (i, i + 1) if j < n and use_link[j]]
+                if near:
+                    j = max(near, key=lambda j: gaps.get(j, 0.0))
+                    use_link[j] = False
+                    out.cut.append(("link", j, text))
+                    changed = True
+            if changed:
+                return True
+        return False
 
     for split in range(max(o.n_splits, 1)):
+        obs = split_observations(det, camera, times, margin_s, t_last)
+        solved.clear()
         for _ in range(max(o.max_rounds, 1)):
-            built = build()
-            if built is None:
-                sol = None
+            gaps.clear()
+            solve_chains(obs)
+            if not chains or not cut_links():
                 break
-            prob, active = built
-            x0 = np.concatenate([state[i] for i in active]
-                                + [[lv.get(active[k], np.log(phys.terminal_velocity)) for k in prob.free]])
-            sol = prob.solve(x0)
-            out.n_solves += 1
-            _, _, info = prob.evaluate(sol.x)
-            for k, i in enumerate(active):
-                state[i] = sol.x[7 * k:7 * k + 7].copy()
-            for k in prob.free:
-                lv[active[k]] = float(sol.x[prob.lv_col[k]])
-            # 切るもの：すき間の大きいつなぎ目 → ずれが大きくなったショットのつなぎ目 → 足元から離れた打点
-            changed = False
-            gaps = {i: info["gaps"][k] for k, i in enumerate(active) if use_link[i]}
-            big = [i for i, gp in gaps.items() if gp > o.max_link_gap_m]
-            if big:
-                worst = max(big, key=lambda i: gaps[i])
-                for i in big:
-                    if i == worst or gaps[i] > 2 * o.max_link_gap_m:
-                        use_link[i] = False
-                        out.cut.append(("link", i, f"すき間 {gaps[i]:.2f} m"))
-                changed = True
-            else:
-                for k, i in enumerate(active):
-                    if info["rms"][k] <= o.max_rms_ratio * ref_rms[i] + o.rms_slack_px:
-                        continue
-                    near = [j for j in (i, i + 1) if j < n and use_link[j]]
-                    if near:
-                        j = max(near, key=lambda j: gaps.get(j, 0.0))
-                        use_link[j] = False
-                        out.cut.append(("link", j, f"ショット {i} のずれ {info['rms'][k]:.1f} px"
-                                                   f"（元は {ref_rms[i]:.1f} px）"))
-                        changed = True
-            if not changed:
-                for k, i in enumerate(active):
-                    fg = info["feet_gap"][k]
-                    if not (use_feet[i] and fg > max(o.reach_m, base_feet_gap[i] + o.reach_slack_m)):
-                        continue
-                    near = [j for j in (i, i + 1) if j < n and use_link[j]]
-                    if near:
-                        j = max(near, key=lambda j: gaps.get(j, 0.0))
-                        use_link[j] = False
-                        out.cut.append(("link", j, f"ショット {i} の打点が足元から {fg:.1f} m"
-                                                   f"（元は {base_feet_gap[i]:.1f} m）"))
-                        changed = True
-            if not changed:
-                break
-        if sol is None or split + 1 >= o.n_splits:
+        if not chains or split + 1 >= o.n_splits:
             break
         # 直した打った時刻で観測を分け直す（時刻が動いていなければ終わり）
-        new = list(times)
-        for i in active:
-            new[i] = float(state[i][0])
-        if max(abs(a - b) for a, b in zip(new, times)) < 1e-4:
+        moved = [float(state[i][0]) if any(i in ch for ch in chains) else t for i, t in enumerate(times)]
+        if max(abs(a - b) for a, b in zip(moved, times)) < 1e-4:
             break
-        times = new
+        times = moved
     out.links = list(use_link)
-    if sol is None or prob is None or active is None:
-        return out
 
     # --- 結果をショットごとの形に戻す
-    r, jac, info = prob.evaluate(sol.x)
-    cov = None
-    if opts.ci_method != "none" or prob.est:
-        dof = max(prob.n_res - prob.n_par, 1)
-        try:
-            cov = np.linalg.pinv(sol.jac.T @ sol.jac) * (2.0 * sol.cost / dof)
-        except np.linalg.LinAlgError:
-            cov = None
-    for k in prob.free:
-        c = prob.lv_col[k]
-        sd = float(np.sqrt(max(cov[c, c], 0.0))) if cov is not None else np.inf
-        out.vt.append(VtEstimate(float(np.exp(sol.x[c])), float(np.exp(sol.x[c])) * sd, active[k]))
     from scipy.stats import norm
 
     zq = norm.ppf(0.5 + opts.ci_level / 2)
-    _, _, _, vts = prob.unpack(sol.x)
-    for k, i in enumerate(active):
-        tau, P, V = float(state[i][0]), state[i][1:4].copy(), state[i][4:7].copy()
-        rms, m = float(info["rms"][k]), len(prob.shots[k].t)
-        speed = float(np.linalg.norm(V))
-        linked = use_link[i] or (i + 1 < n and use_link[i + 1])
-        if not (linked and np.isfinite(rms) and np.isfinite(speed) and speed > 0
-                and rms <= o.max_rms_ratio * ref_rms[i] + o.rms_slack_px and _plausible_point(P, fits[i].side)):
-            continue
-        if use_link[i]:
-            out.gaps_m[i] = float(info["gaps"][k])
-        horiz = V[:2] if np.hypot(*V[:2]) > 1e-9 else np.array([1.0, 0.0])
-        f = FitResult(mode="plane", t_ref=tau, p0=P, v0=V, terminal_velocity=float(vts[k]),
-                      theta=np.array([0.0, P[2], float(np.hypot(*V[:2])), V[2]]), cov_theta=None, rms_px=rms,
-                      n_obs=m, success=bool(sol.success), message="joint",
-                      plane=FlightPlane(np.r_[P[:2], 0.0], np.r_[horiz, 0.0]))
-        if opts.ci_method != "none" and cov is not None:
-            gr = V / speed
-            sd = float(np.sqrt(max(gr @ cov[7 * k + 4:7 * k + 7, 7 * k + 4:7 * k + 7] @ gr, 0.0)))
-            f.speed0_sd_fit, f.speed0_sd_timing = sd, 0.0
-            if 2 * m - 7 >= 3 and sd < speed:
-                f.speed0_ci, f.ci_method = (speed - zq * sd, speed + zq * sd), "jacobian"
-            else:
-                f.ci_method = "jacobian(unreliable)"
-        old = fits[i]
-        out.fits[i] = ShotFit(tau, old.side, old.t_end, m, f, P, old.message, None)
-        out.joint[i] = True
+    for ch in chains:
+        prob, sol, info = solved[(tuple(ch), tuple(use_feet[i] for i in ch))]
+        cov = None
+        if opts.ci_method != "none" or prob.est:
+            dof = max(prob.n_res - prob.n_par, 1)
+            try:
+                cov = np.linalg.pinv(sol.jac.T @ sol.jac) * (2.0 * sol.cost / dof)
+            except np.linalg.LinAlgError:
+                cov = None
+        for k in prob.free:
+            c = prob.lv_col[k]
+            sd = float(np.sqrt(max(cov[c, c], 0.0))) if cov is not None else np.inf
+            out.vt.append(VtEstimate(float(np.exp(sol.x[c])), float(np.exp(sol.x[c])) * sd, ch[k]))
+        vts = prob.unpack(sol.x)[3]
+        for k, i in enumerate(ch):
+            tau, P, V = float(state[i][0]), state[i][1:4].copy(), state[i][4:7].copy()
+            rms, m = rms_now[i], len(prob.shots[k].t)
+            speed = float(np.linalg.norm(V))
+            if not (linked(i) and np.isfinite(rms) and np.isfinite(speed) and speed > 0
+                    and rms <= o.max_rms_ratio * ref_rms[i] + o.rms_slack_px and _plausible_point(P, fits[i].side)):
+                continue
+            if use_link[i]:
+                out.gaps_m[i] = gaps.get(i, np.nan)
+            horiz = V[:2] if np.hypot(*V[:2]) > 1e-9 else np.array([1.0, 0.0])
+            f = FitResult(mode="plane", t_ref=tau, p0=P, v0=V, terminal_velocity=float(vts[k]),
+                          theta=np.array([0.0, P[2], float(np.hypot(*V[:2])), V[2]]), cov_theta=None, rms_px=rms,
+                          n_obs=m, success=bool(sol.success), message="joint",
+                          plane=FlightPlane(np.r_[P[:2], 0.0], np.r_[horiz, 0.0]))
+            if opts.ci_method != "none" and cov is not None:
+                gr = V / speed
+                sd = float(np.sqrt(max(gr @ cov[7 * k + 4:7 * k + 7, 7 * k + 4:7 * k + 7] @ gr, 0.0)))
+                f.speed0_sd_fit, f.speed0_sd_timing = sd, 0.0
+                if 2 * m - 7 >= 3 and sd < speed:
+                    f.speed0_ci, f.ci_method = (speed - zq * sd, speed + zq * sd), "jacobian"
+                else:
+                    f.ci_method = "jacobian(unreliable)"
+            old = fits[i]
+            out.fits[i] = ShotFit(tau, old.side, old.t_end, m, f, P, old.message, None)
+            out.joint[i] = True
     # 打った時刻・飛行の終わり・観測を、決まった時刻でそろえる
     final_t = [out.fits[i].t_hit for i in range(n)]
     obs = split_observations(det, camera, final_t, margin_s, t_last)
@@ -669,8 +696,8 @@ def combine_vt(estimates: list[VtEstimate], default: float, o: JointOptions | No
     """長いショット 1 本ずつの終端速度の推定を、動画全体の 1 つの値にまとめる。
 
     値は中央値。不確かさは、1 本ずつの値のばらつき（中央値からの差の中央値）から出した中央値の標準誤差と、
-    当てはめからの不確かさの大きい方。当てはめからの不確かさが ``vt_prior_sigma`` の目安と同じくらい大きい推定
-    （軌道から終端速度が決まっていない）は数えない。数えた本数が ``vt_min_flights`` より少ない・不確かさが
+    当てはめからの不確かさの大きい方に、ばらつきに出ない分（``vt_sys_sigma_mps``）を 2 乗和で足したもの。
+    当てはめからの不確かさが ``vt_flight_sigma_mps`` より大きい推定（軌道から終端速度が決まっていない）は数えない。数えた本数が ``vt_min_flights`` より少ない・不確かさが
     ``vt_max_sigma_mps`` より大きい・``vt_range_mps`` の外なら、``default``（設定の値）のままにする。
 
     Returns:
@@ -679,7 +706,7 @@ def combine_vt(estimates: list[VtEstimate], default: float, o: JointOptions | No
     """
     o = o or JointOptions()
     ok = [e for e in estimates if e is not None and np.isfinite(e.value) and np.isfinite(e.sigma)
-          and 0 < e.sigma < 0.5 * o.vt_prior_sigma * default]
+          and 0 < e.sigma <= o.vt_flight_sigma_mps]
     rec: dict[str, Any] = {"used": False, "default_mps": default, "value_mps": None, "sigma_mps": None,
                            "n_flights": len(ok), "reason": ""}
     if not ok:
@@ -690,7 +717,7 @@ def combine_vt(estimates: list[VtEstimate], default: float, o: JointOptions | No
     formal = float(1.0 / np.sqrt(np.sum([1.0 / e.sigma ** 2 for e in ok])))
     # 正規分布なら 標準偏差 ≈ 1.4826 × MAD、中央値の標準誤差 ≈ 1.2533 × 標準偏差 / √n
     scatter = 1.2533 * 1.4826 * float(np.median(np.abs(vals - med))) / np.sqrt(len(ok)) if len(ok) > 1 else np.inf
-    sigma = max(formal, scatter)
+    sigma = float(np.hypot(max(formal, scatter), o.vt_sys_sigma_mps))
     rec["value_mps"], rec["sigma_mps"] = round(med, 3), round(float(sigma), 3) if np.isfinite(sigma) else None
     if len(ok) < o.vt_min_flights:
         rec["reason"] = f"長く飛んだショットが {len(ok)} 本（{o.vt_min_flights} 本以上で使う）"
@@ -705,7 +732,7 @@ def combine_vt(estimates: list[VtEstimate], default: float, o: JointOptions | No
 
 
 def refit_with_vt(fits: list[Any], skip: list[bool], phys: PhysicsParams, opts: FitOptions) -> None:
-    """まとめなかったショット（``skip`` が偽で当てはめのあるもの）を、飛行平面を決めたまま、終端速度 ``phys`` で
+    """まとめなかったショット（``skip`` が偽で当てはめのあるもの）を、いまの飛行平面と打点の目安から、終端速度 ``phys`` で
     当てはめ直す（``fits`` を書き換える）。動画全体の終端速度が設定の値と違うと決まったときに、すべてのショットを
     同じ終端速度にそろえる。当てはめ直せなければ元のまま。"""
     from smash_speed.physics import fit_trajectory
@@ -715,10 +742,11 @@ def refit_with_vt(fits: list[Any], skip: list[bool], phys: PhysicsParams, opts: 
         if (done or f is None or f.plane is None or f.mode != "plane" or sf.obs is None
                 or abs(f.terminal_velocity - phys.terminal_velocity) < 1e-6):
             continue
-        fo = FitOptions(**{**opts.__dict__, "refine_plane": False, "init_state": None, "p0_prior_m": sf.hit_point,
-                           "quadratic_priors": True})
+        fo = FitOptions(**{**opts.__dict__, "refine_plane": opts.refine_plane and sf.n_obs > 5, "init_state": None,
+                           "p0_prior_m": sf.hit_point, "quadratic_priors": True})
         try:
-            new = fit_trajectory(sf.obs, f.t_ref, "plane", f.plane, phys, fo, theta0=f.theta[:4])
+            new = fit_trajectory(sf.obs, f.t_ref, "plane", f.plane, phys, fo,
+                                 theta0=np.r_[f.theta[:4], [0.0, 0.0] if fo.refine_plane else []])
         except (ValueError, RuntimeError):
             continue
         if new.success and np.isfinite(new.speed0):
@@ -752,7 +780,14 @@ def fit_rallies(rallies: list[dict[str, Any]], phys: PhysicsParams, opts: FitOpt
                        "n_flights": 0, "reason": "求めていない"}
     vt, rec = combine_vt([e for r in first for e in r.vt], phys.terminal_velocity, o)
     phys2 = PhysicsParams(phys.g, vt, phys.method, phys.rtol, phys.atol)
-    second = run(_joint_job, [(r, phys2, opts, o, False, f.links, f.fits) for r, f in zip(rallies, first)])
+    o2, keep_links = o, True
+    if rec["used"] and abs(vt - phys.terminal_velocity) > o.vt_refit_mps:
+        # 終端速度が変わると、設定の値で切れたつなぎ目がつながることがあるので、つなぎ目を見直す。つながらない
+        # ショットの打点の目安（設定の終端速度での当てはめの打点）もずれているので、ゆるめる
+        o2 = JointOptions(**{**o.__dict__, "anchor_sigma_m": 4 * o.anchor_sigma_m})
+        keep_links = False
+    second = run(_joint_job, [(r, phys2, opts, o2, False, f.links if keep_links else None, f.fits)
+                              for r, f in zip(rallies, first)])
     for res, f in zip(second, first):
         res.vt, res.cut, res.n_solves = f.vt, f.cut + res.cut, f.n_solves + res.n_solves
         if rec["used"]:
