@@ -702,6 +702,8 @@ python -m smash_speed.shot_list data\IMG_4397.MOV --calib out\calibration.json -
 `stats.json`・`landing.svg`（ラリーの統計と着地点の分布図、下の「ラリーの統計」）、
 `report.html`（1 枚のレポート、下の「1 本の動画のレポート」）を書き出す。
 `smash-speed shots --video <動画> --calib <calibration.json> --out <出力先>` でも同じことができる（GUI はこれを裏で動かす）。
+`--joint-fit` を付けると、ラリーの中のショットをつないでまとめて当てはめ直し（となりのショットと打点・打った時刻を合わせる）、
+長く飛んだショットからシャトルの終端速度も求める（`shot_list.json` の `joint_fit`。既定では使わない。方法と数字は `docs/rally_fit.md`）。
 GUI の「ショットの一覧」の画面はこれを読む（出力先は `<出力の場所>\<動画の名前>_shots`）。
 
 合成ラリーの動画（`synth_rally.render_rally_video`。横・遠くのカメラ、白い背景、打球音の WAV つき）を
