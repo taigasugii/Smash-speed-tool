@@ -50,7 +50,7 @@ from scipy.optimize import least_squares
 
 from smash_speed.camera import Camera
 from smash_speed.geometry import FlightPlane
-from smash_speed.physics import MAX_FIT_SPEED_MPS, SPEED_PENALTY_SIGMA_MPS, FitOptions, FitResult, PhysicsParams
+from smash_speed.physics import SPEED_PENALTY_SIGMA_MPS, FitOptions, FitResult, PhysicsParams
 
 _DV = 1e-3        # ヤコビアン用に速度を動かす大きさ [m/s]
 _DLV = 1e-4       # 同・log(v_t)
