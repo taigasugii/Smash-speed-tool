@@ -49,7 +49,7 @@ _DV = 1e-3        # ヤコビアン用に速度を動かす大きさ [m/s]
 _DLV = 1e-4       # 同・log(v_t)
 _EPS_M = 1e-4     # 投影のヤコビアン用に位置を動かす大きさ [m]
 _BAD_PX = 1e3     # 計算できなかった残差の罰（``physics._residuals`` と同じ）
-_N_PRIOR = 14     # ショットごとの、画像の上のずれ以外の残差の数
+_N_PRIOR = 17     # ショットごとの、画像の上のずれ以外の残差の数
 
 
 @dataclass
@@ -58,10 +58,13 @@ class JointOptions:
 
     link_sigma_m: float = 0.15        # つなぎ目（前のショットの終わりと打点）のすき間の不確かさ [m]
     max_link_gap_m: float = 0.6       # 解いた後のすき間がこれを超えたつなぎ目は切る [m]
-    max_cross_frac: float = 0.006     # 当てはめる前に、前後の軌道が画像の上でこれ（画像の幅の割合）より近づかない
-                                      # つなぎ目は切る（1920 px で 12 px。``shot_fit.refine_hit_times`` は 6 px）
+    max_cross_frac: float = 0.03      # 当てはめる前に、前後の軌道が画像の上でこれ（画像の幅の割合）より近づかない
+                                      # つなぎ目は切る（1920 px で 58 px。はっきり別の物だけ。速いショットは 1 本ずつの
+                                      # 当てはめのずれで 12 px ほど離れることがある。あとは解いてから切る）
     cross_window_s: float = 0.1       # そのとき近づく所を探す、打った時刻の前後の幅 [s]
     feet_sigma_m: float = 0.5         # 打つ人の足元から打点までの水平の距離の不確かさ [m]
+    anchor_sigma_m: float = 0.5       # 前のショットとつながらないショットの打点を、ショットごとの当てはめのつないだ打点
+                                      # （``ShotFit.hit_point``）の近くに留める不確かさ [m]
     max_feet_gap_m: float = 2.5       # 解いた後の打点が足元からこれより離れたら、その足元は使わない [m]
     audio_sigma_s: float = 0.003      # 打球音から決めた打った時刻の不確かさ [s]
     track_sigma_s: float | None = None  # 軌道から決めた打った時刻の不確かさ [s]（None ならコマの間隔）
@@ -184,8 +187,9 @@ def interpolate(grid: np.ndarray, y: np.ndarray, s: np.ndarray) -> tuple[np.ndar
     u = ((s - grid[i]) / (grid[i + 1] - grid[i]))[:, None, None]
     p0, p1, v0, v1 = y[i, :, :3], y[i + 1, :, :3], y[i, :, 3:], y[i + 1, :, 3:]
     u2, u3 = u * u, u * u * u
-    pos = (2 * u3 - 3 * u2 + 1) * p0 + (u3 - 2 * u2 + u) * h * v0 + (-2 * u3 + 3 * u2) * p1 + (u3 - u2) * h * v1
-    vel = (6 * u2 - 6 * u) / h * (p0 - p1) + (3 * u2 - 4 * u + 1) * v0 + (3 * u2 - 2 * u) * v1
+    with np.errstate(invalid="ignore"):    # 前へ戻して発散した所（inf）は NaN になる
+        pos = (2 * u3 - 3 * u2 + 1) * p0 + (u3 - 2 * u2 + u) * h * v0 + (-2 * u3 + 3 * u2) * p1 + (u3 - u2) * h * v1
+        vel = (6 * u2 - 6 * u) / h * (p0 - p1) + (3 * u2 - 4 * u + 1) * v0 + (3 * u2 - 2 * u) * v1
     bad = (s < grid[0] - 1e-12) | (s > grid[-1] + 1e-12)
     if bad.any():
         pos[bad], vel[bad] = np.nan, np.nan
@@ -204,6 +208,7 @@ class _Shot:
     side: str
     link: bool                        # 前のショット（問題の中の 1 つ前）とつなぐか
     foot: np.ndarray | None           # 打つ人の足元
+    anchor: np.ndarray | None         # 前のショットとつながらないときの、打点の目安
     t_audio: float | None             # 打球音の時刻
     t_track: float                    # 軌道から決めた打った時刻（打球音がないときの目安）
     t_lo: float                       # 打った時刻の下限（前のショットの最後の観測）
@@ -340,6 +345,12 @@ class _Problem:
                 r[row:row + 2] = wf * d
                 jac[row, c + 1], jac[row + 1, c + 2] = wf, wf
             row += 2
+            # --- 前とつながらないショットの打点の目安
+            if s.anchor is not None and not s.link:
+                wa = w / o.anchor_sigma_m
+                r[row:row + 3] = wa * (P[k] - s.anchor)
+                jac[row:row + 3, c + 1:c + 4] = wa * np.eye(3)
+            row += 3
             # --- 打った時刻
             if s.t_audio is not None:
                 wa = w / o.audio_sigma_s
@@ -479,7 +490,9 @@ def joint_fit(fits: list[Any], det: pd.DataFrame, camera: Camera, phys: PhysicsP
     huber = opts.loss_scale_px if opts.loss == "huber" else None
     weight = max(opts.loss_scale_px, float(np.median(list(ref_rms.values()))) if ref_rms else 0.0)
     times = [sf.t_hit for sf in fits]
-    t_track = list(times)
+    t_track = [sf.t_hit for sf in base]
+    anchors = [None if sf.hit_point is None or not np.isfinite(sf.hit_point).all() else np.asarray(sf.hit_point, float)
+               for sf in base]
     lv = np.log(phys.terminal_velocity)
     sol = prob = active = None
     info: dict[str, Any] = {}
@@ -496,7 +509,7 @@ def joint_fit(fits: list[Any], det: pd.DataFrame, camera: Camera, phys: PhysicsP
             keep = ob.t <= times[i] + o.max_flight_s
             prev_t = obs[i - 1].t if i > 0 else np.empty(0)
             shots.append(_Shot(ob.t[keep], ob.uv[keep], fits[i].side, use_link[i],
-                               feet[i] if use_feet[i] else None, t_audio[i], t_track[i],
+                               feet[i] if use_feet[i] else None, anchors[i], t_audio[i], t_track[i],
                                float(prev_t[-1]) if len(prev_t) else -np.inf,
                                float(ob.t[0]) if len(ob.t) else np.inf,
                                est and _is_long(fits[i], o)))
@@ -578,7 +591,6 @@ def joint_fit(fits: list[Any], det: pd.DataFrame, camera: Camera, phys: PhysicsP
     zq = norm.ppf(0.5 + opts.ci_level / 2)
     _, _, _, vts = prob.unpack(sol.x)
     for k, i in enumerate(active):
-        new = list(times)
         tau, P, V = float(state[i][0]), state[i][1:4].copy(), state[i][4:7].copy()
         rms, m = float(info["rms"][k]), len(prob.shots[k].t)
         speed = float(np.linalg.norm(V))
@@ -656,3 +668,67 @@ def combine_vt(estimates: list[VtEstimate | None], default: float, o: JointOptio
         rec["used"] = True
         return mean, rec
     return default, rec
+
+
+def refit_with_vt(fits: list[Any], skip: list[bool], phys: PhysicsParams, opts: FitOptions) -> None:
+    """まとめなかったショット（``skip`` が偽で当てはめのあるもの）を、飛行平面を決めたまま、終端速度 ``phys`` で
+    当てはめ直す（``fits`` を書き換える）。動画全体の終端速度が設定の値と違うと決まったときに、すべてのショットを
+    同じ終端速度にそろえる。当てはめ直せなければ元のまま。"""
+    from smash_speed.physics import fit_trajectory
+
+    for sf, done in zip(fits, skip):
+        f = sf.fit
+        if (done or f is None or f.plane is None or f.mode != "plane" or sf.obs is None
+                or abs(f.terminal_velocity - phys.terminal_velocity) < 1e-6):
+            continue
+        fo = FitOptions(**{**opts.__dict__, "refine_plane": False, "init_state": None, "p0_prior_m": sf.hit_point,
+                           "quadratic_priors": True})
+        try:
+            new = fit_trajectory(sf.obs, f.t_ref, "plane", f.plane, phys, fo, theta0=f.theta[:4])
+        except (ValueError, RuntimeError):
+            continue
+        if new.success and np.isfinite(new.speed0):
+            sf.fit = new
+
+
+def fit_rallies(rallies: list[dict[str, Any]], phys: PhysicsParams, opts: FitOptions | None = None,
+                o: JointOptions | None = None, mapper: Any = None) -> tuple[list[JointResult], dict[str, Any]]:
+    """動画（セッション）のすべてのラリーをまとめて当てはめ、終端速度を動画全体で 1 つ決める。
+
+    1. ラリーごとに、長いショットの終端速度を一緒に求めながら当てはめる（``joint_fit``）。
+    2. ラリーごとの推定を 1 つにまとめる（``combine_vt``。足りなければ設定の値のまま）。
+    3. 決めた終端速度で、すべてのショットを当てはめ直す（1 の結果から始めるので速い）。
+
+    ``o.estimate_vt`` が偽なら、設定の終端速度で 1 回だけ当てはめる。
+
+    Args:
+        rallies: ラリーごとの ``joint_fit`` の引数の辞書（``fits``・``det``・``camera`` と、あれば ``feet``・``t_audio``・
+            ``margin_s``・``t_last``・``speed_of_sound_mps``・``max_rms_px``）
+        mapper: ``mapper(fn, 引数のリスト)`` でラリーごとの計算を並べる関数（None なら 1 つずつ）
+
+    Returns:
+        (ラリーごとの ``JointResult``, 終端速度の記録（``combine_vt``）)
+    """
+    o = o or JointOptions()
+    opts = opts or FitOptions(refine_plane=True)
+    run = mapper or (lambda fn, args: [fn(*a) for a in args])
+    first = run(_joint_job, [(r, phys, opts, o, o.estimate_vt, None, None) for r in rallies])
+    if not o.estimate_vt:
+        return first, {"used": False, "default_mps": phys.terminal_velocity, "value_mps": None, "sigma_mps": None,
+                       "n_flights": 0, "n_rallies": 0, "reason": "求めていない"}
+    vt, rec = combine_vt([r.vt for r in first], phys.terminal_velocity, o)
+    phys2 = PhysicsParams(phys.g, vt, phys.method, phys.rtol, phys.atol)
+    second = run(_joint_job, [(r, phys2, opts, o, False, f.links, f.fits) for r, f in zip(rallies, first)])
+    for res, f in zip(second, first):
+        res.vt, res.cut, res.n_solves = f.vt, f.cut + res.cut, f.n_solves + res.n_solves
+        if rec["used"]:
+            refit_with_vt(res.fits, res.joint, phys2, opts)
+    return second, rec
+
+
+def _joint_job(rally: dict[str, Any], phys: PhysicsParams, opts: FitOptions, o: JointOptions, estimate_vt: bool,
+               links: list[bool] | None, start: list[Any] | None) -> JointResult:
+    """``fit_rallies`` の 1 ラリー分（``start`` があれば、そこから始めて元の当てはめ ``rally["fits"]`` と比べる）。"""
+    kw = {k: v for k, v in rally.items() if k != "fits"}
+    return joint_fit(start if start is not None else rally["fits"], phys=phys, opts=opts, o=o,
+                     estimate_vt=estimate_vt, links=links, base=rally["fits"], **kw)
