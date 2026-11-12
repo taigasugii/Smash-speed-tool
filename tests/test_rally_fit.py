@@ -60,6 +60,7 @@ def test_jacobian_matches_finite_differences():
         t, uv = det.timestamp[m].to_numpy(float)[1:], det.loc[m, ["x_px", "y_px"]].to_numpy(float)[1:]
         dist = float(np.linalg.norm(cam.center - s.p0))
         shots.append(_Shot(t, uv, s.side, k > 0, s.p0[:2] + 0.2 if k != 1 else None, s.p0 + 0.1,
+                           np.r_[s.p0 - 0.1, s.v0] if k == 2 else None,
                            s.t_hit + dist / 343.0 if k == 0 else None, s.t_hit + 0.004, -np.inf, np.inf, k != 1))
         x += [s.t_hit + 0.003, *(s.p0 + [0.3, -0.2, 0.1]), *(s.v0 * 1.03)]
     x = np.array(x + [np.log(6.5), np.log(6.9)])
