@@ -9,6 +9,9 @@
 4. 跳んでいるコマ：足元の位置で測った枠の高さがふだんより大きく出るコマを見つけ、床の上の位置を前後から補う。
 
 5. 動き：``movement.write_movement`` で、移動距離・速さ・いた場所の分布（``movement.json``・``movement.svg``）も書く。
+6. ダブルス（1 側 2 人）：``per_side`` が 2（または 0 = 自動で、その側に 2 人いると分かったとき）の側は、
+   ``player_ids.track_pair`` で 2 人を同じ番号のまま追う（すれ違い・重なりの後も入れ替わらないよう、動きと枠の中の色で確かめる）。
+   色は検出のときに枠の中から取り（``box_appearance``）、``people.csv`` の ``app`` に入れる。
 
 結果は 1 コマ 1 側 1 人の ``players.csv``（``frame, t, side, player, x, y, u, v, x0, y0, x1, y1, score, interpolated,
 airborne``）と、
@@ -61,7 +64,7 @@ class PlayerOptions:
     nms_iou: float = 0.45             # 重なった枠をまとめる IoU
     process_width: int = 1280         # 検出に使う画像の横幅 [px]（モデルの入力は 640 なので、これ以上は要らない）
     stride: int = 1                   # 何コマごとに検出するか
-    per_side: int = 1                 # 1 側の人数（シングルス 1、ダブルス 2）
+    per_side: int = 1                 # 1 側の人数（シングルス 1、ダブルス 2、0 は側ごとに自動で決める。``player_ids``）
     margin_m: tuple[float, float] = (2.0, 1.0)  # 選手とみなす範囲の、コートの外側の線からの広げ幅（長さ方向・幅方向）[m]
     net_margin_m: float = 0.5         # ネットを越えて相手側に足が出たとみなしてよい幅 [m]
     outside_weight: float = 0.3       # コートの線の外（広げた範囲）にいた点の重み（中にいた点は 1）
@@ -183,14 +186,66 @@ class PersonDetector:
         return np.column_stack([b[:, 0], b[:, 1], b[:, 0] + b[:, 2], b[:, 1] + b[:, 3], score[idx]])
 
 
-def detect_people(frames: Iterable[tuple[int, float, np.ndarray]], detector: PersonDetector, scale: float = 1.0
-                  ) -> pd.DataFrame:
-    """コマごとに人を検出する。``scale`` は元の解像度に対する画像の縮小率（枠は元の解像度に直す）。"""
+# 枠の中の色（ダブルスで 2 人を見分ける手がかり。``player_ids``）：上半身と下半身の 2 か所で、
+# 色相 ``APP_HUE_BINS`` 個（鮮やかな画素だけ）＋ 色のない画素の暗い・中くらい・明るい の割合。合計 1 を 0〜255 にして持つ
+APP_HUE_BINS = 8
+APP_REGIONS = ((0.18, 0.48), (0.52, 0.80))   # 枠の高さに対する縦の範囲（上半身、下半身）。横は中央の 4 割
+APP_DIM = len(APP_REGIONS) * (APP_HUE_BINS + 3)
+
+
+def box_appearance(img: np.ndarray, box: Iterable[float]) -> np.ndarray:
+    """BGR の画像の枠（x0, y0, x1, y1 [px]）の中の色の割合（長さ ``APP_DIM``、uint8）。枠が小さすぎれば 0。"""
+    x0, y0, x1, y1 = (float(v) for v in box)
+    w, h = x1 - x0, y1 - y0
+    out = np.zeros(APP_DIM, np.uint8)
+    if w < 4 or h < 8:
+        return out
+    n = APP_HUE_BINS + 3
+    for k, (a, b) in enumerate(APP_REGIONS):
+        xa, xb = int(round(x0 + 0.3 * w)), int(round(x0 + 0.7 * w))
+        ya, yb = int(round(y0 + a * h)), int(round(y0 + b * h))
+        crop = img[max(ya, 0):max(yb, 0), max(xa, 0):max(xb, 0)]
+        if crop.size < 12:
+            continue
+        hsv = cv2.cvtColor(np.ascontiguousarray(crop), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        colored = (hsv[:, 1] >= 70) & (hsv[:, 2] >= 60)
+        hist = np.zeros(n)
+        hist[:APP_HUE_BINS] = np.bincount((hsv[colored, 0].astype(int) * APP_HUE_BINS) // 180,
+                                          minlength=APP_HUE_BINS)[:APP_HUE_BINS]
+        v = hsv[~colored, 2]
+        hist[APP_HUE_BINS:] = [(v < 70).sum(), ((v >= 70) & (v < 170)).sum(), (v >= 170).sum()]
+        out[k * n:(k + 1) * n] = np.round(255 * hist / max(hist.sum(), 1.0))
+    return out
+
+
+def encode_appearance(feat: np.ndarray) -> str:
+    return np.asarray(feat, np.uint8).tobytes().hex()
+
+
+def decode_appearance(col: Iterable[Any]) -> np.ndarray:
+    """``people.csv`` の ``app``（16 進の文字列）の列を (n, ``APP_DIM``) の 0〜1 に戻す。空・形の違う行は NaN。"""
+    col = list(col)
+    out = np.full((len(col), APP_DIM), np.nan)
+    for i, s in enumerate(col):
+        if isinstance(s, str) and len(s) == 2 * APP_DIM:
+            v = np.frombuffer(bytes.fromhex(s), np.uint8)
+            if v.any():
+                out[i] = v / 255.0
+    return out
+
+
+def detect_people(frames: Iterable[tuple[int, float, np.ndarray]], detector: PersonDetector, scale: float = 1.0,
+                  appearance: bool = False) -> pd.DataFrame:
+    """コマごとに人を検出する。``scale`` は元の解像度に対する画像の縮小率（枠は元の解像度に直す）。
+
+    ``appearance`` が真なら、枠の中の色（``box_appearance``）を ``app`` の列に 16 進の文字列で入れる。
+    """
     rows = []
     for i, t, img in frames:
         for x0, y0, x1, y1, s in detector.detect(img):
-            rows.append((i, t, x0 / scale, y0 / scale, x1 / scale, y1 / scale, s))
-    return pd.DataFrame(rows, columns=["frame", "t", "x0", "y0", "x1", "y1", "score"])
+            row = (i, t, x0 / scale, y0 / scale, x1 / scale, y1 / scale, s)
+            rows.append(row + (encode_appearance(box_appearance(img, (x0, y0, x1, y1))),) if appearance else row)
+    return pd.DataFrame(rows, columns=["frame", "t", "x0", "y0", "x1", "y1", "score"] + (["app"] if appearance else []))
 
 
 def add_court_positions(people: pd.DataFrame, camera: Camera) -> pd.DataFrame:
@@ -332,27 +387,42 @@ def track_players(people: pd.DataFrame, frame_t: pd.Series, cfg: dict[str, Any],
         frame_t: 検出したコマの番号 → 時刻 [s]（人が 1 人もいないコマも含める。抜けを補うのに使う）
     """
     o = o or PlayerOptions()
+    if o.per_side != 1:
+        from smash_speed.player_ids import track_sides
+
+        return track_sides(people, frame_t, cfg, o)[0]
+    return _track_singles(people, frame_t, cfg, o, SIDES)
+
+
+def _track_singles(people: pd.DataFrame, frame_t: pd.Series, cfg: dict[str, Any], o: PlayerOptions,
+                   sides: Iterable[str]) -> pd.DataFrame:
+    """側ごとに 1 人を、コートの中にいた点の多い軌跡の組で選ぶ（シングルスの追跡）。"""
     out = []
-    for side in SIDES:
+    for side in sides:
         region, weight = side_region(people, side, cfg, o)
         cand = people[region].assign(weight=weight[region]).reset_index(drop=True)
-        for player in range(o.per_side):
-            if cand.empty:
-                break
-            cand["tid"] = link_tracklets(cand, o)
-            g = cand.groupby("tid")
-            spans = pd.DataFrame({"t0": g["t"].min(), "t1": g["t"].max(), "weight": g["weight"].sum()})
-            spans = spans[spans["t1"] - spans["t0"] >= o.min_track_s].rename_axis("id").reset_index()
-            chosen = choose_tracklets(spans, o.max_overlap_s)
-            if not chosen:
-                break
-            pick = cand["tid"].isin(chosen)
-            # 同じコマに 2 つ残ったとき（軌跡の境目）は重みの大きい方
-            track = cand[pick].sort_values("weight", ascending=False).drop_duplicates("frame")
-            track = _fill_gaps(track.drop(columns=["tid", "weight"]), frame_t, o)
-            out.append(track.assign(side=side, player=player))
-            # ダブルスの 2 人目は、1 人目に使った検出を除いて選び直す
-            cand = cand[~pick].drop(columns="tid").reset_index(drop=True)
+        if "app" in cand:
+            cand = cand.drop(columns="app")
+        if cand.empty:
+            continue
+        cand["tid"] = link_tracklets(cand, o)
+        chosen = choose_tracklets(tracklet_spans(cand, o), o.max_overlap_s)
+        if not chosen:
+            continue
+        # 同じコマに 2 つ残ったとき（軌跡の境目）は重みの大きい方
+        track = cand[cand["tid"].isin(chosen)].sort_values("weight", ascending=False).drop_duplicates("frame")
+        out.append(_fill_gaps(track.drop(columns=["tid", "weight"]), frame_t, o).assign(side=side, player=0))
+    return _player_table(out)
+
+
+def tracklet_spans(cand: pd.DataFrame, o: PlayerOptions) -> pd.DataFrame:
+    """軌跡（``cand`` の ``tid``）ごとの始まり・終わりの時刻と重みの合計（``min_track_s`` より短いものは除く）。"""
+    g = cand.groupby("tid")
+    spans = pd.DataFrame({"t0": g["t"].min(), "t1": g["t"].max(), "weight": g["weight"].sum()})
+    return spans[spans["t1"] - spans["t0"] >= o.min_track_s].rename_axis("id").reset_index()
+
+
+def _player_table(out: list[pd.DataFrame]) -> pd.DataFrame:
     if not out:
         return pd.DataFrame(columns=PLAYER_COLUMNS)
     res = pd.concat(out, ignore_index=True)
@@ -412,10 +482,16 @@ def ground_jumps(players: pd.DataFrame, camera: Camera, o: PlayerOptions | None 
     return out
 
 
-def coverage(players: pd.DataFrame, n_frames: int, per_side: int = 1) -> dict[str, float]:
-    """側ごとの、選手の位置が出たコマの割合（補ったコマも含む）。"""
-    n = max(1, n_frames * per_side)
-    return {side: round(float((players["side"] == side).sum()) / n, 4) for side in SIDES}
+def coverage(players: pd.DataFrame, n_frames: int, per_side: int | dict[str, int] = 1) -> dict[str, float]:
+    """側ごとの、選手の位置が出たコマの割合（補ったコマも含む）。``per_side`` は 1 側の人数（側ごとに違えば {側: 人数}）。"""
+    per = per_side if isinstance(per_side, dict) else {side: per_side for side in SIDES}
+    return {side: round(float((players["side"] == side).sum()) / max(1, n_frames * max(1, per.get(side, 1))), 4)
+            for side in SIDES}
+
+
+def players_per_side(players: pd.DataFrame) -> dict[str, int]:
+    """``players.csv`` の側ごとの人数（その側の ``player`` の種類の数）。"""
+    return {side: int(players.loc[players["side"] == side, "player"].nunique()) for side in SIDES}
 
 
 # =============================================================================
