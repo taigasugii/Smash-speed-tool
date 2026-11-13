@@ -12,6 +12,7 @@
 - 動画 1 本のすべてのショットの種類と初速（GUI の「ショットの一覧」、`smash-speed shots`）と、種類の正解ラベル付け
 - ラリーの区切り・統計・1 枚のレポート・日ごとの記録の推移
 - 選手の位置と動き（`--players`。`pip install -e ".[gpu]"` が要る）
+- ダブルス：4 人を同じ番号のまま追い、誰が打ったか・前後と横並びの陣形・ローテーション・2 人の間を出す（`--players` で自動。`docs/doubles.md`）
 - 横から撮ったスイングのフォームの解析と、関節・打点のラベル付け（姿勢推定のモデルは任意で入れる）
 
 ## 処理の流れ
@@ -701,6 +702,8 @@ python -m smash_speed.shot_list data\IMG_4397.MOV --calib out\calibration.json -
 かかる時間の目安は `docs/speed.md`。4K 30 fps で選手つきなら動画の長さの約 2〜2.6 倍、30 分の動画で約 1 時間）、
 `stats.json`・`landing.svg`（ラリーの統計と着地点の分布図、下の「ラリーの統計」）、
 `report.html`（1 枚のレポート、下の「1 本の動画のレポート」）を書き出す。
+`--players` で 1 つのコートに 2 人ずつ選手がいたときは、`doubles.json`・`formation.csv` と、`shots.csv` の
+`hitter_id`（打った人。P1〜P4）・`hitter_conf`・`formation`・`opp_formation` も書く（下の「ダブルス」）。
 `smash-speed shots --video <動画> --calib <calibration.json> --out <出力先>` でも同じことができる（GUI はこれを裏で動かす）。
 GUI の「ショットの一覧」の画面はこれを読む（出力先は `<出力の場所>\<動画の名前>_shots`）。
 
