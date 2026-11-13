@@ -321,7 +321,7 @@ def tracking_scores(players: pd.DataFrame, people: pd.DataFrame, n_frames: int) 
     """番号の付き方の答え合わせ（側ごと）。
 
     ``id_accuracy``：その側の選手を追ったコマのうち、番号が正解の人と合っていた割合（番号と人の対応は合う方）。
-    ``switches``：1 つの番号が追う人が入れ替わった回数。``extra_share``：選手ではない人を追ったコマの割合。
+    ``switches``：1 つの番号が追う人が入れ替わった回数（0.3 秒より短いものは数えない）。``extra_share``：選手ではない人を追ったコマの割合。
     ``coverage``：選手ごとの、追えたコマの割合の平均。``mapping``：番号 → 正解の人。
     """
     tr = who_is_tracked(players, people)
@@ -338,8 +338,12 @@ def tracking_scores(players: pd.DataFrame, people: pd.DataFrame, n_frames: int) 
                 best, mapping = ok, m
         switches = 0
         for _, gp in mine.sort_values("frame").groupby("player"):
-            w = gp["who"].to_numpy()
-            switches += int(np.sum(w[1:] != w[:-1]))
+            # 0.3 秒より短い間だけ別の人になったコマ（2 人が 1 つの枠にまとまったコマなど）は数えない
+            w, tt = gp["who"].to_numpy(), gp["t"].to_numpy(float)
+            start = np.r_[0, np.flatnonzero(w[1:] != w[:-1]) + 1]
+            end = np.r_[start[1:], len(w)]
+            runs = [w[a] for a, b in zip(start, end) if tt[b - 1] - tt[a] >= 0.3]
+            switches += sum(x != y for x, y in zip(runs[:-1], runs[1:]))
         out[side] = {"n": int(len(g)), "id_accuracy": round(best / max(1, len(mine)), 4), "switches": switches,
                      "extra_share": round(1.0 - len(mine) / max(1, len(g)), 4),
                      "coverage": round(float(np.mean([(mine["who"] == nm).sum() / max(1, n_frames) for nm in names])), 4),

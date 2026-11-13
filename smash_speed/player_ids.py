@@ -3,10 +3,11 @@
 シングルスの追跡（``players._track_singles``）は「コートの中にいた点の多い軌跡の組」を 1 人分選ぶだけで、
 2 人目は残りの検出から選び直していた。これだと 2 人がすれ違う・重なるたびに番号が入れ替わる。ここでは 3 段階で決める。
 
-1. どの検出が選手か（``choose_chains``）：近いコマどうしをつないだ短い軌跡（``players.link_tracklets``）から、
-   時間が重ならない並びを **2 本同時に** 選ぶ。重みは「コートの中にいた点の数」、並びの中のつなぎには
-   「画像の上で動ける範囲か」と離れ具合の費用を付け、合計が最も良い 2 本を最小費用流（線形計画）で出す。
-   待っている人・隣のコートの人は、コートの中にいる時間が短く、選手の軌跡と時間が重なるので選ばれない。
+1. どの検出が選手か（``choose_chains``）：近いコマどうしをつないだ短い軌跡（``players.link_tracklets``）を、
+   別の人に乗り移った所（1 コマで大きく飛んだ・枠の中の色が変わった）で切ってから（``split_impure``）、
+   時間が重ならない並びを **2 本同時に** 選ぶ。重みは「コートの線の中にいた時間」（線の外にいた時間は少しだけ数える）、
+   並びの中のつなぎには「画像の上で動ける範囲か」と離れ具合の費用を付け、合計が最も良い 2 本を最小費用流（線形計画）で出す。
+   待っている人・隣のコートの人は、線の外にいるので重みがほとんどなく、選手の軌跡と時間が重なるので選ばれない。
 2. どちらがどちらか（``resolve_identities``）：2 本の並びは、2 人が重なった所・片方が相手の近くで消えた所・
    長く見えなかった所（「入れ替わりうる所」）で入れ替わっているかもしれない。入れ替わりうる所で区切った区間ごとに
    「そのまま・入れ替え」を、(a) 区切りの前後の動き（位置と速さの続き具合）と (b) 枠の中の色（``people.csv`` の ``app``。
@@ -30,7 +31,7 @@ from scipy.optimize import linprog
 from scipy.sparse import coo_matrix
 
 from smash_speed.players import (SIDES, PlayerOptions, _fill_gaps, _player_table, _track_singles, decode_appearance,
-                                 link_tracklets, side_region, tracklet_spans)
+                                 link_tracklets, side_region)
 
 PLAYER_LABELS = {("h", 0): "P1", ("h", 1): "P2", ("o", 0): "P3", ("o", 1): "P4"}
 
@@ -44,11 +45,20 @@ def player_label(side: str, player: int) -> str:
 class IdOptions:
     """2 人を同じ番号のまま追う条件。距離は画像の上の足元の距離を枠の高さで割ったもの（``players.link_tracklets`` と同じ）。"""
 
-    # どの検出が選手か（最小費用流）
+    # 近いコマどうしをつなぐとき（``link_with_motion``）
+    predict_s: float = 0.2        # 軌跡の速さで先を見越す長さの上限 [s]（0 なら ``players.link_tracklets`` と同じ）
+    vel_blend: float = 0.5        # 速さの見積もりに、新しい 1 コマの動きを混ぜる割合
+    # 軌跡を切る所（別の人に乗り移った所）
+    split_jump_h: float = 0.25    # 1 コマの動きが、前のコマの動きからこれより大きく変わったら切る
+    split_app: float = 0.8        # 前後 ``split_app_n`` コマの色の中央値の差（割合の差の合計。0〜4）がこれより大きければ切る
+    split_app_n: int = 7
+    # どの検出が選手か（最小費用流）。重み・費用の単位は「コートの中にいた秒数 × 検出のスコア」
+    outside_cap_s: float = 0.1    # 1 本の軌跡で、線の外にいた分として数える重みの上限
+    track_cost: float = 0.12      # 軌跡 1 本を選ぶ費用（線の外にしかいない軌跡は選ばない）
     link_gap_s: float = 2.0       # これより短い途切れは、動ける範囲の中の軌跡にだけつなぐ。長ければどこへでもつなげる
-    link_cost: float = 4.0        # つなぎの離れ具合（動ける範囲いっぱいで 1）にかける費用（重み = 点の数 と同じ単位）
-    gap_cost: float = 2.0         # 途切れの長さ [s] にかける費用
-    idle_cost: float = 1.0        # 長い途切れの後につなぐ費用
+    link_cost: float = 0.15       # つなぎの離れ具合（動ける範囲いっぱいで 1）にかける費用
+    gap_cost: float = 0.07        # 途切れの長さ [s] にかける費用
+    idle_cost: float = 0.03       # 長い途切れの後につなぐ費用
     # 入れ替わりうる所
     contact_h: float = 0.5        # 2 人の足元がこれより近いコマは重なっている
     contact_iou: float = 0.4      # 2 人の枠の重なり（IoU）がこれより大きいコマも重なっている
@@ -61,6 +71,7 @@ class IdOptions:
     motion_sigma_h: float = 0.35  # 位置の続き具合の許す幅（区切りの長さ 0 のとき）
     motion_speed_h: float = 1.5   # 区切りが長いほど広げる分 [枠の高さ/s]
     stay_prior: float = 0.5       # 手がかりがないときに「そのまま」を選ぶ分（対数の比）
+    same_track: float = 5.0       # 区切りの前後が同じ軌跡（コマごとに続けて追えていた）のときに「そのまま」に足す分
     max_logodds: float = 8.0
     # 色
     min_clean: int = 4            # 区間の色を出すのに要る、重なっていないコマの数
@@ -80,6 +91,108 @@ class IdOptions:
 # =============================================================================
 # 1. どの検出が選手か
 # =============================================================================
+def link_with_motion(cand: pd.DataFrame, o: PlayerOptions, ido: IdOptions | None = None) -> np.ndarray:
+    """``players.link_tracklets`` と同じつなぎ方で、軌跡の速さから見越した位置との距離で割り当てる。
+
+    最後の位置との距離だけで割り当てると、止まっている人が隠れた所を別の人が通ったとき、通った人の検出が
+    止まっていた人の軌跡につながる。速さを見越すと、動いている人の検出は動いている軌跡につながりやすい。
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    ido = ido or IdOptions()
+    ids = np.full(len(cand), -1, int)
+    active: list[list[float]] = []   # [軌跡の番号, 最後の時刻, u, v, 枠の高さ, 速さ u, 速さ v]
+    next_id = 0
+    frames = cand["frame"].to_numpy()
+    ts = cand["t"].to_numpy(float)
+    xy = np.column_stack([cand[["u", "v"]].to_numpy(float), (cand["y1"] - cand["y0"]).to_numpy(float)])
+    order = np.argsort(frames, kind="stable")
+    bounds = np.flatnonzero(np.diff(frames[order])) + 1
+    for rows in np.split(order, bounds):
+        if not len(rows):
+            continue
+        t = ts[rows[0]]
+        active = [a for a in active if t - a[1] <= o.max_gap_s]
+        used = set()
+        if active:
+            last = np.array([a[2:] for a in active])
+            dt = t - np.array([a[1] for a in active])
+            pred = last[:, :2] + last[:, 3:5] * np.minimum(dt, ido.predict_s)[:, None]
+            scale = (last[:, None, 2] + xy[rows][None, :, 2]) / 2
+            cost = np.linalg.norm(pred[:, None, :] - xy[rows][None, :, :2], axis=2) / scale
+            gate = o.gate_h + o.max_speed_h * dt
+            big = 1e6
+            c = np.where(cost <= gate[:, None], cost, big)
+            for ai, ri in zip(*linear_sum_assignment(c)):
+                if c[ai, ri] >= big:
+                    continue
+                r = rows[ri]
+                a = active[ai]
+                ids[r] = int(a[0])
+                step = (xy[r, :2] - np.array(a[2:4])) / max(dt[ai], 1e-6)
+                vel = (1 - ido.vel_blend) * np.array(a[5:7]) + ido.vel_blend * step if dt[ai] <= ido.predict_s else step * 0
+                active[ai][1:] = [t, *xy[r], *vel]
+                used.add(ri)
+        for ri, r in enumerate(rows):
+            if ri not in used:
+                ids[r] = next_id
+                active.append([next_id, t, *xy[r], 0.0, 0.0])
+                next_id += 1
+    return ids
+
+
+def split_impure(cand: pd.DataFrame, tid: np.ndarray, ido: IdOptions | None = None) -> np.ndarray:
+    """軌跡が別の人に乗り移った所で切り、付け直した軌跡の番号を返す。
+
+    近いコマどうしをつなぐだけだと、止まっている人の前を選手が通って隠したときなどに、軌跡が別の人へ移る。
+    (a) 1 コマの動き（枠の高さが単位）が前のコマの動きから ``split_jump_h`` より大きく変わった所と、
+    (b) 色（``app``）の前後 ``split_app_n`` コマの中央値が ``split_app`` より大きく違う所（その山の頂）で切る。
+    """
+    ido = ido or IdOptions()
+    out = np.asarray(tid).copy()
+    nxt = int(out.max()) + 1 if len(out) else 0
+    app = decode_appearance(cand["app"]) if "app" in cand else None
+    order = np.lexsort((cand["frame"].to_numpy(), out))
+    bounds = np.flatnonzero(np.diff(out[order])) + 1
+    uv = cand[["u", "v"]].to_numpy(float)
+    hh = np.maximum((cand["y1"] - cand["y0"]).to_numpy(float), 1.0)
+    n_app = ido.split_app_n
+    for rows in np.split(order, bounds):
+        if len(rows) < 4:
+            continue
+        step = np.diff(uv[rows], axis=0) / hh[rows][1:, None]
+        cut = np.zeros(len(rows), bool)             # cut[i]：i 番目の行から新しい軌跡
+        cut[2:] = np.hypot(*np.diff(step, axis=0).T) > ido.split_jump_h
+        # 1 コマだけの外れ（次のコマで戻る）は切らない：続けて 2 つ切れる所は外れとみなす
+        both = cut[:-1] & cut[1:]
+        cut[:-1][both] = False
+        cut[1:][both] = False
+        if app is not None and len(rows) >= 2 * n_app:
+            a = pd.DataFrame(app[rows])
+            before = a.rolling(n_app, min_periods=n_app).median().shift(1).to_numpy()
+            after = a[::-1].rolling(n_app, min_periods=n_app).median()[::-1].to_numpy()
+            d = np.nan_to_num(np.abs(before - after).sum(axis=1))
+            for i0, i1 in _runs(d > ido.split_app):
+                cut[i0 + int(np.argmax(d[i0:i1]))] = True
+        for i in np.flatnonzero(cut):
+            out[rows[i:]] = nxt
+            nxt += 1
+    return out
+
+
+def chain_spans(cand: pd.DataFrame, o: PlayerOptions, ido: IdOptions) -> pd.DataFrame:
+    """軌跡ごとの始まり・終わりと、並びを選ぶときの重み [s]：線の中にいた時間 × スコア ＋ 線の外の分（上限つき）− 選ぶ費用。"""
+    ft = cand.drop_duplicates("frame").sort_values("frame")["t"].to_numpy(float)
+    dt = float(np.median(np.diff(ft))) if len(ft) > 1 else 1.0
+    inside = cand["weight"].to_numpy(float) > o.outside_weight * cand["score"].to_numpy(float) + 1e-9
+    w = cand["weight"].to_numpy(float) * dt
+    g = pd.DataFrame({"tid": cand["tid"].to_numpy(), "t": cand["t"].to_numpy(float), "win": np.where(inside, w, 0.0),
+                      "wout": np.where(inside, 0.0, w)}).groupby("tid")
+    spans = pd.DataFrame({"t0": g["t"].min(), "t1": g["t"].max(),
+                          "weight": g["win"].sum() + np.minimum(g["wout"].sum(), ido.outside_cap_s) - ido.track_cost})
+    return spans[spans["t1"] - spans["t0"] >= o.min_track_s].rename_axis("id").reset_index()
+
+
 def choose_chains(cand: pd.DataFrame, o: PlayerOptions, ido: IdOptions | None = None, k: int = 2) -> list[list[int]]:
     """軌跡（``cand`` の ``tid``）から、時間が重ならない並びを ``k`` 本、重みの合計 − つなぎの費用が最も良くなるよう選ぶ。
 
@@ -87,7 +200,7 @@ def choose_chains(cand: pd.DataFrame, o: PlayerOptions, ido: IdOptions | None = 
     の中のときだけ、それより長ければいつでもつなげる。選んだ軌跡の番号の並び（時刻の順）を、重みの大きい順に返す。
     """
     ido = ido or IdOptions()
-    spans = tracklet_spans(cand, o).sort_values(["t0", "t1"]).reset_index(drop=True)
+    spans = chain_spans(cand, o, ido).sort_values(["t0", "t1"]).reset_index(drop=True)
     n = len(spans)
     if n == 0:
         return []
@@ -181,6 +294,9 @@ def _dense(rows: pd.DataFrame, frames: np.ndarray) -> dict[str, np.ndarray]:
         out[c] = a
     out["h"] = out["y1"] - out["y0"]
     out["present"] = np.isfinite(out["u"])
+    out["tid"] = np.full(len(frames), -1)
+    if "tid" in rows:
+        out["tid"][pos] = rows["tid"].to_numpy()
     app = np.full((len(frames), 0), np.nan)
     if "app" in rows:
         f = decode_appearance(rows["app"])
@@ -251,32 +367,45 @@ def _edge_state(s: dict[str, np.ndarray], t: np.ndarray, i0: int, i1: int, tail:
     edge = near[-3:] if tail else near[:3]
     pos = np.array([np.median(s["u"][edge]), np.median(s["v"][edge])])
     vel = np.zeros(2)
-    if tail and len(near) >= 3 and t[near[-1]] > t[near[0]]:
+    if len(near) >= 3 and t[near[-1]] > t[near[0]]:
         vel = np.array([np.polyfit(t[near], s[c][near], 1)[0] for c in ("u", "v")])
     return pos, vel, float(np.median(s["h"][edge])), float(np.median(t[edge]))
 
 
 def _motion_logodds(a: dict[str, np.ndarray], b: dict[str, np.ndarray], t: np.ndarray, seg0: tuple[int, int],
                     seg1: tuple[int, int], ido: IdOptions) -> float:
-    """区切りをはさんだ 2 区間で「そのまま」が「入れ替え」よりどれだけありそうか（対数の比。＋ならそのまま）。"""
+    """区切りをはさんだ 2 区間で「そのまま」が「入れ替え」よりどれだけありそうか（対数の比。＋ならそのまま）。
+
+    区切りの前の位置と速さから後の位置を見越したずれと、後の位置と速さから前の位置を見越したずれの両方で比べる
+    （区切りの間に走り出した人は、前からだけ見越すと止まっていた人と取り違える）。
+    """
     before = [_edge_state(s, t, *seg0, True, ido) for s in (a, b)]
     after = [_edge_state(s, t, *seg1, False, ido) for s in (a, b)]
     num = 0.0
     used = False
-    for k in (0, 1):
-        if before[k] is None or after[0] is None or after[1] is None:
-            continue
-        pos, vel, h, tb = before[k]
-        dur = max(0.0, min(after[0][3], after[1][3]) - tb)
-        pred = pos + vel * min(dur, ido.vel_horizon_s)
-        sig = (ido.motion_sigma_h + ido.motion_speed_h * dur) * max(h, 1.0)
-        stay = float(np.sum((pred - after[k][0]) ** 2))
-        cross = float(np.sum((pred - after[1 - k][0]) ** 2))
-        num += (cross - stay) / (2 * sig * sig)
-        used = True
+    for src, dst, sign in ((before, after, 1.0), (after, before, -1.0)):
+        for k in (0, 1):
+            if src[k] is None or dst[0] is None or dst[1] is None:
+                continue
+            pos, vel, h, ts = src[k]
+            dur = max(0.0, sign * (dst[k][3] - ts))
+            pred = pos + sign * vel * min(dur, ido.vel_horizon_s)
+            sig = (ido.motion_sigma_h + ido.motion_speed_h * dur) * max(h, 1.0)
+            stay = float(np.sum((pred - dst[k][0]) ** 2))
+            cross = float(np.sum((pred - dst[1 - k][0]) ** 2))
+            num += (cross - stay) / (2 * sig * sig) / 2     # 前向き・後ろ向きは同じ動きを 2 度見ているので半分ずつ
+            used = True
+    # 区切りの間も同じ軌跡で追えていた人がいれば、その人は入れ替わっていない（軌跡は ``split_impure`` で
+    # 飛んだ所を切ってある。区切りの前後の位置だけだと、すれ違いは入れ替わったように見える）
+    same = 0.0
+    for s in (a, b):
+        i0 = np.flatnonzero(s["present"][seg0[0]:seg0[1]])
+        i1 = np.flatnonzero(s["present"][seg1[0]:seg1[1]])
+        if len(i0) and len(i1) and s["tid"][seg0[0] + i0[-1]] == s["tid"][seg1[0] + i1[0]] >= 0:
+            same = ido.same_track
     if not used:
-        return ido.stay_prior
-    return float(np.clip(num, -ido.max_logodds, ido.max_logodds)) + ido.stay_prior
+        return ido.stay_prior + same
+    return float(np.clip(num, -ido.max_logodds, ido.max_logodds)) + ido.stay_prior + same
 
 
 def _appearance_scores(feats: list[list[np.ndarray | None]], ido: IdOptions) -> tuple[np.ndarray, dict[str, Any]]:
@@ -358,7 +487,7 @@ def resolve_identities(slots: list[pd.DataFrame], frame_t: pd.Series, ido: IdOpt
     if len(segs) > 1:
         dist, iou = _pair_distance(a, b)
         with np.errstate(invalid="ignore"):
-            clean = ~ev & ~(dist < 2 * ido.contact_h) & (iou < 0.05)
+            clean = ~ev & (iou < 0.05)                 # 2 人の枠が重なっていないコマの色だけを使う
         feats: list[list[np.ndarray | None]] = []
         for i0, i1 in segs:
             fk: list[np.ndarray | None] = []
@@ -415,7 +544,8 @@ def track_pair(cand: pd.DataFrame, frame_t: pd.Series, o: PlayerOptions, ido: Id
     if cand.empty:
         return [], info
     cand = cand.reset_index(drop=True)
-    cand["tid"] = link_tracklets(cand, o)
+    linked = link_with_motion(cand, o, ido) if ido.predict_s > 0 else link_tracklets(cand, o)
+    cand["tid"] = split_impure(cand, linked, ido)
     chains = choose_chains(cand, o, ido, 2)
     info["n_chains"] = len(chains)
     # 同じコマに 2 つ残ったとき（軌跡の境目）は重みの大きい方
