@@ -245,6 +245,7 @@ def test_shot_list_flow(client, tmp_path):
         v = client.get("/api/shot_view", query_string={"i": k}).get_json()
         assert v["ok"] and v["court"] and v["image_size"]
         assert v["t_hit_s"] < v["t_end_s"] and v["frame"] >= 0
+        assert v["people"] == [] and not s["hitter_id"]  # ダブルスでなければ、選手の立ち位置は出さない
         # 場面を前後に送れる・再生するコマ（B5c2）：打つ 0.8 秒前から次の打球まで、時刻の順。見えたコマは検出と同じ点
         fr = v["frames"]
         assert v["frame"] in [f[0] for f in fr] and np.all(np.diff([f[1] for f in fr]) > 0)

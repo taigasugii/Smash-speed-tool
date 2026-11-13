@@ -539,17 +539,29 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
             yield i, t, img
 
     t0 = time.time()
-    people = detect_people(_with_progress(remember(frames), n_total, progress), detector, scale)
+    # 枠の中の色は、ダブルスで 2 人を見分けるのに使う（シングルスと決めてあるときは要らない）
+    people = detect_people(_with_progress(remember(frames), n_total, progress), detector, scale,
+                           appearance=o.per_side != 1)
     elapsed = time.time() - t0
     people = add_court_positions(people, camera)
     people.to_csv(out_dir / PEOPLE_FILE, index=False, float_format="%.4f")
     frame_t = pd.Series(seen, dtype=float).sort_index()
-    players = ground_jumps(track_players(people, frame_t, cfg, o), camera, o)
+    doubles_info = None
+    if o.per_side != 1:
+        from smash_speed.player_ids import track_sides
+
+        tracked, doubles_info = track_sides(people, frame_t, cfg, o)
+    else:
+        tracked = track_players(people, frame_t, cfg, o)
+    players = ground_jumps(tracked, camera, o)
+    per_side = players_per_side(players)
     players.to_csv(out_dir / PLAYERS_FILE, index=False, float_format="%.4f")
     info = {
         "video": str(Path(video).resolve()), "calib": str(Path(calib).resolve()),
         "start_s": start_s, "end_s": end_s, "n_frames": len(frame_t), "n_people": len(people),
-        "coverage": coverage(players, len(frame_t), o.per_side),
+        "coverage": coverage(players, len(frame_t), per_side),
+        "per_side": per_side,        # 側ごとの人数（2 ならダブルスとして追った）
+        "doubles": doubles_info,     # ダブルスの追跡の確かめ用の数（``per_side`` が 1 のときは None）
         "airborne": {s: round(float(players["airborne"][players["side"] == s].mean()), 4) if (players["side"] == s).any()
                      else 0.0 for s in SIDES},
         "provider": detector.provider,
@@ -634,11 +646,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--model", choices=list(MODELS), default=DEFAULT_MODEL)
     ap.add_argument("--stride", type=int, default=1, help="何コマごとに検出するか")
     ap.add_argument("--doubles", action="store_true", help="ダブルス（1 側 2 人）")
+    ap.add_argument("--auto", action="store_true", help="シングルスかダブルスかを側ごとに自動で決める")
     ap.add_argument("--device", choices=["auto", "gpu", "cpu"], default=None)
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
-    o = PlayerOptions(model=a.model, stride=max(1, a.stride), per_side=2 if a.doubles else 1)
+    o = PlayerOptions(model=a.model, stride=max(1, a.stride), per_side=2 if a.doubles else 0 if a.auto else 1)
     info = analyze_players(a.video, a.calib, a.out, cfg, o, a.start, a.end, a.capture_fps, a.device)
     print(f"{info['n_frames']} コマ（{info['provider']}、検出 {info['detect_s']} 秒）："
           f"手前 {info['coverage']['h']:.0%}・奥 {info['coverage']['o']:.0%} のコマで選手の位置が出ました → {a.out}")

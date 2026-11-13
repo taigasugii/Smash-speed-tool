@@ -76,6 +76,8 @@ class IdOptions:
     # 色
     min_clean: int = 4            # 区間の色を出すのに要る、重なっていないコマの数
     app_min_sep: float = 3.0      # 2 人の色の離れ具合（区間ごとのばらつきが単位）がこれより小さければ色を使わない
+                                  # （区間が少ないと偶然離れて見えるので、下限を 1 + 4 / 区間の数 倍にする）
+    app_min_segments: int = 4     # 2 人とも色の出た区間がこれより少なければ色を使わない
     app_cap: float = 12.0
     # 自動でダブルスとみなす条件（2 本目の選手について）
     auto_min_cover: float = 0.35  # 位置が出たコマの割合の下限
@@ -417,8 +419,9 @@ def _appearance_scores(feats: list[list[np.ndarray | None]], ido: IdOptions) -> 
     n = len(feats)
     zero = np.zeros(n)
     both = [k for k in range(n) if feats[k][0] is not None and feats[k][1] is not None]
-    if len(both) < 2:
+    if len(both) < ido.app_min_segments:
         return zero, {"used": False, "n_segments": len(both)}
+    min_sep = ido.app_min_sep * (1 + 4 / len(both))
     d = np.array([feats[k][0] - feats[k][1] for k in both])
     v = np.linalg.svd(d, full_matrices=False)[2][0]
     c = np.array([[np.nan if f is None else float(f @ v) for f in fk] for fk in feats])   # (区間, 並び)
@@ -434,8 +437,8 @@ def _appearance_scores(feats: list[list[np.ndarray | None]], ido: IdOptions) -> 
         mu_hi, mu_lo = float(np.median(hi)), float(np.median(lo))
         sig = 1.4826 * float(np.median(np.abs(np.r_[hi - mu_hi, lo - mu_lo]))) + 1e-4
         sep = (mu_hi - mu_lo) / sig
-        info = {"used": bool(sep >= ido.app_min_sep), "n_segments": len(both), "separation": round(sep, 2)}
-        if sep < ido.app_min_sep:
+        info = {"used": bool(sep >= min_sep), "n_segments": len(both), "separation": round(sep, 2)}
+        if sep < min_sep:
             return zero, info
 
         def ll(x: np.ndarray, mu: float) -> np.ndarray:
@@ -500,7 +503,7 @@ def resolve_identities(slots: list[pd.DataFrame], frame_t: pd.Series, ido: IdOpt
         stay = np.array([_motion_logodds(a, b, t, segs[k], segs[k + 1], ido) for k in range(len(segs) - 1)])
         state = _viterbi(unary, stay)
         info["n_swaps"] = int(np.sum(state[1:] != state[:-1]))
-    # コマごとの状態：区間の中はその区間の状態、区切りの中は 2 人がいちばん近づいたコマ（なければ真ん中）で切り替える
+    # コマごとの状態：区間の中はその区間の状態、区切りの中は途中のコマで切り替える
     per_frame = np.zeros(len(frames), int)
     if len(segs):
         per_frame[:segs[0][0]] = state[0]
@@ -512,8 +515,12 @@ def resolve_identities(slots: list[pd.DataFrame], frame_t: pd.Series, ido: IdOpt
             j0, j1 = i1, segs[k + 1][0]
             cut = (j0 + j1) // 2
             if state[k] != state[k + 1] and j1 > j0:
+                # 切り替えるコマ：どちらかが見えていなかった間の真ん中。2 人とも見えていたなら、いちばん近づいたコマ
+                gone = np.flatnonzero(~(a["present"][j0:j1] & b["present"][j0:j1]))
                 d, _ = _pair_distance(a, b)
-                if np.isfinite(d[j0:j1]).any():
+                if len(gone):
+                    cut = j0 + int(gone[len(gone) // 2])
+                elif np.isfinite(d[j0:j1]).any():
                     cut = j0 + int(np.nanargmin(d[j0:j1]))
             per_frame[j0:cut] = state[k]
             per_frame[cut:j1] = state[k + 1]

@@ -21,6 +21,9 @@
   このときは ``shots.csv`` の ``hitter_x_m``・``hitter_y_m`` に打つ人の足元も入れ（``hitter.attach_hitters``）、
   当てはめの前に出して打点の手がかりにもする（``hitter_prior``。``shot_fit.fit_shots`` の ``hitter_xy``）
 - ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
+- ``doubles.json``・``formation.csv``：ダブルスのまとめ（誰が打ったか・陣形・ローテーション・2 人の間）と、コマごとの陣形
+  （``players=True`` で、1 側に 2 人の選手がいたときだけ。``doubles``）。このときは ``shots.csv`` の ``hitter_id``（P1〜P4）・
+  ``hitter_conf``・``formation``・``opp_formation`` も入れる
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -30,7 +33,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -42,6 +45,7 @@ from smash_speed.calibration.io import load_calibration
 from smash_speed.camera import Camera
 from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
+from smash_speed.doubles import assign_doubles, doubles_brief, pair_sides, prefit_feet, write_doubles
 from smash_speed.hitter import attach_hitters, hitter_at
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
@@ -79,6 +83,7 @@ class ShotListOptions:
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
     players: bool = False             # 選手の位置も出す（``players.analyze_players``。人の検出のモデルを使うので遅くなる）
     player_options: PlayerOptions | None = None
+    doubles: str = "auto"             # 1 側の人数：auto（側ごとに自動で決める）| on（ダブルス）| off（シングルス）
     hitter_prior: bool = True         # 選手の位置があれば、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     hit_players: bool = True          # 選手の位置があれば、打球を見つけるのにも使う（``find_hits`` の ``players``。
                                       # どちらの選手にも届かない所の打球を捨て、近い方を打った側にする）
@@ -401,8 +406,13 @@ def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], 
     part = det[(vis_t >= lo) & (vis_t <= hi)]
     feet = None
     if players is not None and not players.empty:
-        feet = [None if e is None else np.array([e.x, e.y])
-                for e in (hitter_at(players, h.t, h.side) for h in hs)]
+        if pair_sides(players):
+            # ダブルス：打った側の 2 人のうち、打った人が確かに選べた打球だけ、その人の足元を手がかりにする
+            feet = prefit_feet([h.t if h.t_track is None else h.t_track for h in hs], [h.side for h in hs],
+                               players, part, camera)
+        else:
+            feet = [None if e is None else np.array([e.x, e.y])
+                    for e in (hitter_at(players, h.t, h.side) for h in hs)]
     fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
                      max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
                      speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0),
@@ -544,12 +554,17 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     if players_info is not None:
         info["players"] = players_info
         if players is not None:
-            n = attach_hitters(shots, players)
+            if pair_sides(players):
+                n = assign_doubles(shots, players, det, camera, phys)["n"]
+            else:
+                n = attach_hitters(shots, players)
             write_shots(out / SHOTS_FILE, shots)
             info["players"]["n_hitters"] = n
             info["players"]["hitter_prior"] = o.hitter_prior
             progress(f"[進行] 打つ人の足元：{n} / {len(shots)} 本")
         rallies = rallies_with_players(shots, rallies, det, o, cfg, out, info, progress)
+        if players is not None:
+            doubles_step(shots, rallies, players, cfg, out, info, progress)
     info["elapsed_s"] = round(time.time() - t_start, 1)
     # レポートは shot_list.json を読むので先に書き、書き出しの時間を足して書き直す
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -589,6 +604,22 @@ def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFr
     return new
 
 
+def doubles_step(shots: list[Shot], rallies: list[Rally], players: pd.DataFrame, cfg: dict[str, Any], out: Path,
+                 info: dict[str, Any], progress: Callable[[str], None] = print) -> None:
+    """1 側に 2 人の選手がいたら、陣形・ローテーション・2 人の間を出して ``doubles.json``・``formation.csv`` を書き、
+    ``shots.csv`` を陣形つきで書き直す。いなければ、前の解析の ``doubles.json`` を消す。"""
+    movement = None
+    if (out / "movement.json").exists() and "movement" in info.get("players", {}):
+        movement = json.loads((out / "movement.json").read_text(encoding="utf-8"))
+    summary = write_doubles(out, shots, rallies, players, cfg.get("court"), movement)
+    if not summary:
+        return
+    write_shots(out / SHOTS_FILE, shots)
+    info["players"]["doubles"] = doubles_brief(summary)
+    h = summary["hitters"]
+    progress(f"[進行] ダブルス：打った人 {h['n']} / {h['n_shots']} 本（確かでないもの {h['n_low_conf']} 本）")
+
+
 def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: Callable[[str], None] = print
                  ) -> dict[str, Any]:
     """選手の位置を ``players.csv`` に書き、``shot_list.json`` に入れる要約を返す。
@@ -597,13 +628,16 @@ def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: C
     """
     progress("[進行] 選手を検出しています")
     try:
-        p = analyze_players(o.video, o.calib, out, cfg, o.player_options, o.start_s, o.end_s, o.capture_fps,
-                            progress=progress)
+        per_side = {"auto": 0, "on": 2, "off": 1}[o.doubles]
+        po = replace(o.player_options or PlayerOptions(), per_side=per_side)
+        p = analyze_players(o.video, o.calib, out, cfg, po, o.start_s, o.end_s, o.capture_fps, progress=progress)
     except Exception as e:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
         progress(f"[注意] 選手の位置は出せませんでした：{e}")
         return {"error": str(e)}
-    progress(f"[進行] 選手の位置：手前 {p['coverage']['h']:.0%}・奥 {p['coverage']['o']:.0%} のコマ")
-    return {k: p[k] for k in ("n_frames", "coverage", "provider", "detect_s", "movement") if k in p}
+    progress(f"[進行] 選手の位置：手前 {p['coverage']['h']:.0%}・奥 {p['coverage']['o']:.0%} のコマ"
+             + ("（ダブルスとして 2 人を追いました）" if max(p.get("per_side", {}).values(), default=0) >= 2 else ""))
+    return {"doubles_mode": o.doubles,
+            **{k: p[k] for k in ("n_frames", "coverage", "per_side", "provider", "detect_s", "movement") if k in p}}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -622,6 +656,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-audio", action="store_true", help="打球音を使わない")
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
+    ap.add_argument("--doubles", choices=["auto", "on", "off"], default="auto",
+                    help="--players のとき、1 側 2 人（ダブルス）として追うか（auto：側ごとに自動で決める）")
     ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
     ap.add_argument("--no-hit-players", action="store_true", help="打球を見つけるのに選手の位置を使わない")
     ap.add_argument("--detections", type=Path, default=None,
@@ -633,7 +669,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(a.config)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
-                                         players=a.players, hitter_prior=not a.no_hitter_prior,
+                                         players=a.players, doubles=a.doubles, hitter_prior=not a.no_hitter_prior,
                                          hit_players=not a.no_hit_players, detections=a.detections,
                                          tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")

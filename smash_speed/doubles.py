@@ -37,7 +37,7 @@ from smash_speed.camera import Camera
 from smash_speed.hitter import HitterOptions, hitter_at
 from smash_speed.movement import MovementOptions, movement_tracks
 from smash_speed.physics import PhysicsParams
-from smash_speed.player_ids import player_label
+from smash_speed.player_ids import _runs, player_label
 from smash_speed.rally_stats import DEPTH_NAMES, SVG_STYLE, WIDTH_NAMES, _court_lines, zone_of
 from smash_speed.shots import SHOT_TYPE_LABELS, Rally, Shot
 
@@ -298,8 +298,9 @@ def classify_formation(dx: np.ndarray, dy: np.ndarray, t: np.ndarray, o: Doubles
     if len(lab) > 1:
         start = np.r_[0, np.flatnonzero(np.diff(lab)) + 1]
         end = np.r_[start[1:], len(lab)]
+        dt = float(np.median(np.diff(t)))
         for a, b in zip(start[1:], end[1:]):
-            if t[b - 1] - t[a] < o.min_dwell_s:
+            if t[b - 1] - t[a] + dt < o.min_dwell_s:
                 lab[a:b] = lab[a - 1]
     return np.array(FORMATIONS, dtype=object)[lab]
 
@@ -319,8 +320,8 @@ def formation_table(players: pd.DataFrame, o: DoublesOptions | None = None, mo: 
     out = []
     for side in pairs:
         g = tracks[tracks["side"] == side]
-        a, b = (g[g["player"] == p].set_index("frame")[["t", "x", "y"]] for p in sorted(g["player"].unique())[:2])
-        j = a.join(b, how="inner", lsuffix="_a", rsuffix="_b").sort_values("t_a")
+        a, b = (g[g["player"] == p][["frame", "t", "x", "y"]] for p in sorted(g["player"].unique())[:2])
+        j = a.merge(b, on="frame", suffixes=("_a", "_b")).sort_values("t_a").set_index("frame")
         if j.empty:
             continue
         dx, dy = (j["x_a"] - j["x_b"]).to_numpy(float), (j["y_a"] - j["y_b"]).to_numpy(float)
@@ -411,8 +412,8 @@ def rotation_events(shots: list[Shot], table: pd.DataFrame, o: DoublesOptions | 
         t = w["t"].to_numpy(float)
         ok = (w["formation"] == target).to_numpy()
         seconds = None
-        for a, b in zip(*(np.flatnonzero(d) for d in (np.diff(np.r_[False, ok]) == 1, np.diff(np.r_[ok, False]) == -1))):
-            if t[b] - t[a] >= o.settle_s or b == len(t) - 1:
+        for a, b in _runs(ok):
+            if t[b - 1] - t[a] >= o.settle_s or b == len(t):
                 seconds = max(0.0, float(t[a] - s.t_hit_s))
                 break
         already = bool(ok[0])

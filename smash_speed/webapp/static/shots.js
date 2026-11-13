@@ -40,18 +40,23 @@ App.views.shots = {
           <input class="input" id="s1" type="number" step="0.1" min="0" style="width:90px"> 秒まで</span>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す</label>` : ""}
         <label class="row small"><input type="checkbox" id="players" ${info.players ? "checked" : ""}> 選手の立ち位置も記録する（時間が延びます）</label>
+        <label class="row small" id="dblrow" title="ダブルスでは、1 つのコートに 2 人ずつ追い、誰が打ったか・2 人の並び方も出します">試合の形
+          <select class="input" id="doubles" style="height:30px;font-size:13px">
+            <option value="auto">自動で決める</option><option value="off">シングルス</option><option value="on">ダブルス</option></select></label>
       </div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="go">${has ? "解析し直す" : "解析を始める"}</button>
         <span class="muted small" id="eta"></span></div></div>`);
     let part = info.start_s != null || info.end_s != null;
     $("#s0", card).value = fmt(info.start_s ?? 0, 1);
     $("#s1", card).value = fmt(info.end_s ?? dur, 1);
+    $("#doubles", card).value = (info.players && info.players.doubles_mode) || "auto";
     const upd = () => {
       $$("#rng button", card).forEach((b) => b.classList.toggle("on", (b.dataset.v === "part") === part));
       $("#part", card).classList.toggle("hidden", !part);
       const len = part ? Math.max(0, +$("#s1", card).value - +$("#s0", card).value) : dur;
       // 選手の検出は 4K 30fps で動画の長さの約 0.4 倍（GPU。F3d）
       const extra = $("#players", card).checked ? len * 0.5 : 0;
+      $("#dblrow", card).classList.toggle("hidden", !$("#players", card).checked);
       $("#eta", card).textContent = `目安 約 ${minutes(len + extra / 2.5)} 分（動画 ${fmt(len, 0)} 秒）。解析中もほかの画面は使えます。`;
     };
     $$("#rng button", card).forEach((b) => { b.onclick = () => { part = b.dataset.v === "part"; upd(); }; });
@@ -61,7 +66,8 @@ App.views.shots = {
     upd();
     $("#go", card).onclick = () => {
       if (has && !confirm("解析し直すと、前回の一覧は置き換わります。よろしいですか？")) return;
-      const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked), players: $("#players", card).checked };
+      const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked), players: $("#players", card).checked,
+        doubles: $("#doubles", card).value };
       if (part) {
         data.start = +$("#s0", card).value;
         data.end = +$("#s1", card).value;
@@ -78,7 +84,40 @@ App.views.shots = {
     if (!p) return "";
     if (p.error) return `選手の立ち位置は記録できませんでした（${esc(p.error)}）。`;
     const c = p.coverage || {};
-    return `選手の立ち位置を記録しました（手前 ${fmt(100 * (c.h ?? 0), 0)}%・奥 ${fmt(100 * (c.o ?? 0), 0)}% のコマ）。`;
+    const pairs = Object.values(p.per_side || {}).some((n) => n >= 2);
+    return `選手の立ち位置を記録しました（手前 ${fmt(100 * (c.h ?? 0), 0)}%・奥 ${fmt(100 * (c.o ?? 0), 0)}% のコマ）。`
+      + (pairs ? "ダブルスとして 2 人ずつ追いました。" : "");
+  },
+
+  // ---- ダブルス：選手ごとの本数・2 人の並び方・ローテーション・落とされた所（info.players.doubles）
+  renderDoubles(el, d, sideName) {
+    if (!d || !d.players || !Object.keys(d.players).length) return;
+    const pct = (v) => v == null ? "—" : `${fmt(100 * v, 0)}%`;
+    const who = Object.entries(d.players).map(([name, p]) => `<div class="card" style="padding:10px 14px;min-width:150px;margin:0">
+        <div class="muted small">${esc(name)}（${sideName(p.side)}）</div>
+        <div style="font-size:22px;font-weight:800">${p.n_shots} <span style="font-size:13px">本（ペアの ${pct(p.share_of_pair)}）</span></div>
+        <div class="small">${p.max_kmh != null ? `最高 <b>${fmt(p.max_kmh, 0)}</b> km/h・` : ""}前 ${p.n_front ?? 0}・中 ${p.n_mid ?? 0}・後ろ ${p.n_back ?? 0} 本</div>
+        ${p.distance_m != null ? `<div class="small muted">動いた距離 ${fmt(p.distance_m, 0)} m</div>` : ""}</div>`).join("");
+    const lines = [];
+    for (const [side, f] of Object.entries(d.formation || {})) {
+      lines.push(`<b>${sideName(side)}の並び方</b>：前後（攻めの形）${pct(f.attack)}・横並び（守りの形）${pct(f.defence)}・移っている途中 ${pct(f.transition)}`);
+    }
+    for (const [side, r] of Object.entries(d.rotation || {})) {
+      const part = (k, label) => k && k.n_judged ? `${label} ${k.n_in_time} / ${k.n_judged} 本${k.median_s != null ? `（${fmt(k.median_s, 1)} 秒）` : ""}` : "";
+      const t = [part(r.lift, "上げた後、相手が打つまでに横並びになれた"), part(r.attack, "攻めた後、前後になれた")].filter(Boolean);
+      if (t.length) lines.push(`<b>${sideName(side)}のローテーション</b>：${t.join("、")}`);
+    }
+    for (const [side, g] of Object.entries(d.gaps || {})) {
+      if (!g.n) continue;
+      const kinds = Object.values(g.by_kind).filter((k) => k.n).map((k) => `${esc(k.label)} ${k.n}`).join("・");
+      lines.push(`<b>${sideName(side)}が落とされた所</b>：${g.n} 本（${kinds}）`);
+    }
+    const hh = d.hitters || {};
+    el.appendChild(h(`<div class="card"><h2>ダブルス：誰が打ったか・2 人の並び方</h2>
+      <p class="desc">選手は P1〜P4 と呼んでいます。打った人は、打った瞬間のシャトルと 2 人の位置から決めた<b>目安</b>です
+        ${hh.n ? `（${hh.n} 本のうち、確かでないもの ${hh.n_low_conf ?? 0} 本。表では「？」を付けています）` : ""}。詳しい表と図はレポートにあります。</p>
+      <div class="row" style="flex-wrap:wrap;gap:10px">${who}</div>
+      ${lines.length ? `<ul class="small" style="margin:12px 0 0;padding-left:18px">${lines.map((l) => `<li>${l}</li>`).join("")}</ul>` : ""}</div>`));
   },
 
   // ---- 種類ごとの本数と速さ
@@ -109,6 +148,9 @@ App.views.shots = {
       tiles.appendChild(t);
     }
     el.appendChild(card);
+    const cx = App.calib && App.calib.camera_center ? App.calib.camera_center[0] : null;
+    this.renderDoubles(el, info.players && info.players.doubles,
+      (s) => cx == null ? (s === "h" ? "片側" : "反対側") : ((s === "h") === (cx < 0) ? "手前" : "奥"));
   },
 
   // ---- 表
@@ -143,7 +185,7 @@ App.views.shots = {
       const c = s.speed_kmh == null ? null : s.confidence;  // 初速が出なかったショットの確かさは出さない
       const conf = c == null ? '<span class="badge">—</span>' : c >= 0.7 ? '<span class="badge ok">高い</span>' : c >= 0.4 ? '<span class="badge warn">ふつう</span>' : '<span class="badge bad">低い</span>';
       const rally = s.rally_id != null ? `${s.rally_id}${s.index_in_rally != null ? `<span class="muted small">（${s.index_in_rally} 本目）</span>` : ""}` : "—";
-      const tr = tb.appendChild(h(`<tr class="click"${s.id === this.sel ? ' style="outline:2px solid var(--primary)"' : ""}><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}</td>
+      const tr = tb.appendChild(h(`<tr class="click"${s.id === this.sel ? ' style="outline:2px solid var(--primary)"' : ""}><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}${s.hitter_id ? ` <b>${esc(s.hitter_id)}</b>${s.hitter_conf != null && s.hitter_conf < 0.75 ? '<span class="muted" title="2 人の差が小さく、確かではありません">？</span>' : ""}` : ""}</td>
         <td>${s.shot_type === "unknown" ? `<span class="muted">${esc(s.label)}</span>` : `<span class="badge info">${esc(s.label)}</span>`}</td>
         <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td>
         <td><select class="input truth" style="height:30px;font-size:13px"><option value="">—</option>
@@ -266,7 +308,7 @@ App.views.shots = {
       <p class="desc">左は打った少し後の場面です。<span style="color:#ea580c">○</span> は見つけたシャトル（<span style="color:#ea580c">●</span> がこのコマ）、<span style="color:#2563eb">線</span> は計算した飛び方
         （<span style="color:#2563eb">●</span> がこのコマの時刻の位置）です。「▶ 再生」（キーボードのスペース）で、打つ 0.8 秒前から次の打球までを
         動画として繰り返し見られます。速さはゆっくりにもできます。止めている間は、下のボタンかキーボードの ← → でコマを前後に送れます。
-        右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所${v.hitter ? `、<span style="color:#7c3aed">■</span> が打った人の足元` : ""}です。
+        右はコートを上から見た図で、<span style="color:#16a34a">●</span> が打った所、<span style="color:#dc2626">×</span> が落ちた所${v.hitter ? `、<span style="color:#7c3aed">■</span> が打った人の足元` : ""}${v.people && v.people.length ? `、<span style="color:#475569">○</span> が打った瞬間の選手（${s.hitter_id ? `打ったのは ${esc(s.hitter_id)}` : "P1〜P4"}）` : ""}です。
         ${s.speed_kmh == null ? "このショットは初速が出せなかったので、飛び方の線はありません。" : ""}
         いちばん下で、このショットの正しい種類を選べます（キーボードの数字でも選べます）。</p>
       <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
@@ -293,6 +335,7 @@ App.views.shots = {
       ${v.court.map(([a, b]) => `<line x1="${a[0]}" y1="${-a[1]}" x2="${b[0]}" y2="${-b[1]}" stroke="#fff" stroke-width="${sw}"/>`).join("")}
       <line x1="0" y1="${-Y + 0.3}" x2="0" y2="${Y - 0.3}" stroke="#334155" stroke-width="${sw * 1.5}" stroke-dasharray="0.15 0.1"/>
       ${pathTop ? `<polyline points="${pathTop}" fill="none" stroke="#2563eb" stroke-width="${sw * 1.6}"/>` : ""}
+      ${(v.people || []).map((p) => `<circle cx="${p.x}" cy="${-p.y}" r="0.22" fill="none" stroke="#475569" stroke-width="${sw * 1.4}"/><text x="${p.x + 0.3}" y="${-p.y + 0.15}" font-size="0.45" fill="#334155">${esc(p.id)}</text>`).join("")}
       ${v.hitter ? `<rect x="${v.hitter[0] - 0.15}" y="${-v.hitter[1] - 0.15}" width="0.3" height="0.3" fill="#7c3aed"/>` : ""}
       ${v.hit ? `<circle cx="${v.hit[0]}" cy="${-v.hit[1]}" r="0.18" fill="#16a34a"/>` : ""}
       ${v.land ? `<path d="M${v.land[0] - 0.18},${-v.land[1] - 0.18}l0.36,0.36m0,-0.36l-0.36,0.36" stroke="#dc2626" stroke-width="${sw * 1.6}"/>` : ""}</svg>

@@ -328,6 +328,60 @@ def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):
 
 
 
+def test_cli_doubles_writes_hitters_and_formations(rally_video, tmp_path, monkeypatch):
+    """1 側に 2 人の選手がいると、打った人（P1〜P4）・陣形を ``shots.csv`` に入れ、``doubles.json`` とレポートの節を書く（D4）。"""
+    from smash_speed.doubles import DOUBLES_FILE, FORMATION_FILE
+    from smash_speed.movement import movement_brief, write_movement
+    from smash_speed.synth_doubles import truth_players
+
+    d, truth = rally_video
+    seen = []
+    # h の側は前後（P1 が前）、o の側は横並びで立っている
+    stand = {"h0": (-2.0, -0.5), "h1": (-5.0, 0.5), "o0": (3.5, -1.5), "o1": (3.5, 1.5)}
+
+    def fake_players(video, calib, out_dir, cfg, o, start_s, end_s, capture_fps, progress):
+        seen.append(o.per_side)
+        t = np.arange(0, 20, 1 / 30)
+        players = truth_players(t, {k: np.tile(np.array(v), (len(t), 1)) for k, v in stand.items()}, CAM)
+        players.to_csv(Path(out_dir) / "players.csv", index=False)
+        return {"n_frames": len(t), "coverage": {"h": 1.0, "o": 1.0}, "per_side": {"h": 2, "o": 2},
+                "provider": "CPUExecutionProvider", "detect_s": 0.1,
+                "movement": movement_brief(write_movement(out_dir, players, cfg.get("court")))}
+
+    monkeypatch.setattr(shot_list, "analyze_players", fake_players)
+    main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
+          "--players", "--doubles", "on"])
+    assert seen == [2]
+    saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+    assert saved["players"]["doubles_mode"] == "on" and saved["players"]["per_side"] == {"h": 2, "o": 2}
+    dbl = saved["players"]["doubles"]
+    assert dbl["per_side"] == {"h": 2, "o": 2} and dbl["formation"]["h"]["attack"] == pytest.approx(1.0)
+    assert dbl["formation"]["o"]["defence"] == pytest.approx(1.0)
+    shots = read_shots(tmp_path / SHOTS_FILE)
+    sided = [s for s in shots if s.side]
+    assert sided and saved["players"]["n_hitters"] == len(sided) == dbl["hitters"]["n"]
+    for s in sided:
+        assert s.hitter_id in (("P1", "P2") if s.side == "h" else ("P3", "P4")) and 0.5 <= s.hitter_conf <= 1.0
+        assert (s.hitter_x_m, s.hitter_y_m) == stand[{"P1": "h0", "P2": "h1", "P3": "o0", "P4": "o1"}[s.hitter_id]]
+        assert (s.formation, s.opp_formation) == (("attack", "defence") if s.side == "h" else ("defence", "attack"))
+    assert sum(p["n_shots"] for p in dbl["players"].values()) == len(sided)
+    full = json.loads((tmp_path / DOUBLES_FILE).read_text(encoding="utf-8"))
+    assert full["hitters"]["n"] == len(sided) and (tmp_path / FORMATION_FILE).exists()
+    assert json.loads((tmp_path / "stats.json").read_text(encoding="utf-8"))["doubles"]["per_side"] == {"h": 2, "o": 2}
+    assert "<h2>ダブルス</h2>" in (tmp_path / "report.html").read_text(encoding="utf-8")
+    # 同じ出力先でシングルスとして解析し直すと、ダブルスのファイルと節は残らない
+    monkeypatch.setattr(shot_list, "analyze_players", lambda video, calib, out_dir, cfg, o, *a, **k: (
+        pd.read_csv(Path(out_dir) / "players.csv").query("player == 0").to_csv(Path(out_dir) / "players.csv", index=False),
+        {"n_frames": 10, "coverage": {"h": 1.0, "o": 1.0}, "per_side": {"h": 1, "o": 1}, "detect_s": 0.1})[1])
+    main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
+          "--players", "--doubles", "off"])
+    saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+    assert "doubles" not in saved["players"] and not (tmp_path / DOUBLES_FILE).exists()
+    assert all(not s.hitter_id and not s.formation for s in read_shots(tmp_path / SHOTS_FILE))
+    assert "<h2>ダブルス</h2>" not in (tmp_path / "report.html").read_text(encoding="utf-8")
+    assert "doubles" not in json.loads((tmp_path / "stats.json").read_text(encoding="utf-8"))
+
+
 def test_analyze_video_with_external_detections(rally_video, tmp_path, monkeypatch):
     """自前の検出の代わりに、外の検出 CSV（学習したモデルの検出の形）や学習したモデルを使える（F1b）。
 
