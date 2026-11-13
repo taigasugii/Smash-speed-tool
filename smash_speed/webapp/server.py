@@ -763,6 +763,8 @@ def run(kind: str):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
         if b.get("players"):
             args.append("--players")
+            if b.get("doubles") in ("on", "off"):   # 省略・auto は自動（側ごとに 1 人か 2 人かを決める）
+                args += ["--doubles", b["doubles"]]
         t = start_task("すべてのショットを解析", [cli(*args)])
     elif kind == "propose_calib":
         if S.meta is None:
@@ -1146,7 +1148,18 @@ def shot_view():
     if frame is None and S.meta is not None:
         frame = int(round(s.t_hit_s * S.meta.fps_meta))
     r3 = lambda v: None if v is None else round(float(v), 3)  # noqa: E731
-    return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end,
+    # ダブルス：打った瞬間の 4 人の立ち位置（上から見た図に出す）
+    people = []
+    if s.hitter_id and (Path(d) / "players.csv").exists():
+        from smash_speed.player_ids import player_label
+
+        pl = pd.read_csv(Path(d) / "players.csv")
+        near = pl[(pl.t - s.t_hit_s).abs() <= 0.2]
+        if len(near):
+            near = near.loc[(near.t - s.t_hit_s).abs().groupby([near.side, near.player]).idxmin()]
+            people = [{"id": player_label(r.side, r.player), "x": r3(r.x), "y": r3(r.y)} for r in near.itertuples()
+                      if np.isfinite([r.x, r.y]).all()]
+    return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end, people=people,
               hit=[r3(s.hit_x_m), r3(s.hit_y_m), r3(s.hit_z_m)] if s.hit_point is not None else None,
               land=[r3(s.land_x_m), r3(s.land_y_m)] if s.land_x_m is not None and s.land_y_m is not None else None,
               hitter=[r3(s.hitter_x_m), r3(s.hitter_y_m)] if s.hitter_x_m is not None and s.hitter_y_m is not None else None,
