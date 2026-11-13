@@ -40,9 +40,9 @@ App.views.shots = {
           <input class="input" id="s1" type="number" step="0.1" min="0" style="width:90px"> 秒まで</span>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す</label>` : ""}
         <label class="row small"><input type="checkbox" id="players" ${info.players ? "checked" : ""}> 選手の立ち位置も記録する（時間が延びます）</label>
-        <label class="row small" id="dblrow" title="ダブルスでは、1 つのコートに 2 人ずつ追い、誰が打ったか・2 人の並び方も出します">試合の形
+        <label class="row small" id="dblrow" title="ダブルスでは、1 つのコートに 2 人ずつ追い、誰が打ったか・2 人の並び方も出します。自動は、両方のコートに 2 人ずついるときだけダブルスにします">人数
           <select class="input" id="doubles" style="height:30px;font-size:13px">
-            <option value="auto">自動で決める</option><option value="off">シングルス</option><option value="on">ダブルス</option></select></label>
+            <option value="auto">自動（ふつうは 1 対 1）</option><option value="off">1 対 1</option><option value="on">ダブルス・2 対 1（2 人いる側は 2 人とも追う）</option></select></label>
       </div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="go">${has ? "解析し直す" : "解析を始める"}</button>
         <span class="muted small" id="eta"></span></div></div>`);

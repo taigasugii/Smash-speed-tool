@@ -1002,6 +1002,18 @@ python -m smash_speed.feet_speed outputs\d1c\shots_IMG_5109 --truth agent\truth\
 練習の動画 3 本（低い位置・手前の角から）の正解の打球の組 43 本で、幅に入ったのは 25 / 32 本（初速の出ないもの 11 本）。
 手前の選手の打球は 17 / 18 本、奥の選手の打球は 8 / 14 本（目安との比の中央値 0.78。速い球が遅く出る）。数字は `agent/JOURNAL.md` の D1c。
 
+### ダブルス（`smash_speed/player_ids.py`・`smash_speed/doubles.py`）
+
+`--players` のショットの一覧で、**両方のコートに 2 人ずつ選手がいる**と分かったとき（`--doubles auto`。既定）だけ、4 人を同じ番号（P1〜P4）のまま追い、
+誰が打ったか（`shots.csv` の `hitter_id`・`hitter_conf`）・陣形（前後＝攻めの形／横並び＝守りの形。`formation`・`formation.csv`）・
+ローテーションにかかった時間・落とされた所（2 人の間・前・後ろ・外側）を出す（`doubles.json`、レポートと GUI の「ダブルス」）。
+1 対 1 の動画は今までの追跡とまったく同じ結果になる（片側だけ 2 人の練習も、自動では 1 側 1 人のまま。`--doubles on` で 2 人の側を 2 人とも追う）。
+使い方・仕組み・数字は `docs/doubles.md`。
+
+合成のダブルス（`synth_doubles.py`。30 fps・4 本 × 5 ラリー。`python -m smash_speed.synth_doubles`）で、番号の正しさは角の低いカメラで
+今までの 76.1% → 99.3%（ペアが同じ色の服だと 88.7%）、誰が打ったかは当てはめの前で 91〜99%、陣形は 96〜99%。
+4 人そろった実動画はまだなく、実動画では片側 2 人の追跡だけ確かめた（IMG_4397・IMG_4521）。品質チェックは `agent/checks/check_doubles.py`。
+
 ### フォームの解析（ROADMAP E 章、`smash_speed/form.py` ほか）
 
 側方から撮ったスイング（ラケットを持つ腕の側から、打つ向きにまっすぐ横、6〜8 m、腰くらいの高さ、カメラは水平）から、

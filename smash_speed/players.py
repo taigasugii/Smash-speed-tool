@@ -64,7 +64,8 @@ class PlayerOptions:
     nms_iou: float = 0.45             # 重なった枠をまとめる IoU
     process_width: int = 1280         # 検出に使う画像の横幅 [px]（モデルの入力は 640 なので、これ以上は要らない）
     stride: int = 1                   # 何コマごとに検出するか
-    per_side: int = 1                 # 1 側の人数（シングルス 1、ダブルス 2、0 は側ごとに自動で決める。``player_ids``）
+    per_side: int = 1                 # 1 側の人数（シングルス 1、ダブルス 2、0 は自動で決める。``player_ids.track_sides``）
+    auto_each_side: bool = False      # 自動のとき、側ごとに決める（偽なら、両側とも 2 人いるときだけダブルス）
     margin_m: tuple[float, float] = (2.0, 1.0)  # 選手とみなす範囲の、コートの外側の線からの広げ幅（長さ方向・幅方向）[m]
     net_margin_m: float = 0.5         # ネットを越えて相手側に足が出たとみなしてよい幅 [m]
     outside_weight: float = 0.3       # コートの線の外（広げた範囲）にいた点の重み（中にいた点は 1）
@@ -646,12 +647,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--model", choices=list(MODELS), default=DEFAULT_MODEL)
     ap.add_argument("--stride", type=int, default=1, help="何コマごとに検出するか")
     ap.add_argument("--doubles", action="store_true", help="ダブルス（1 側 2 人）")
-    ap.add_argument("--auto", action="store_true", help="シングルスかダブルスかを側ごとに自動で決める")
+    ap.add_argument("--auto", action="store_true", help="シングルスかダブルスかを自動で決める（両側とも 2 人ならダブルス）")
+    ap.add_argument("--each-side", action="store_true", help="--auto のとき、側ごとに決める（2 対 1 の練習など）")
     ap.add_argument("--device", choices=["auto", "gpu", "cpu"], default=None)
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
-    o = PlayerOptions(model=a.model, stride=max(1, a.stride), per_side=2 if a.doubles else 0 if a.auto else 1)
+    o = PlayerOptions(model=a.model, stride=max(1, a.stride), per_side=2 if a.doubles else 0 if a.auto or a.each_side else 1,
+                      auto_each_side=a.each_side)
     info = analyze_players(a.video, a.calib, a.out, cfg, o, a.start, a.end, a.capture_fps, a.device)
     print(f"{info['n_frames']} コマ（{info['provider']}、検出 {info['detect_s']} 秒）："
           f"手前 {info['coverage']['h']:.0%}・奥 {info['coverage']['o']:.0%} のコマで選手の位置が出ました → {a.out}")

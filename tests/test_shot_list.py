@@ -340,7 +340,7 @@ def test_cli_doubles_writes_hitters_and_formations(rally_video, tmp_path, monkey
     stand = {"h0": (-2.0, -0.5), "h1": (-5.0, 0.5), "o0": (3.5, -1.5), "o1": (3.5, 1.5)}
 
     def fake_players(video, calib, out_dir, cfg, o, start_s, end_s, capture_fps, progress):
-        seen.append(o.per_side)
+        seen.append((o.per_side, o.auto_each_side))
         t = np.arange(0, 20, 1 / 30)
         players = truth_players(t, {k: np.tile(np.array(v), (len(t), 1)) for k, v in stand.items()}, CAM)
         players.to_csv(Path(out_dir) / "players.csv", index=False)
@@ -351,7 +351,7 @@ def test_cli_doubles_writes_hitters_and_formations(rally_video, tmp_path, monkey
     monkeypatch.setattr(shot_list, "analyze_players", fake_players)
     main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
           "--players", "--doubles", "on"])
-    assert seen == [2]
+    assert seen == [(0, True)]
     saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     assert saved["players"]["doubles_mode"] == "on" and saved["players"]["per_side"] == {"h": 2, "o": 2}
     dbl = saved["players"]["doubles"]

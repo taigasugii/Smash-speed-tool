@@ -14,7 +14,8 @@
    2 人がはっきり違う色のときだけ使う）から、いちばんありそうな並びに決める（ビタビ）。
    同じ色の服の 2 人は色では分けられないので、動きだけで決める。
 3. 自動（``per_side`` = 0）：2 本目が「選手らしい」（コートの線の内側に長くいて、1 本目と同時に写っていて、動いている）
-   ときだけ、その側をダブルスとして扱う。そうでなければシングルスの追跡の結果をそのまま返す。
+   側が **両側とも** のときだけ、ダブルスとして扱う。そうでなければシングルスの追跡の結果をそのまま返す
+   （1 対 1 の基礎打ちに球出しの人・コーチが入っていても、今までと同じ結果）。``auto_each_side`` で側ごとに決めることもできる。
 
 番号（``player``）は 0・1。最初に 2 人とも写った区間で y が小さい方が 0。表では h の側の 0・1 を P1・P2、
 o の側を P3・P4 と呼ぶ（``PLAYER_LABELS``）。コートの入れ替え（チェンジエンド）の前後で同じ人を結ぶことはしていない。
@@ -597,12 +598,14 @@ def track_sides(people: pd.DataFrame, frame_t: pd.Series, cfg: dict[str, Any], o
                 ido: IdOptions | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
     """側ごとに、ダブルス（2 人）かシングルス（1 人）で選手を追う。``players.csv`` の形の表と、側ごとの人数・確かめ用の数。
 
-    ``o.per_side`` が 2 なら両側とも 2 人、0 なら側ごとに ``looks_like_pair`` で決める（1 人の側はシングルスの追跡と同じ結果）。
+    ``o.per_side`` が 2 なら両側とも 2 人。0（自動）なら ``looks_like_pair`` で決める：``o.auto_each_side`` が偽（既定）なら
+    **両側とも** 2 人の選手がいるときだけダブルスにし、そうでなければ両側ともシングルスの追跡（今までと同じ結果）。
+    真なら側ごとに決める（2 対 1 の練習など。1 人の側はシングルスの追跡と同じ結果）。
     """
     o = o or PlayerOptions()
     ido = ido or IdOptions()
-    out = []
     info: dict[str, Any] = {"per_side": {}, "sides": {}}
+    pairs: dict[str, list[pd.DataFrame]] = {}
     for side in SIDES:
         region, weight = side_region(people, side, cfg, o)
         cand = people[region].assign(weight=weight[region]).reset_index(drop=True)
@@ -612,14 +615,19 @@ def track_sides(people: pd.DataFrame, frame_t: pd.Series, cfg: dict[str, Any], o
             if not pair:
                 tracks = []
         info["sides"][side] = side_info
-        if not tracks:
+        pairs[side] = tracks
+    if o.per_side == 0 and not o.auto_each_side and not all(pairs[side] for side in SIDES):
+        pairs = {side: [] for side in SIDES}      # 片側だけ 2 人（コーチ・球出しの人がいる練習など）はシングルスのまま
+    out = []
+    for side in SIDES:
+        if not pairs[side]:
             single = _track_singles(people, frame_t, cfg, o, [side])
             info["per_side"][side] = int(not single.empty)
             if not single.empty:
                 out.append(single)
             continue
-        info["per_side"][side] = len(tracks)
-        for k, tr in enumerate(tracks):
+        info["per_side"][side] = len(pairs[side])
+        for k, tr in enumerate(pairs[side]):
             tr = tr.drop(columns=[c for c in ("tid", "weight", "app") if c in tr])
             out.append(_fill_gaps(tr, frame_t, o).assign(side=side, player=k))
     return _player_table(out), info

@@ -646,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-audio", action="store_true", help="打球音を使わない（軌道だけで打球を見つける）")
     p.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv。人の検出のモデルを使う）")
     p.add_argument("--doubles", choices=["auto", "on", "off"], default="auto",
-                   help="--players のとき、1 側 2 人（ダブルス）として追うか（auto：側ごとに自動で決める）")
+                   help="--players のとき：auto は両側とも 2 人いればダブルス、on は 2 人いる側を 2 人とも追う、off は 1 側 1 人")
     p.add_argument("--no-hitter-prior", action="store_true",
                    help="--players のとき、打つ人の足元を打点の手がかりにしない（以前の当てはめ）")
     p.add_argument("--detections", help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")

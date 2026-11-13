@@ -357,3 +357,14 @@ def test_doubles_benchmark_runs():
     r = doubles_benchmark(1, n_rallies=2, cameras=("side",))["side"]
     assert r["auto_doubles"] == 1 and r["id_accuracy"] >= 0.97 and r["hitter_post"] >= 0.9 and r["formation"] >= 0.9
     assert set(PEOPLE) == {"h0", "h1", "o0", "o1"} and callable(extra_feet) and callable(add_court_positions)
+
+
+def test_auto_needs_two_players_on_both_sides(scene):
+    """片側だけ 2 人（1 対 1 の練習に球出しの人がいるなど）は、自動ではシングルスのまま。側ごとに決めれば 2 人の側だけ 2 人。"""
+    people = scene["people"][scene["people"]["who"] != "o1"].drop(columns="who")
+    auto, info = track_sides(people, scene["frame_t"], CFG, PlayerOptions(per_side=0))
+    assert info["per_side"] == {"h": 1, "o": 1}
+    assert auto.equals(track_players(people, scene["frame_t"], CFG, PlayerOptions(per_side=1)))
+    each, info = track_sides(people, scene["frame_t"], CFG, PlayerOptions(per_side=0, auto_each_side=True))
+    assert info["per_side"] == {"h": 2, "o": 1}
+    assert each[each["side"] == "o"].reset_index(drop=True).equals(auto[auto["side"] == "o"].reset_index(drop=True))

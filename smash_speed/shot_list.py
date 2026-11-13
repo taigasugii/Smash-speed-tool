@@ -83,7 +83,8 @@ class ShotListOptions:
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
     players: bool = False             # 選手の位置も出す（``players.analyze_players``。人の検出のモデルを使うので遅くなる）
     player_options: PlayerOptions | None = None
-    doubles: str = "auto"             # 1 側の人数：auto（側ごとに自動で決める）| on（ダブルス）| off（シングルス）
+    doubles: str = "auto"             # auto：両側とも 2 人の選手がいるときだけダブルス（そうでなければ今までどおり 1 側 1 人）
+                                      # on：2 人いる側は 2 人とも追う（片側だけ 2 人の練習もこれ）| off：いつも 1 側 1 人
     hitter_prior: bool = True         # 選手の位置があれば、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     hit_players: bool = True          # 選手の位置があれば、打球を見つけるのにも使う（``find_hits`` の ``players``。
                                       # どちらの選手にも届かない所の打球を捨て、近い方を打った側にする）
@@ -628,8 +629,8 @@ def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: C
     """
     progress("[進行] 選手を検出しています")
     try:
-        per_side = {"auto": 0, "on": 2, "off": 1}[o.doubles]
-        po = replace(o.player_options or PlayerOptions(), per_side=per_side)
+        po = replace(o.player_options or PlayerOptions(), per_side=1 if o.doubles == "off" else 0,
+                     auto_each_side=o.doubles == "on")
         p = analyze_players(o.video, o.calib, out, cfg, po, o.start_s, o.end_s, o.capture_fps, progress=progress)
     except Exception as e:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
         progress(f"[注意] 選手の位置は出せませんでした：{e}")
@@ -657,7 +658,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
     ap.add_argument("--doubles", choices=["auto", "on", "off"], default="auto",
-                    help="--players のとき、1 側 2 人（ダブルス）として追うか（auto：側ごとに自動で決める）")
+                    help="--players のとき：auto は両側とも 2 人いればダブルス、on は 2 人いる側を 2 人とも追う、off は 1 側 1 人")
     ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
     ap.add_argument("--no-hit-players", action="store_true", help="打球を見つけるのに選手の位置を使わない")
     ap.add_argument("--detections", type=Path, default=None,
