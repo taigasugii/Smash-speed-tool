@@ -583,8 +583,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               speed_of_sound_mps: float = 343.0, max_kmh: float = np.inf,
               bad_max_nfev_per_param: int = 30, hitter_xy: list[Any] | None = None,
               hitter_sigma_m: tuple[float, float] = (0.5, 2.0), max_hitter_gap_m: float = 2.5,
-              serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5
-              ) -> list[ShotFit]:
+              serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5,
+              joint: Any = None) -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -621,6 +621,10 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             最初の当てはめの打点を、飛行平面に沿ってこの目安と重みつきで平均する（``serve_hit_point``）。
             None なら使わない（ラリーの最初の打球が見つかっていない動画では、サーブではないので）。
             最初のショットの打つ人の足元（``hitter_xy``）があれば、足元の方を使う
+        joint: 与えると（``rally_fit.JointOptions``）、最後にラリー全体をまとめて当てはめ直す（``rally_fit.fit_rallies``。
+            となりのショットと打点・打った時刻をつなぎ、長いショットから終端速度も求める）。つながらなかった
+            ショットは、ショットごとの当てはめのまま。動画に何ラリーもあるときは、ラリーごとにこの関数を
+            ``joint=None`` で呼んでから ``fit_rallies`` をまとめて呼ぶ（終端速度を動画全体で 1 つにする）
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
@@ -733,7 +737,21 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
     for i, f in zip(jobs, _parallel_map(_try_fit, args, workers)):
         if f is not None:
             fits[i].fit = f
+    if joint is not None:
+        from smash_speed.rally_fit import fit_rallies
+
+        res, _ = fit_rallies([joint_job(fits, det, camera, feet, t_audio, margin_s, t_last, speed_of_sound_mps,
+                                        max_rms_px)], phys, opts, joint)
+        fits = res[0].fits
     return fits
+
+
+def joint_job(fits: list[ShotFit], det: pd.DataFrame, camera: Camera, feet: list[Any] | None = None,
+              t_audio: list[float | None] | None = None, margin_s: float = 0.01, t_last: float | None = None,
+              speed_of_sound_mps: float = 343.0, max_rms_px: float = np.inf) -> dict[str, Any]:
+    """``rally_fit.fit_rallies`` に渡す 1 ラリー分の引数（``fit_shots`` の結果と、そのときの引数から）。"""
+    return {"fits": fits, "det": det, "camera": camera, "feet": feet, "t_audio": t_audio, "margin_s": margin_s,
+            "t_last": t_last, "speed_of_sound_mps": speed_of_sound_mps, "max_rms_px": max_rms_px}
 
 
 def shot_fits_to_shots(fits: list[ShotFit], phys: PhysicsParams, source: str = "shot_fit") -> list[Shot]:
@@ -756,7 +774,7 @@ def shot_fits_to_shots(fits: list[ShotFit], phys: PhysicsParams, source: str = "
             land_x_m=float(tr["pos"][-1, 0]) if t_land else None, land_y_m=float(tr["pos"][-1, 1]) if t_land else None,
             t_land_s=t_land, v0_x_mps=float(f.v0[0]), v0_y_mps=float(f.v0[1]), v0_z_mps=float(f.v0[2]),
             terminal_velocity_mps=f.terminal_velocity, confidence=conf, source=source,
-            note=f"{sf.n_obs} コマ・ずれ {f.rms_px:.1f} px"))
+            note=f"{sf.n_obs} コマ・ずれ {f.rms_px:.1f} px" + ("・ラリーでつないだ" if f.message == "joint" else "")))
     return out
 
 
@@ -767,7 +785,8 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                         noise_px: float = 1.5, dropout: float = 0.1, camera: Camera | None = None,
                         cfg: dict[str, Any] | None = None, verbose: bool = False,
                         keep_shots: bool = False, feet_noise_m: float | None = None,
-                        serve_depth_m: tuple[float, float] | None = None) -> dict[str, Any]:
+                        serve_depth_m: tuple[float, float] | None = None, joint: Any = None,
+                        true_vt: float | None = None, workers: int = 1) -> dict[str, Any]:
     """合成ラリーで、ショットの種類ごとの初速の誤差を測る。
 
     Args:
@@ -777,6 +796,11 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
         keep_shots: ``rows`` に、推定したショット（``Shot``。``index_in_rally`` は見つけた打球の順）の列 ``shot`` を足す
         feet_noise_m: 与えると、本当の打点の真下からこの大きさ（水平の各向きの標準偏差）[m] だけずらした位置を
             打つ人の足元として渡す（``fit_shots`` の ``hitter_xy``。足元の手がかりの効き目を見る）
+        joint: 与えると（``rally_fit.JointOptions``）、ショットごとの当てはめの後に、全部のラリーを 1 本の動画として
+            まとめて当てはめ直す（``rally_fit.fit_rallies``）。``rows`` の ``base_kmh``・``base_err_pct`` がショットごと、
+            ``est_kmh``・``err_pct`` がまとめた後の値。戻り値の ``vt`` が終端速度の記録
+        true_vt: 合成ラリーを作る・観測するときの本当の終端速度 [m/s]（省略時は設定の値と同じ。当てはめは設定の値から）
+        workers: ショットごとの当てはめを並べるプロセスの数（``fit_shots``）
 
     Returns:
         ``rows``（1 ショット 1 行の DataFrame：種類・正解と推定の初速・誤差 [%]）と、
@@ -791,12 +815,13 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
     phys = PhysicsParams.from_config(cfg)
     camera = camera or rally_camera(cfg)
     opts = FitOptions.from_config(cfg, ci_method="none")
+    true_phys = phys if true_vt is None else PhysicsParams(phys.g, true_vt, phys.method, phys.rtol, phys.atol)
     rally_rng = np.random.default_rng([seed, 1])
-    rows = []
+    done = []
     for r in range(n_rallies):
-        rally = make_rally(rally_rng, phys, n_shots=int(rally_rng.integers(4, 13)),
+        rally = make_rally(rally_rng, true_phys, n_shots=int(rally_rng.integers(4, 13)),
                            server_side="h" if r % 2 == 0 else "o")
-        det = observe_rally(rally, camera, fps, phys, np.random.default_rng([seed, 2, r]), noise_px=noise_px,
+        det = observe_rally(rally, camera, fps, true_phys, np.random.default_rng([seed, 2, r]), noise_px=noise_px,
                             dropout=dropout)
         segs = rally.segments
         if hits == "true":
@@ -818,8 +843,18 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
         if feet_noise_m is not None:
             foot_rng = np.random.default_rng([seed, 3, r])
             feet = [None if j is None else segs[j].p0[:2] + foot_rng.normal(0.0, feet_noise_m, 2) for j in pairs]
-        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio, hitter_xy=feet,
+        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio, hitter_xy=feet, workers=workers,
                          serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None)
+        done.append((segs, pairs, fits, joint_job(fits, det, camera, feet, t_audio)))
+    vt_rec, joined = None, [None] * len(done)
+    if joint is not None:
+        from smash_speed.rally_fit import fit_rallies
+
+        joined, vt_rec = fit_rallies([d[3] for d in done], phys,
+                                     FitOptions(**{**opts.__dict__, "quadratic_priors": True}), joint)
+    rows = []
+    for r, (segs, pairs, base, _) in enumerate(done):
+        fits = base if joined[r] is None else joined[r].fits
         shots = shot_fits_to_shots(fits, phys) if keep_shots else [None] * len(fits)
         for i, (sf, j) in enumerate(zip(fits, pairs)):
             if j is None:
@@ -834,6 +869,13 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                          "dt_hit_ms": 1000 * (sf.t_hit - s.t_hit),
                          "err_pct": None if est is None else 100 * (est / true - 1),
                          **({"shot": shots[i]} if keep_shots else {})})
+            if joint is not None:
+                b = base[i].speed_kmh
+                rows[-1].update(base_kmh=b, base_err_pct=None if b is None else 100 * (b / true - 1),
+                                joint=bool(joined[r].joint[i]), base_dt_hit_ms=1000 * (base[i].t_hit - s.t_hit),
+                                hit_err_m=None if sf.fit is None else float(np.linalg.norm(sf.fit.p0 - s.p0)),
+                                base_hit_err_m=None if base[i].fit is None
+                                else float(np.linalg.norm(base[i].fit.p0 - s.p0)))
             if verbose and (est is None or abs(est / true - 1) > 0.1):
                 print(f"ラリー {r} の {j + 1} 本目 {s.profile}：正解 {true:.1f} km/h、推定 "
                       f"{'-' if est is None else f'{est:.1f}'} km/h（{sf.n_obs} コマ）{sf.message}")
@@ -846,8 +888,13 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                          "median_abs_pct": float(e.median()) if len(e) else None,
                          "p90_abs_pct": float(e.quantile(0.9)) if len(e) else None}
     e = df.err_pct.dropna().abs() if len(df) else pd.Series(dtype=float)
-    return {"n_rallies": n_rallies, "fps": fps, "hits": hits, "rows": df, "by_type": by_type,
-            "mape": float(e.mean()) if len(e) else None, "n_failed": int(df.err_pct.isna().sum()) if len(df) else 0}
+    out = {"n_rallies": n_rallies, "fps": fps, "hits": hits, "rows": df, "by_type": by_type,
+           "mape": float(e.mean()) if len(e) else None, "n_failed": int(df.err_pct.isna().sum()) if len(df) else 0}
+    if joint is not None:
+        b = df.base_err_pct.dropna().abs() if len(df) else pd.Series(dtype=float)
+        out.update(vt=vt_rec, base_mape=float(b.mean()) if len(b) else None,
+                   n_joint=int(df.joint.sum()) if len(df) else 0)
+    return out
 
 
 def main(argv: list[str] | None = None) -> None:

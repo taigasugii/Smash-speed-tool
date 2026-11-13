@@ -227,6 +227,7 @@ def cmd_find_smashes(a: argparse.Namespace, cfg: dict) -> int:
 
 
 def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
+    from smash_speed.rally_fit import JointOptions
     from smash_speed.shot_list import ShotListOptions, analyze_video
 
     o = ShotListOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
@@ -234,7 +235,8 @@ def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
                         audio=Path(a.audio) if a.audio else None, use_audio=not a.no_audio,
                         players=a.players, doubles=a.doubles, hitter_prior=not a.no_hitter_prior,
                         detections=Path(a.detections) if a.detections else None,
-                        tracknet=Path(a.tracknet) if a.tracknet else None, tracknet_threshold=a.tracknet_threshold)
+                        tracknet=Path(a.tracknet) if a.tracknet else None, tracknet_threshold=a.tracknet_threshold,
+                        joint_fit=a.joint_fit, joint_options=JointOptions(estimate_vt=not a.no_estimate_vt))
     info = analyze_video(o, cfg, progress=lambda m: print(m, flush=True))
     print()
     print("種類ごとの本数")
@@ -652,6 +654,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--detections", help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
     p.add_argument("--tracknet", help="学習したモデル（model.pt）で全コマを検出して使う（.venv-train が要る）")
     p.add_argument("--tracknet-threshold", type=float, default=0.25, help="学習したモデルの閾値")
+    p.add_argument("--joint-fit", action="store_true",
+                   help="ラリーの中のショットをつないでまとめて当てはめ直す（打点・打った時刻をとなりのショットと合わせ、"
+                        "長いショットからシャトルの終端速度も求める）")
+    p.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit のとき、終端速度は設定の値のままにする")
     p.set_defaults(func=cmd_shots)
 
     p = add("summarize")
