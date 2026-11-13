@@ -578,6 +578,22 @@ def detections_from_heat(data_dir: Path, heat_path: Path, threshold: float = 0.5
     return det
 
 
+def train_python() -> Path | None:
+    """``.venv-train`` の Python のパス（なければ None）。"""
+    root = Path(__file__).resolve().parents[2]
+    for py in (root / ".venv-train" / "Scripts" / "python.exe", root / ".venv-train" / "bin" / "python"):
+        if py.exists():
+            return py
+    return None
+
+
+def can_predict() -> bool:
+    """``predict_in_train_env`` を動かせるか（この Python に torch があるか、``.venv-train`` があるか）。"""
+    import importlib.util
+
+    return importlib.util.find_spec("torch") is not None or train_python() is not None
+
+
 def predict_in_train_env(data_dir: Path, ckpt: Path, out: Path | None = None, prefer: str | None = None) -> Path:
     """``predict`` を、torch のある Python（この Python か、なければ ``.venv-train``）で動かす。"""
     import importlib.util
@@ -587,10 +603,8 @@ def predict_in_train_env(data_dir: Path, ckpt: Path, out: Path | None = None, pr
     if importlib.util.find_spec("torch") is not None:
         return predict(data_dir, ckpt, out, prefer=prefer)
     root = Path(__file__).resolve().parents[2]
-    py = root / ".venv-train" / "Scripts" / "python.exe"
-    if not py.exists():
-        py = root / ".venv-train" / "bin" / "python"
-    if not py.exists():
+    py = train_python()
+    if py is None:
         raise FileNotFoundError("torch の入った Python（.venv-train）が見つかりません（docs/gpu.md）")
     out = out or Path(ckpt).with_name(Path(ckpt).stem + "_pred.npy")
     args = [str(py), "-W", "ignore", "-m", "smash_speed.train.tracknet_train", "predict", str(data_dir), str(ckpt),

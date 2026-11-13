@@ -2,6 +2,7 @@
 
 1. 動画全体を 1 回だけ縮小して読み、シャトルを検出する（``detection.baseline``。1 コマ 1 点）。
    学習したモデル（``tracknet``）か、外の検出 CSV（``detections``）を代わりに使うこともできる（F1b）。
+   コマンドでは、設定の ``detection.shot_list_model`` が置いてあればそれを使う（F1c。``choose_tracknet``）。
 2. 打球音（音声があれば）と軌道の向きの変化から、すべての打球の時刻と打った側を出す（``hits.find_hits``）。
 3. 打球の間隔で組に分け、組ごとに軌道と初速を当てはめる（``shot_fit.fit_shots``）。ほかの組の検出が
    混ざらないよう、組の前後で検出を切り分ける。``joint_fit=True`` なら、その後に組の中のショットをつないで
@@ -90,6 +91,8 @@ class ShotListOptions:
     tracknet: Path | None = None      # 学習したモデル（``tracknet_train`` の model.pt）。あればこれで全コマを検出し
                                       # （``tracknet_train.detect_video``。torch は ``.venv-train``）、自前の検出の代わりに使う
     tracknet_threshold: float = TRACKNET_THRESHOLD
+    tracknet_fallback: bool = False   # 真なら、学習したモデルで検出できなかったとき（torch が動かないなど）今の検出に戻す
+                                      # （設定の既定のモデルを使うとき。``default_tracknet``）
     joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
                                       # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
     joint_options: JointOptions | None = None
@@ -159,6 +162,32 @@ def load_detections(path: Path, meta: VideoMeta, start_s: float | None = None, e
     cols = ["frame", "timestamp", "x_px", "y_px", "visible", "confidence", "track_id"]
     return det[cols + [c for c in det.columns if c not in cols]].sort_values("frame", kind="stable"
                                                                              ).reset_index(drop=True)
+
+
+def default_tracknet(cfg: dict[str, Any]) -> Path | None:
+    """設定の ``detection.shot_list_model``（F1c。相対パスはこのリポジトリから）が置いてあり、torch の入った
+    Python（``.venv-train``）があればそのパス。どちらかがなければ None（今の検出で探す）。"""
+    from smash_speed.config import PROJECT_ROOT
+    from smash_speed.train.tracknet_train import can_predict
+
+    p = (cfg.get("detection") or {}).get("shot_list_model")
+    if not p:
+        return None
+    p = Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p
+    return p if p.exists() and can_predict() else None
+
+
+def choose_tracknet(tracknet: Path | None, detections: Path | None, baseline: bool, cfg: dict[str, Any]
+                    ) -> tuple[Path | None, bool]:
+    """コマンドの引数から、使う学習したモデルと、失敗したら今の検出に戻すか（``tracknet_fallback``）を決める。
+
+    モデルか検出 CSV を指定したらそれ、``baseline``（``--baseline-detector``）なら今の検出、どちらでもなければ
+    設定の既定のモデル（``default_tracknet``。失敗したら今の検出に戻す）。
+    """
+    if tracknet is not None or detections is not None or baseline:
+        return tracknet, False
+    p = default_tracknet(cfg)
+    return p, p is not None
 
 
 def tracknet_detections(o: ShotListOptions, out: Path, progress: Callable[[str], None] = print) -> Path:
@@ -529,7 +558,15 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     if onsets is not None:
         progress(f"[進行] 打球音の候補 {len(onsets)} 個")
     lap("audio")
-    det_path = tracknet_detections(o, out, progress) if o.tracknet is not None else o.detections
+    tracknet, detector_note = o.tracknet, None
+    try:
+        det_path = tracknet_detections(o, out, progress) if tracknet is not None else o.detections
+    except (OSError, RuntimeError, ValueError, AnalysisError) as e:
+        if not o.tracknet_fallback:
+            raise
+        detector_note = f"学習したモデルで検出できなかったので、今の検出で探した（{str(e).strip()[-300:]}）"
+        progress(f"[進行] {detector_note}")
+        tracknet, det_path = None, o.detections
     if det_path is not None:
         det = load_detections(det_path, meta, o.start_s, o.end_s)
     else:
@@ -577,9 +614,11 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "capture_fps": o.capture_fps, "fps": meta.capture_fps, "width": meta.width, "height": meta.height,
         "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi, "recorded_at": recorded_at(meta),
         "audio": str(Path(o.audio).resolve()) if o.audio else None,
-        "detector": "tracknet" if o.tracknet is not None else ("file" if o.detections is not None else "baseline"),
+        "detector": "tracknet" if tracknet is not None else ("file" if o.detections is not None else "baseline"),
         "detections": str(Path(det_path).resolve()) if det_path is not None else None,
-        "tracknet_threshold": o.tracknet_threshold if o.tracknet is not None else None,
+        "tracknet": str(Path(tracknet).resolve()) if tracknet is not None else None,
+        "tracknet_threshold": o.tracknet_threshold if tracknet is not None else None,
+        "detector_note": detector_note,
         "used_audio": onsets is not None, "n_onsets": None if onsets is None else len(onsets),
         "n_frames": len(det), "n_visible": n_vis,
         "n_tracks": None if tracks is None else len(tracks),
@@ -678,18 +717,21 @@ def main(argv: list[str] | None = None) -> None:
                     help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
     ap.add_argument("--tracknet", type=Path, default=None, help="学習したモデル（model.pt）で全コマを検出して使う")
     ap.add_argument("--tracknet-threshold", type=float, default=TRACKNET_THRESHOLD)
+    ap.add_argument("--baseline-detector", action="store_true",
+                    help="設定の学習したモデル（detection.shot_list_model）を使わず、今の検出で探す")
     ap.add_argument("--joint-fit", action="store_true",
                     help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
     ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
+    tracknet, fallback = choose_tracknet(a.tracknet, a.detections, a.baseline_detector, cfg)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
                                          players=a.players, hitter_prior=not a.no_hitter_prior,
                                          hit_players=not a.no_hit_players, detections=a.detections,
-                                         tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold,
-                                         joint_fit=a.joint_fit,
+                                         tracknet=tracknet, tracknet_threshold=a.tracknet_threshold,
+                                         tracknet_fallback=fallback, joint_fit=a.joint_fit,
                                          joint_options=JointOptions(estimate_vt=not a.no_estimate_vt)), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))

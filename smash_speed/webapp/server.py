@@ -763,6 +763,8 @@ def run(kind: str):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
         if b.get("players"):
             args.append("--players")
+        if not b.get("model"):   # 学習したモデル（設定の detection.shot_list_model）は画面で選んだときだけ使う
+            args.append("--baseline-detector")
         t = start_task("すべてのショットを解析", [cli(*args)])
     elif kind == "propose_calib":
         if S.meta is None:
@@ -974,16 +976,18 @@ def shots_get():
     """``shots`` の結果（``shot_list.json`` と ``shots.csv``）。ショットは打った時刻の順。
 
     種類の正解ラベル（ROADMAP B6）は出力の場所の ``shot_labels.csv`` から付け直し、各ショットの ``truth`` に入れる。
+    ``model`` は、学習したシャトルの検出（設定の ``detection.shot_list_model``。F1c）を使えるか（画面の選択肢を出すか）。
     """
     from dataclasses import asdict
 
     from smash_speed.shot_labels import LABELS_FILE, NOT_A_HIT, NOT_A_HIT_LABEL, match_labels, read_labels
-    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shot_list import SHOT_LIST_FILE, default_tracknet
     from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
 
     d = _shots_dir()
+    model = default_tracknet(S.cfg()) is not None
     if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
-        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS)
+        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS, model=model)
     info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     shots = read_shots(Path(d) / SHOTS_FILE)
     labels = read_labels(out_root() / LABELS_FILE)
@@ -999,7 +1003,7 @@ def shots_get():
              if (Path(d) / f).exists()}
     # 正しい種類として選べるのは、labels の 8 種類（unknown のほか）と「打球ではない」（not_hit）
     return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,
-              files=files,
+              files=files, model=model,
               label_stats=_label_stats(labels, info.get("video", "")))
 
 

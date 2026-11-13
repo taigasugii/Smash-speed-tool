@@ -88,6 +88,10 @@ detection:
     tracknet_ckpt: null        # ckpts/TrackNet_best.pt
     inpaintnet_ckpt: null      # ckpts/InpaintNet_best.pt（省略可）
     python: null               # TrackNetV3 用の Python（null なら現在の Python）
+  # ショットの一覧で使う、実動画の正解で追加学習したシャトルの検出（F1c。docs/gpu.md の「既定にする」）。
+  # このファイルがあり、torch の入った Python（.venv-train）があれば使い、なければ今の検出（baseline）で探す。
+  # スマッシュの解析（analyze・find-smashes）は今の検出のまま（初速が良くならないため）
+  shot_list_model: ckpts/shuttle/model_ft1.pt
   n_track_candidates: 40       # 解析で打点後の軌道を選ぶときの候補の数（打球音・打点の位置で選ぶ）
   # 打つ人の足元・着地点がわかっているときの探し方（smash_speed/detection/guided.py）
   auto_roi: true               # 検出する範囲が未指定なら、打つ人から着地点までの空間（床〜高さ 4 m）を画像に投影して絞る

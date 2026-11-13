@@ -310,8 +310,10 @@ def test_cli_without_audio(rally_video, tmp_path, capsys, monkeypatch):
         return {"n_frames": 10, "coverage": {"h": 1.0, "o": 0.5}, "provider": "CPUExecutionProvider", "detect_s": 0.1}
 
     monkeypatch.setattr(shot_list, "analyze_players", fake_players)
+    # 学習したモデルが置いてある PC でも、合成の動画は今の検出で探す（モデルの既定は test_default_tracknet_*）
     main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
-          "--players"])
+          "--players", "--baseline-detector"])
+    assert json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))["detector"] == "baseline"
     saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     assert not saved["used_audio"] and saved["n_onsets"] is None
     assert calls == [(d / "rally.mp4", tmp_path.resolve(), None, None)]
@@ -366,6 +368,56 @@ def test_analyze_video_with_external_detections(rally_video, tmp_path, monkeypat
     assert calls == [("model.pt", 0.3)]
     assert info["detector"] == "tracknet" and info["tracknet_threshold"] == 0.3 and info["n_hits"] == ref["n_hits"]
     assert Path(info["detections"]) == (tmp_path / "tn" / "tracknet" / "detections.csv").resolve()
+
+
+def test_default_tracknet_is_used_only_when_the_model_and_torch_are_there(tmp_path, monkeypatch):
+    """設定の ``detection.shot_list_model`` は、ファイルがあり torch を動かせるときだけ既定になる（F1c）。"""
+    import smash_speed.train.tracknet_train as tt
+    from smash_speed.shot_list import choose_tracknet, default_tracknet
+
+    model = tmp_path / "model.pt"
+    cfg = {"detection": {"shot_list_model": str(model)}}
+    monkeypatch.setattr(tt, "can_predict", lambda: True)
+    assert default_tracknet(cfg) is None                       # まだ置いていない
+    model.write_bytes(b"")
+    assert default_tracknet(cfg) == model
+    assert default_tracknet({"detection": {"shot_list_model": None}}) is None
+    assert default_tracknet({}) is None
+    # 指定したモデル・検出 CSV・--baseline-detector が先。既定のモデルのときだけ、失敗したら今の検出に戻す
+    assert choose_tracknet(None, None, False, cfg) == (model, True)
+    assert choose_tracknet(None, None, True, cfg) == (None, False)
+    assert choose_tracknet(tmp_path / "x.pt", None, False, cfg) == (tmp_path / "x.pt", False)
+    assert choose_tracknet(None, tmp_path / "d.csv", False, cfg) == (None, False)
+    monkeypatch.setattr(tt, "can_predict", lambda: False)     # .venv-train がない PC
+    assert default_tracknet(cfg) is None and choose_tracknet(None, None, False, cfg) == (None, False)
+
+
+def test_default_tracknet_falls_back_to_the_baseline_detector(rally_video, tmp_path, monkeypatch):
+    """既定のモデルで検出できなかったら（torch が動かないなど）、今の検出で一覧を作り、理由を残す。
+    指定したモデルなら止める。"""
+    import smash_speed.train.tracknet_train as tt
+    from smash_speed.errors import AnalysisError
+
+    d, truth = rally_video
+
+    def broken(*a, **k):
+        raise RuntimeError("熱の地図を作れませんでした：DirectML のエラー")
+
+    monkeypatch.setattr(tt, "detect_video", broken)
+    (tmp_path / "model.pt").write_bytes(b"")
+    o = dict(video=d / "rally.mp4", calib=d / "calibration.json", use_audio=False, tracknet=tmp_path / "model.pt")
+    info = analyze_video(ShotListOptions(out_dir=tmp_path / "fb", tracknet_fallback=True, **o), CFG,
+                         progress=lambda m: None)
+    assert info["detector"] == "baseline" and info["tracknet"] is None and "DirectML" in info["detector_note"]
+    assert sum(f is not None for f in _match(read_shots(tmp_path / "fb" / SHOTS_FILE), truth)) >= len(truth) - 1
+    with pytest.raises(RuntimeError):
+        analyze_video(ShotListOptions(out_dir=tmp_path / "stop", **o), CFG, progress=lambda m: None)
+    (tmp_path / "model.pt").unlink()   # ファイルがないときも同じ
+    info = analyze_video(ShotListOptions(out_dir=tmp_path / "gone", tracknet_fallback=True, **o), CFG,
+                         progress=lambda m: None)
+    assert info["detector"] == "baseline" and "見つかりません" in info["detector_note"]
+    with pytest.raises(AnalysisError):
+        analyze_video(ShotListOptions(out_dir=tmp_path / "gone2", **o), CFG, progress=lambda m: None)
 
 
 def test_load_detections_checks_columns_and_cuts_the_range(tmp_path):

@@ -702,6 +702,11 @@ python -m smash_speed.shot_list data\IMG_4397.MOV --calib out\calibration.json -
 `stats.json`・`landing.svg`（ラリーの統計と着地点の分布図、下の「ラリーの統計」）、
 `report.html`（1 枚のレポート、下の「1 本の動画のレポート」）を書き出す。
 `smash-speed shots --video <動画> --calib <calibration.json> --out <出力先>` でも同じことができる（GUI はこれを裏で動かす）。
+シャトルの検出は、実動画の正解で追加学習したモデル（`configs/default.yaml` の `detection.shot_list_model`、
+`ckpts/shuttle/model_ft1.pt`）が置いてあり `.venv-train` があればそれを使い、なければ今の検出で探す（F1c。打球の見つけ方が
+再現率 0.900 → 0.971・適合率 0.797 → 0.944 に良くなる。作り方と数字は `docs/gpu.md` の「ショットの一覧の既定にする」）。
+今の検出で探すときは `--baseline-detector`、GUI では「練習させた見つけ方でシャトルを探す」を外す。スマッシュの解析（`analyze`・
+`find-smashes`）は今の検出のまま。
 `--joint-fit` を付けると、ラリーの中のショットをつないでまとめて当てはめ直し（となりのショットと打点・打った時刻を合わせる）、
 長く飛んだショットからシャトルの終端速度も求める（`shot_list.json` の `joint_fit`。既定では使わない。方法と数字は `docs/rally_fit.md`）。
 GUI の「ショットの一覧」の画面はこれを読む（出力先は `<出力の場所>\<動画の名前>_shots`）。
