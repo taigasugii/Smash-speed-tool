@@ -227,14 +227,18 @@ def cmd_find_smashes(a: argparse.Namespace, cfg: dict) -> int:
 
 
 def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
-    from smash_speed.shot_list import ShotListOptions, analyze_video
+    from smash_speed.rally_fit import JointOptions
+    from smash_speed.shot_list import ShotListOptions, analyze_video, choose_tracknet
 
+    tracknet, fallback = choose_tracknet(Path(a.tracknet) if a.tracknet else None,
+                                         Path(a.detections) if a.detections else None, a.baseline_detector, cfg)
     o = ShotListOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
                         start_s=a.start, end_s=a.end, roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
                         audio=Path(a.audio) if a.audio else None, use_audio=not a.no_audio,
                         players=a.players, hitter_prior=not a.no_hitter_prior,
                         detections=Path(a.detections) if a.detections else None,
-                        tracknet=Path(a.tracknet) if a.tracknet else None, tracknet_threshold=a.tracknet_threshold)
+                        tracknet=tracknet, tracknet_threshold=a.tracknet_threshold, tracknet_fallback=fallback,
+                        joint_fit=a.joint_fit, joint_options=JointOptions(estimate_vt=not a.no_estimate_vt))
     info = analyze_video(o, cfg, progress=lambda m: print(m, flush=True))
     print()
     print("種類ごとの本数")
@@ -269,6 +273,59 @@ def cmd_stereo(a: argparse.Namespace, cfg: dict) -> int:
                       offset_s=a.offset, impact_time_s=a.impact_time)
     row = analyze_stereo(o, cfg)
     print(f"初速 {row['speed_initial_kmh']:.1f} km/h  時刻のずれ（2台目 − 1台目）{row['sync_offset_s'] * 1000:.2f} ms")
+    return 0
+
+
+def cmd_stereo_truth(a: argparse.Namespace, cfg: dict) -> int:
+    from smash_speed.stereo_truth import StereoRallyOptions, TruthOptions, analyze_stereo_rally, print_truth
+
+    rs = tuple(v / 1000.0 for v in a.rolling_shutter_ms) if a.rolling_shutter_ms else (0.0, 0.0)
+    o = StereoRallyOptions(
+        videos=[Path(v) for v in a.videos], calibs=[Path(c) for c in a.calibs], out_dir=Path(a.out),
+        detections=[Path(d) for d in a.detections] if a.detections else None,
+        tracknet=Path(a.tracknet) if a.tracknet else None, capture_fps=a.capture_fps, start_s=a.start, end_s=a.end,
+        offset_s=a.offset, sync_search_s=a.sync_search, refine_sync=not a.no_refine_sync,
+        audio_paths=[Path(x) for x in a.audio] if a.audio else None, use_audio=not a.no_audio,
+        hit_times=[float(x) for x in a.hits.split(",")] if a.hits else None,
+        truth=TruthOptions(terminal_velocity=a.terminal_velocity, rolling_shutter_s=rs))
+    print_truth(analyze_stereo_rally(o, cfg))
+    print(f"結果：{Path(a.out) / 'stereo_truth.json'}")
+    return 0
+
+
+def cmd_stereo_compare(a: argparse.Namespace, cfg: dict) -> int:
+    import json
+
+    from smash_speed.shots import SHOTS_FILE, read_shots
+    from smash_speed.stereo_truth import COMPARE_FILE, TRUTH_FILE, compare_shots, compare_summary
+
+    tp, sp = Path(a.truth), Path(a.shots)
+    tp = tp / TRUTH_FILE if tp.is_dir() else tp
+    sp = sp / SHOTS_FILE if sp.is_dir() else sp
+    truth = json.loads(tp.read_text(encoding="utf-8"))
+    shots = read_shots(sp)
+    df = compare_shots(truth, shots, a.camera, a.max_dt)
+    out = Path(a.out) if a.out else tp.with_name(COMPARE_FILE)
+    df.to_csv(out, index=False, encoding="utf-8-sig")
+    s = compare_summary(df, len(shots))
+    out.with_suffix(".json").write_text(json.dumps(s, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"正解 {s['n_truth']} 本のうち、1 台の解析で初速が出ていて比べられたもの {s['n_compared']} 本"
+          f"（1 台の解析のショット {s['n_single']} 本）")
+    if s["n_compared"]:
+        print(f"初速の誤差（1 台 − 正解）：中央値 {s['median_abs_pct']}%・平均 {s['mape_pct']}%・90% 点 {s['p90_abs_pct']}%・"
+              f"かたより {s['bias_pct']:+}%")
+        print(f"打った時刻の差の中央値 {s['median_abs_dt_ms']} ms"
+              + (f"、同じ時刻の速さで比べた誤差の中央値 {s['median_abs_same_t_pct']}%" if "median_abs_same_t_pct" in s else "")
+              + (f"、打点のずれの中央値 {s['median_hit_point_err_m']} m" if "median_hit_point_err_m" in s else ""))
+    print(f"表：{out}")
+    return 0
+
+
+def cmd_stereo_study(a: argparse.Namespace, cfg: dict) -> int:
+    from smash_speed.stereo_study import run_study, study_cases
+
+    df = run_study(cfg, Path(a.out), study_cases()[:1] if a.quick else None, a.workers)
+    print(df.to_string(index=False))
     return 0
 
 
@@ -369,6 +426,9 @@ SUBCOMMANDS: dict[str, str] = {
     "detect": "シャトルを検出して CSV に保存する",
     "analyze": "動画1本からシャトルの初速・平均速度を算出する",
     "stereo": "2台のカメラで三角測量して初速を算出する",
+    "stereo-truth": "2 台のスマホの動画から、すべてのショットの正しい初速と 3 次元の軌道を出す（1 台の解析の答え合わせ用）",
+    "stereo-compare": "1 台で解析したショットの一覧を、2 台からの正しい初速と比べる",
+    "stereo-study": "2 台のカメラの置き方・fps・時刻合わせの誤差による初速の誤差を、合成データで調べる",
     "annotate": "シャトル位置・打点・着地の正解ラベルを付ける",
     "make-lowfps": "高 fps 動画から疑似低 fps 動画とラベルを生成する",
     "export-tracknet": "ラベル付きデータを TrackNetV3 の学習データ形式で書き出す",
@@ -481,6 +541,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_stereo)
 
+    p = add("stereo-truth")
+    p.add_argument("--videos", nargs=2, required=True, help="同じラリーを撮った 2 本の動画（1 台目・2 台目）")
+    p.add_argument("--calibs", nargs=2, required=True, help="それぞれの動画のキャリブレーション（calibrate の出力）")
+    p.add_argument("--out", required=True)
+    p.add_argument("--detections", nargs=2, help="自前の検出の代わりに使う検出 CSV（1 台ずつ）")
+    p.add_argument("--tracknet", help="学習したモデル（model.pt）で両方の動画を検出して使う（.venv-train が要る）")
+    p.add_argument("--capture-fps", nargs=2, type=float, help="実際の撮影 fps（スロー動画でメタデータと違う場合。1 台ずつ）")
+    p.add_argument("--start", type=float, help="解析する区間の始まり（1 台目の動画の時刻）[s]")
+    p.add_argument("--end", type=float)
+    p.add_argument("--offset", type=float,
+                   help="2 台目の時刻 − 1 台目の時刻 [s]（省略時は音から。±0.05 秒ほど合っていれば映像で細かく合わせる）")
+    p.add_argument("--sync-search", type=float, default=0.08, help="映像で時刻を合わせるときに探す幅 [s]")
+    p.add_argument("--no-refine-sync", action="store_true", help="映像で時刻を細かく合わせない（音・--offset のまま）")
+    p.add_argument("--audio", nargs=2, help="動画の音声の代わりに使う WAV（1 台ずつ）")
+    p.add_argument("--no-audio", action="store_true", help="音を使わない（--offset が要る）")
+    p.add_argument("--hits", help="打球の時刻を手で渡す（1 台目の時刻。カンマ区切り。省略時は自動で見つける）")
+    p.add_argument("--terminal-velocity", choices=["session", "fixed"], default="session",
+                   help="終端速度の決め方：session = 長い飛行から決める / fixed = 設定の値のまま")
+    p.add_argument("--rolling-shutter-ms", nargs=2, type=float,
+                   help="画像の上の行から下の行までの読み出しの時間 [ms]（分かっていれば。1 台ずつ）")
+    p.set_defaults(func=cmd_stereo_truth)
+
+    p = add("stereo-compare")
+    p.add_argument("--truth", required=True, help="stereo-truth の出力先（または stereo_truth.json）")
+    p.add_argument("--shots", required=True, help="1 台で解析した一覧の保存先（smash-speed shots の出力先、または shots.csv）")
+    p.add_argument("--camera", type=int, choices=[1, 2], default=1, help="1 台で解析したのがどちらの動画か")
+    p.add_argument("--max-dt", type=float, default=0.3, help="同じショットとみなす打った時刻の差 [s]")
+    p.add_argument("--out", help="表の保存先（省略時は正解と同じフォルダの stereo_compare.csv）")
+    p.set_defaults(func=cmd_stereo_compare)
+
+    p = add("stereo-study")
+    p.add_argument("--out", default="outputs/stereo_study")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--quick", action="store_true", help="基本の条件だけ（動くかの確かめ）")
+    p.set_defaults(func=cmd_stereo_study)
+
     p = add("annotate")
     video_args(p, rng=True)
     p.add_argument("--out", required=True, help="ラベルの保存先ディレクトリ")
@@ -558,6 +654,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--detections", help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
     p.add_argument("--tracknet", help="学習したモデル（model.pt）で全コマを検出して使う（.venv-train が要る）")
     p.add_argument("--tracknet-threshold", type=float, default=0.25, help="学習したモデルの閾値")
+    p.add_argument("--baseline-detector", action="store_true",
+                   help="設定の学習したモデル（detection.shot_list_model）を使わず、今の検出で探す")
+    p.add_argument("--joint-fit", action="store_true",
+                   help="ラリーの中のショットをつないでまとめて当てはめ直す（打点・打った時刻をとなりのショットと合わせ、"
+                        "長いショットからシャトルの終端速度も求める）")
+    p.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit のとき、終端速度は設定の値のままにする")
     p.set_defaults(func=cmd_shots)
 
     p = add("summarize")

@@ -229,6 +229,33 @@ def test_parallel_grid_fits_match_initial_fit(cam):
     fits = fit_shots(det, t_hits, cam, PHYS, [s.side for s in segs], opts, n_rounds=0, refine_times=False,
                      hitter_xy=feet, workers=2)
     for k, s in enumerate(segs):
-        one = initial_fit(fits[k].obs, fits[k].t_hit, s.side, PHYS, opts, feet[k])
+        # ``fit_shots`` は打点の位置の目安を 2 乗のまま効かせる（``quadratic_priors``）ので、同じ設定で比べる
+        one = initial_fit(fits[k].obs, fits[k].t_hit, s.side, PHYS,
+                          FitOptions(refine_plane=True, ci_method="none", quadratic_priors=True), feet[k])
         assert np.array_equal(fits[k].fit.theta, one.theta)
         assert np.array_equal(fits[k].fit.plane.direction, one.plane.direction)
+
+
+def test_foot_hit_times_move_a_late_hit_back_to_the_hitter(rally_fit):
+    """打球音のないショットの遅れた打球の時刻を、軌道が打つ人の足元にいちばん近づく時刻へ戻す。"""
+    from smash_speed.shot_fit import foot_hit_times
+
+    rally, _, fits = rally_fit
+    fast = [i for i, s in enumerate(rally.segments) if s.speed0 > 25 and fits[i].fit is not None]
+    assert fast
+    feet = [s.p0[:2] for s in rally.segments]
+    late = [sf.t_hit + (0.09 if i in fast else 0.0) for i, sf in enumerate(fits)]     # 25 m/s でも 2 m 先
+    none = [None] * len(fits)
+    new = foot_hit_times(fits, feet, none, PHYS, late)
+    for i, s in enumerate(rally.segments):
+        if i in fast:
+            assert abs(new[i] - s.t_hit) < 0.02
+            assert abs(late[i] - s.t_hit) > 0.08
+        else:
+            assert new[i] == late[i]
+    # 打球音のあるショット・足元のないショット・打点が足元に近いショットは動かさない
+    assert foot_hit_times(fits, feet, [0.0] * len(fits), PHYS, late) == late
+    assert foot_hit_times(fits, none, none, PHYS, late) == late
+    on_time = [sf.t_hit for sf in fits]
+    assert foot_hit_times(fits, feet, none, PHYS, on_time) == on_time
+
