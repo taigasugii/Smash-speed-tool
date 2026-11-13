@@ -67,6 +67,11 @@ class Shot:
     source: str = ""                       # どこから来たか（smash_batch | manual | …）
     ref: str = ""                          # 元の結果の場所（出力先からの相対パス・候補の番号など）
     note: str = ""
+    # ダブルス（選手の追跡で 1 側に 2 人いたとき。``doubles.assign_doubles``）。シングルスでは空欄
+    hitter_id: str = ""                    # 打った人：P1・P2（h の側）、P3・P4（o の側）
+    hitter_conf: float | None = None       # 打った人の確かさ 0〜1（パートナーとの差が大きいほど 1 に近い）
+    formation: str = ""                    # 打った側の陣形：attack（前後）| defence（横並び）| transition（移っている途中）
+    opp_formation: str = ""                # 相手の側の陣形
 
     @property
     def hit_point(self) -> np.ndarray | None:

@@ -9,6 +9,7 @@
 
 - 側：分かっていればその側（h：x < 0、o：x > 0）の選手。分からなければ打点に近い選手。
 - ダブルス（1 側に 2 人）：打点が分かれば打点に近い方。分からなければ、決められない（``ambiguous``）として近い方を返さない。
+  ``player`` で選手の番号を渡せば、その人の足元（誰が打ったかは ``doubles.pick_hitter`` で選ぶ。ROADMAP D4b）。
 - 中央値から ``spread_m`` より離れたコマ（足が隠れて枠の下の辺が上がった・隣の人と取り違えたなど）は外して出し直す。
 """
 
@@ -71,10 +72,11 @@ def _median_foot(g: pd.DataFrame, o: HitterOptions) -> tuple[np.ndarray, np.ndar
 
 
 def hitter_at(players: pd.DataFrame, t_hit: float, side: str = "", hit_xy: Any = None,
-              o: HitterOptions | None = None) -> HitterEstimate | None:
+              o: HitterOptions | None = None, player: int | None = None) -> HitterEstimate | None:
     """打った時刻 ``t_hit`` の、打った人の床の上の足元。選手の位置が足りなければ None。
 
-    ``side`` は打った側（分からなければ ""）、``hit_xy`` は打点のコートの位置（分かれば。選手を選ぶのに使う）。
+    ``side`` は打った側（分からなければ ""）、``hit_xy`` は打点のコートの位置（分かれば。選手を選ぶのに使う）、
+    ``player`` は打った人の番号（ダブルスで、誰が打ったかが分かっているとき。``side`` と一緒に渡す）。
     """
     o = o or HitterOptions()
     if players is None or players.empty:
@@ -87,6 +89,8 @@ def hitter_at(players: pd.DataFrame, t_hit: float, side: str = "", hit_xy: Any =
     near = players[(players["t"] - t_hit).abs() <= o.window_s]
     if side:
         near = near[near["side"] == side]
+    if player is not None:
+        near = near[near["player"] == player]
     found = []
     for (s, p), g in near.groupby(["side", "player"]):
         r = _median_foot(g, o)
