@@ -605,6 +605,16 @@ def worker_pool(workers: int) -> Iterator[None]:
             ex.shutdown(cancel_futures=True)
 
 
+def pool_executor() -> Any:
+    """``worker_pool`` のプロセスの組（``concurrent.futures.ProcessPoolExecutor``。なければ None）。"""
+    return _shared_pool[0] if pool_active() else None
+
+
+def worker_env() -> Any:
+    """この中で起動したプロセスに、並べて動かすときの環境変数（行列計算を 1 スレッド）を渡す。"""
+    return _worker_env()
+
+
 def pool_active() -> bool:
     """``worker_pool`` のプロセスの組が使える（壊れていない）か。"""
     return bool(_shared_pool) and _shared_pool[0] is not None

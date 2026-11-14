@@ -37,7 +37,7 @@ def _jobs(rally, opts):
 
 
 def test_integration_matches_simulate():
-    """2 次元の RK4（幾何級数の刻み）とエルミート補間の位置は、``physics.simulate``（DOP853）と 0.01 mm 以内。"""
+    """2 次元の RK4（幾何級数の刻み）とエルミート補間の位置は、``physics.simulate``（DOP853）と 0.005 mm 以内。"""
     rng = np.random.default_rng(0)
     worst = 0.0
     for _ in range(100):
@@ -47,7 +47,7 @@ def test_integration_matches_simulate():
         t = np.sort(rng.uniform(0.002, 2.5, 40))
         worst = max(worst, np.abs(simulate(p0, v0, 0.0, t, PHYS)[0]
                                   - simulate_batch(p0, v0, 0.0, t, PHYS.g, PHYS.terminal_velocity)).max())
-    assert worst < 1e-5
+    assert worst < 5e-6
 
 
 def test_batch_fits_match_cpu_fits(rally):
@@ -125,7 +125,7 @@ def test_fit_shots_batch_matches_cpu(rally):
 
 
 def test_analyze_hits_batch_is_the_same_for_any_number_of_rally_threads():
-    """まとめて解くとき、同時に進めるラリーの数によらず同じショットになり、1 つずつの当てはめとも合う。"""
+    """まとめて解くとき、同時に進めるラリーの数・プロセスの数によらず同じショットになり、1 つずつの当てはめとも合う。"""
     rng = np.random.default_rng(5)
     rallies = [make_rally(rng, PHYS, n_shots=3, t_start=0.5)]
     rallies.append(make_rally(rng, PHYS, n_shots=3, server_side="o", t_start=rallies[0].t_end + 5.0))
@@ -138,10 +138,12 @@ def test_analyze_hits_batch_is_the_same_for_any_number_of_rally_threads():
     one = analyze_hits(det, hits, CAM, PHYS, CFG, rally_threads=1, fit_backend="batch", **kw)
     two = analyze_hits(det, hits, CAM, PHYS, CFG, rally_threads=2, fit_backend="batch", **kw)
     many = analyze_hits(det, hits, CAM, PHYS, CFG, fit_backend="batch", **kw)
+    procs = analyze_hits(det, hits, CAM, PHYS, CFG, fit_backend="batch", workers=2, batch_processes=2, **kw)
     cpu = analyze_hits(det, hits, CAM, PHYS, CFG, fit_backend="cpu", **kw)
     key = [(s.t_hit_s, s.shot_type, s.speed_kmh, s.hit_x_m) for s in one]
     assert key == [(s.t_hit_s, s.shot_type, s.speed_kmh, s.hit_x_m) for s in two]
     assert key == [(s.t_hit_s, s.shot_type, s.speed_kmh, s.hit_x_m) for s in many]
+    assert key == [(s.t_hit_s, s.shot_type, s.speed_kmh, s.hit_x_m) for s in procs]
     assert [s.shot_type for s in one] == [s.shot_type for s in cpu]
     for a, b in zip(one, cpu):
         assert abs(a.t_hit_s - b.t_hit_s) < 1e-6
@@ -179,3 +181,12 @@ def test_gate_runs_waiting_threads_together(rally, monkeypatch):
     alone = fit_trajectories(jobs)
     assert [f.rms_px for f in out[0] + out[1]] == [f.rms_px for f in alone]
     assert isinstance(gate, BatchGate) and not fit_batch._GATE
+
+
+def test_balanced_chunks():
+    """ラリーを打球の数がなるべく同じ組に分ける（組の中は番号の順、空の組は作らない）。"""
+    from smash_speed.shot_list import _balanced_chunks
+
+    assert _balanced_chunks([40, 5, 5, 30, 20], 2) == [[0, 1, 2], [3, 4]]   # 50 本と 50 本
+    assert _balanced_chunks([3, 4], 4) == [[1], [0]]
+    assert _balanced_chunks([3, 4, 5], 1) == [[0, 1, 2]]

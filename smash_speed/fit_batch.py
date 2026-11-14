@@ -49,6 +49,9 @@ try:  # scipy の least_squares（trf）と同じ手順にするため、中の�
 except ImportError:  # scipy の中の名前が変わったら、1 つずつの当てはめ（CPU）に戻す
     AVAILABLE = False
 
+# 時間の刻み。1 秒まで 145 刻み。``physics.simulate``（DOP853）との位置の差は、初速 2〜170 m/s・2.5 秒までで最大 0.0007 mm。
+# 刻みを 2 倍（1 ms・0.08・40 ms）にすると積分は 2 倍速いが、差が 0.011 mm になり、別の物の検出が混ざって当てはまらない
+# ショット（最適化が収束しない）の結果がより大きく揺れて、となりのショットの打点・打った時刻にも及ぶ（docs/speed.md の F3e）
 STEP_MIN_S = 5e-4      # 打った直後の刻み [s]
 STEP_GROWTH = 0.04     # 刻み ÷ 打ってからの時間
 STEP_MAX_S = 0.02      # 刻みの上限 [s]（遅くなった後は重力の時間 v_t / g ≈ 0.7 s で変わる）
@@ -71,9 +74,7 @@ def _rhs(y: np.ndarray, negk: np.ndarray, g: float) -> np.ndarray:
     """2 次元の状態 (4, B) = (H, Z, U, W) の時間微分。``negk`` = −g / v_t²。"""
     d = np.empty_like(y)
     d[:2] = y[2:]
-    sp = negk * np.sqrt(y[2] * y[2] + y[3] * y[3])
-    np.multiply(sp, y[2], out=d[2])
-    np.multiply(sp, y[3], out=d[3])
+    np.multiply(y[2:], negk * np.hypot(y[2], y[3]), out=d[2:])
     d[3] -= g
     return d
 

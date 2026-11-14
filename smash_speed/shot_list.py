@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -54,8 +53,8 @@ from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.rally_fit import JointOptions, fit_rallies
 from smash_speed.fit_batch import gate_session
-from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, resolve_backend,
-                                  shot_fits_to_shots, worker_pool)
+from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, pool_executor,
+                                  resolve_backend, shot_fits_to_shots, worker_env, worker_pool)
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
                                write_shots)
@@ -65,7 +64,8 @@ SHOT_LIST_FILE = "shot_list.json"
 DETECTIONS_FILE = "detections.csv"
 TRACKNET_DIR = "tracknet"         # 学習したモデルの検出の作業場所（``<出力先>/tracknet/detections.csv``）
 TRACKNET_THRESHOLD = 0.25         # 学習したモデルの熱の地図の閾値（F1b：打球の見つけ方で 0.25 が良い）
-BATCH_RALLIES = 8                 # 当てはめをまとめて解くとき（``fit_backend="batch"``）に同時に進めるラリーの数
+BATCH_RALLIES = 8                 # 当てはめをまとめて解くとき（``fit_backend="batch"``）に、1 つのプロセスで同時に進めるラリーの数
+BATCH_PROCESSES = 4               # 同・ラリーを分けて進めるプロセスの数
 
 
 @dataclass
@@ -353,7 +353,8 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
                  players: pd.DataFrame | None = None, rally_threads: int | None = None, joint: JointOptions | None = None,
-                 joint_info: dict[str, Any] | None = None, fit_backend: str = "cpu") -> list[Shot]:
+                 joint_info: dict[str, Any] | None = None, fit_backend: str = "cpu",
+                 batch_processes: int | None = None) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -371,9 +372,11 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         joint: 与えると、ショットごとの当てはめの後に、打球の組ごとにショットをつないでまとめて当てはめ直す
             （``rally_fit.fit_rallies``。終端速度は動画全体で 1 つ）
         joint_info: 辞書を渡すと、まとめた当てはめの記録（つないだショットの数・終端速度・かかった時間）を入れる
-        fit_backend: 当てはめの計算の仕方（``shot_fit.resolve_backend``）。"batch" では、ラリーを ``rally_threads`` 個
-ずつ同時に進め、それぞれの段階の当てはめをほかのラリーの分とまとめて解く
-            （``fit_batch.BatchGate``。プロセスは使わない）。結果はラリーの組み方によらない
+        fit_backend: 当てはめの計算の仕方（``shot_fit.resolve_backend``）。"batch" では、ラリーを打球の数がなるべく
+            同じ ``batch_processes`` 組に分けてプロセスごとに進め、それぞれの中でラリーを ``rally_threads`` 個ずつ
+            同時に進めて、段階ごとの当てはめをほかのラリーの分とまとめて解く（``_fit_groups``・``fit_batch.BatchGate``）。
+            結果はラリーの組み方・プロセスの数によらない
+        batch_processes: "batch" で使うプロセスの数（None なら ``BATCH_PROCESSES``。``workers`` まで）
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
     backend = resolve_backend(fit_backend)
@@ -383,17 +386,11 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
 
     if rally_threads is None:
         rally_threads = BATCH_RALLIES if backend == "batch" else 4
-    n_batch = max(1, min(rally_threads, len(groups)))
+    fit_args = (det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players)
 
     def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
-        if gate is not None:
-            gate.enter()        # 同時に進めているほかのラリーの当てはめとまとめて解く（``fit_batch.BatchGate``）
-        try:
-            return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
-                              workers, players, backend)
-        finally:
-            if gate is not None:
-                gate.leave()
+        return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
+                          workers, players, backend)
 
     def to_shots(g: int, fits: list[ShotFit]) -> list[Shot]:
         return _rally_shots([hits[i] for i in groups[g]], fits, camera, phys, max_kmh, max_rms_frac)
@@ -401,17 +398,42 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
     # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）。
     # ラリーどうしは関係しないので、``rally_threads`` 個のラリーを同時に進めて同じプロセスの組に仕事を渡す
     # （1 つのラリーの中では段階ごとに全部の当てはめの終わりを待つので、その間ほかのプロセスが空いていた。F3b）
-    # まとめて解くときは、当てはめにプロセスを使わない（まとめた当てはめ ``joint`` だけプロセスで並べる）
-    pool_workers = workers if backend == "cpu" or joint is not None else 1
-    with worker_pool(pool_workers), (gate_session(n_batch, len(groups)) if backend == "batch"
-                                     else nullcontext()) as gate:
-        if backend == "batch":
-            n_threads = n_batch
-        else:
-            n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
+    # まとめて解くときは、ラリーを ``batch_processes`` 組に分けてプロセスごとに進め、それぞれの中で
+    # ``rally_threads`` 個ずつ同時に進めて当てはめをまとめる（``_fit_groups``）
+    n_proc = max(1, min(batch_processes or BATCH_PROCESSES, workers, len(groups))) if backend == "batch" else 1
+    pool_workers = workers if backend == "cpu" else (max(n_proc, workers) if joint is not None else n_proc)
+    with worker_pool(pool_workers):
+        n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
         fitted: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
         by_group: dict[int, list[Shot]] = {}
-        if n_threads > 1:
+        if backend == "batch":
+            chunks = _balanced_chunks([len(g) for g in groups], n_proc if pool_active() else 1)
+
+            def done(part: dict[int, tuple[list[ShotFit], dict[str, Any]]]) -> None:
+                for g in sorted(part):
+                    fitted[g] = part[g]
+                    by_group[g] = to_shots(g, part[g][0])
+                    _rally_progress(progress, g, len(groups), by_group[g], len(by_group))
+
+            left = chunks
+            if len(chunks) > 1:
+                from concurrent.futures import as_completed
+                from concurrent.futures.process import BrokenProcessPool
+
+                got: set[int] = set()
+                try:
+                    with worker_env():
+                        futs = {pool_executor().submit(_fit_groups, fit_args, c, rally_threads): k
+                                for k, c in enumerate(chunks)}
+                    for fut in as_completed(futs):
+                        done(fut.result())
+                        got.add(futs[fut])
+                    left = []
+                except (BrokenProcessPool, OSError):  # プロセスを使えなければ、残りをこのプロセスで
+                    left = [c for k, c in enumerate(chunks) if k not in got]
+            for c in left:
+                done(_fit_groups(fit_args, c, rally_threads))
+        elif n_threads > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             with ThreadPoolExecutor(n_threads) as ex:
@@ -451,6 +473,46 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         shots += by_group[g]
     split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
+
+
+def _balanced_chunks(sizes: list[int], n: int) -> list[list[int]]:
+    """番号 0..len(sizes)−1 を、大きさ（打球の数）の合計がなるべく同じ ``n`` 組に分ける（大きい順に、いちばん軽い組へ）。
+    組の中は番号の順。空の組は返さない。"""
+    load = [0] * max(1, n)
+    out: list[list[int]] = [[] for _ in load]
+    for g in sorted(range(len(sizes)), key=lambda g: (-sizes[g], g)):
+        k = int(np.argmin(load))
+        out[k].append(g)
+        load[k] += sizes[g]
+    return [sorted(c) for c in out if c]
+
+
+def _fit_groups(fit_args: tuple, gids: list[int], rally_threads: int
+                ) -> dict[int, tuple[list[ShotFit], dict[str, Any]]]:
+    """ラリー ``gids`` を、``rally_threads`` 個ずつ同時に進め、当てはめをまとめて解く（``fit_backend="batch"``。
+    ``analyze_hits`` の中の 1 組。別のプロセスでも動かす）。結果はラリーの組み方・スレッドの数によらない。"""
+    det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players = fit_args
+    n_threads = max(1, min(rally_threads, len(gids)))
+    out: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
+    with gate_session(n_threads, len(gids)) as gate:
+        def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
+            gate.enter()        # 同時に進めているほかのラリーの当てはめとまとめて解く（``fit_batch.BatchGate``）
+            try:
+                return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
+                                  max_rms_frac, workers, players, "batch")
+            finally:
+                gate.leave()
+
+        if n_threads > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(n_threads) as ex:
+                for g, r in zip(gids, ex.map(one, gids)):
+                    out[g] = r
+        else:
+            for g in gids:
+                out[g] = one(g)
+    return out
 
 
 def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
