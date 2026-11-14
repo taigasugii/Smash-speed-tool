@@ -597,9 +597,18 @@ def _try_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsP
 
 # ``fit_shots`` の当てはめの計算の仕方（``backend``）
 FIT_BACKENDS = ("cpu", "batch", "gpu")
+FIT_BACKEND_ENV = "SMASH_SPEED_FIT_BACKEND"     # 既定の計算の仕方を変える環境変数（GUI・チェックで試すとき）
 # ``fit_shots`` の中身：段階ごとに (関数, 引数のリスト) を出して、その結果のリストを受け取りながら進む
 FitSteps = Generator[tuple[Callable[..., Any], list[tuple[Any, ...]]], list[Any], Any]
 FitJobs = Generator[list[FitJob], list[FitResult | None], Any]
+
+
+def default_backend(backend: str | None = None) -> str:
+    """当てはめの計算の仕方。``backend`` が None なら、環境変数 ``SMASH_SPEED_FIT_BACKEND``（なければ "cpu"）。"""
+    backend = backend or os.environ.get(FIT_BACKEND_ENV) or "cpu"
+    if backend not in FIT_BACKENDS:
+        raise ValueError(f"当てはめの計算の仕方は {FIT_BACKENDS} のどれかです：{backend}")
+    return backend
 
 
 def _engine(backend: str) -> str:
@@ -662,7 +671,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               bad_max_nfev_per_param: int = 30, hitter_xy: list[Any] | None = None,
               hitter_sigma_m: tuple[float, float] = (0.5, 2.0), max_hitter_gap_m: float = 2.5,
               serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5,
-              joint: Any = None, backend: str = "cpu") -> list[ShotFit]:
+              joint: Any = None, backend: str | None = None) -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -705,7 +714,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             ``joint=None`` で呼んでから ``fit_rallies`` をまとめて呼ぶ（終端速度を動画全体で 1 つにする）
         backend: 当てはめの計算の仕方。"cpu" は 1 回ずつ（``workers`` 個のプロセスで並べる）、"batch" は段階ごとに
             全部の当てはめをまとめて解く（``fit_batch``。プロセスは使わない）、"gpu" は "batch" の軌道の積分を GPU で
-            （使えなければ "batch" と同じ）。結果は、最適化の終わりの判定の幅の中で同じ（``docs/speed.md``）
+            （使えなければ "batch" と同じ）。結果は、最適化の終わりの判定の幅の中で同じ（``docs/speed.md``）。
+            None なら ``default_backend``（環境変数 ``SMASH_SPEED_FIT_BACKEND``。なければ "cpu"）
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
@@ -713,6 +723,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
     steps = fit_shots_steps(det, t_hits, camera, phys, sides, opts, n_rounds, min_obs, margin_s, hit_sigma_m, t_last,
                             refine_times, max_rms_px, t_audio, speed_of_sound_mps, max_kmh, bad_max_nfev_per_param,
                             hitter_xy, hitter_sigma_m, max_hitter_gap_m, serve_depth_m, hitter_reach_m)
+    backend = default_backend(backend)
     if backend == "cpu":
         res: list[Any] | None = None
         while True:

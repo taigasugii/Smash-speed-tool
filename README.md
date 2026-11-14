@@ -704,6 +704,9 @@ python -m smash_speed.shot_list data\IMG_4397.MOV --calib out\calibration.json -
 `smash-speed shots --video <動画> --calib <calibration.json> --out <出力先>` でも同じことができる（GUI はこれを裏で動かす）。
 `--joint-fit` を付けると、ラリーの中のショットをつないでまとめて当てはめ直し（となりのショットと打点・打った時刻を合わせる）、
 長く飛んだショットからシャトルの終端速度も求める（`shot_list.json` の `joint_fit`。既定では使わない。方法と数字は `docs/rally_fit.md`）。
+`--fit-backend batch` を付けると、軌道の当てはめを 1 回ずつではなく、動画全体の当てはめをまとめて解く（`smash_speed/fit_batch.py`。
+当てはめの時間が約 1/4 になる。結果は、合っている当てはめでは 0.01% 以内で同じ。既定は今までどおりの `cpu`。環境変数
+`SMASH_SPEED_FIT_BACKEND=batch` でも切り替えられる。測った数字と、結果が変わるショットの説明は `docs/speed.md`）。
 GUI の「ショットの一覧」の画面はこれを読む（出力先は `<出力の場所>\<動画の名前>_shots`）。
 
 合成ラリーの動画（`synth_rally.render_rally_video`。横・遠くのカメラ、白い背景、打球音の WAV つき）を

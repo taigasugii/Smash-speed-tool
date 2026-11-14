@@ -53,8 +53,8 @@ from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.fit_batch import solve_together
 from smash_speed.rally_fit import JointOptions, fit_rallies
-from smash_speed.shot_fit import (FIT_BACKENDS, ShotFit, _engine, _parallel_map, fit_jobs, fit_shots, fit_shots_steps,
-                                  joint_job, pool_active, shot_fits_to_shots, worker_pool)
+from smash_speed.shot_fit import (FIT_BACKENDS, ShotFit, _engine, _parallel_map, default_backend, fit_jobs, fit_shots,
+                                  fit_shots_steps, joint_job, pool_active, shot_fits_to_shots, worker_pool)
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
                                write_shots)
@@ -94,6 +94,10 @@ class ShotListOptions:
     joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
                                       # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
     joint_options: JointOptions | None = None
+    fit_backend: str | None = None    # 当てはめの計算の仕方（``shot_fit.FIT_BACKENDS``）。"cpu"：1 回ずつ・プロセスで並べる、
+                                      # "batch"：全部のラリーの当てはめをまとめて解く（``fit_batch``。速い）、
+                                      # "gpu"："batch" の軌道の積分を GPU で（速くならない。``docs/gpu.md``）。
+                                      # None なら ``shot_fit.default_backend``（環境変数。なければ "cpu"）
 
 
 # =============================================================================
@@ -349,7 +353,7 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
                  players: pd.DataFrame | None = None, rally_threads: int = 4, joint: JointOptions | None = None,
-                 joint_info: dict[str, Any] | None = None, fit_backend: str = "cpu") -> list[Shot]:
+                 joint_info: dict[str, Any] | None = None, fit_backend: str | None = None) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -368,10 +372,9 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
         joint_info: 辞書を渡すと、まとめた当てはめの記録（つないだショットの数・終端速度・かかった時間）を入れる
         fit_backend: 当てはめの計算の仕方（``shot_fit.FIT_BACKENDS``）。"cpu" は 1 回ずつ（``workers`` 個のプロセスで並べる）、
             "batch" はすべてのラリーの当てはめをまとめて解く（``fit_batch``。プロセスは使わない）、"gpu" はその軌道の
-            積分を GPU で（使えなければ "batch" と同じ）
+            積分を GPU で（使えなければ "batch" と同じ）。None なら ``shot_fit.default_backend``
     """
-    if fit_backend not in FIT_BACKENDS:
-        raise ValueError(f"当てはめの計算の仕方は {FIT_BACKENDS} のどれかです：{fit_backend}")
+    fit_backend = default_backend(fit_backend)
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
     vis_t = det.timestamp.to_numpy(float)
     groups = rally_groups(hits, rally_gap_s)
@@ -380,7 +383,7 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
     def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
         kw, job = _rally_args(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
                               players)
-        return job(fit_shots(**kw, workers=workers))
+        return job(fit_shots(**kw, workers=workers, backend="cpu"))
 
     def to_shots(g: int, fits: list[ShotFit]) -> list[Shot]:
         return _rally_shots([hits[i] for i in groups[g]], fits, camera, phys, max_kmh, max_rms_frac)
@@ -588,7 +591,8 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     joint_info: dict[str, Any] = {}
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
                          players=players if o.hitter_prior else None,
-                         joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info)
+                         joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info,
+                         fit_backend=o.fit_backend)
     lap("fit")
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
@@ -611,6 +615,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "hit_methods": pd.Series([h.method for h in hits], dtype=object).value_counts().to_dict(),
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),
         "joint_fit": joint_info if o.joint_fit else None,
+        "fit_backend": default_backend(o.fit_backend),
         "meta": run_metadata(),
     }
     if players_info is not None:
@@ -703,6 +708,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--joint-fit", action="store_true",
                     help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
     ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
+    ap.add_argument("--fit-backend", choices=FIT_BACKENDS, default=None,
+                    help="当てはめの計算の仕方（cpu：1 回ずつ、batch：まとめて解く、gpu：batch の積分を GPU で）")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
@@ -712,7 +719,8 @@ def main(argv: list[str] | None = None) -> None:
                                          hit_players=not a.no_hit_players, detections=a.detections,
                                          tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold,
                                          joint_fit=a.joint_fit,
-                                         joint_options=JointOptions(estimate_vt=not a.no_estimate_vt)), cfg)
+                                         joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
+                                         fit_backend=a.fit_backend), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

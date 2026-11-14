@@ -149,9 +149,15 @@ def integrate(v0: np.ndarray, k: np.ndarray, g: np.ndarray, grid: np.ndarray, n_
     p = np.zeros((1, b, 3, 2), dtype)
     kg = np.zeros((1, b, 3, 2), dtype)
     kg[0, :, 0, 1] = k * g
-    pos = np.empty((n + 1, 6, b))
-    vel = np.empty((n + 1, 6, b))
-    pos[0], vel[0] = p[0].reshape(b, 6).T, w[0].reshape(b, 6).T
+    pos = np.empty((n + 1, 3, b), complex)
+    vel = np.empty((n + 1, 3, b), complex)
+
+    def packed(x: np.ndarray) -> np.ndarray:
+        """(歩, B, 3, 2) の実数を、``fit_batch.integrate`` と同じ (歩, 3, B) の複素数に。"""
+        x = x.astype(float)
+        return (x[..., 0] + 1j * x[..., 1]).transpose(0, 2, 1)
+
+    pos[0], vel[0] = packed(p)[0], packed(w)[0]
     h = np.diff(grid)
     for at in range(0, n, SEGMENT):
         hs = np.zeros(SEGMENT)
@@ -159,12 +165,11 @@ def integrate(v0: np.ndarray, k: np.ndarray, g: np.ndarray, grid: np.ndarray, n_
         hs[:m] = h[at:at + m]
         steps = np.stack([hs, hs / 2, hs / 6, hs * hs / 6], axis=1).ravel().astype(dtype)
         ps, ws = sess.run(None, {"w": w, "p": p, "kg": kg, "steps": steps})
-        pos[at + 1:at + m + 1] = ps[:m].reshape(m, b, 6).transpose(0, 2, 1)
-        vel[at + 1:at + m + 1] = ws[:m].reshape(m, b, 6).transpose(0, 2, 1)
+        pos[at + 1:at + m + 1], vel[at + 1:at + m + 1] = packed(ps[:m]), packed(ws[:m])
         p, w = ps[m - 1:m], ws[m - 1:m]
     # k をかけた値で進めたので、戻す（傾きの行は、初速も k 倍なので、そのまま）
-    pos[:, :2] /= k
-    vel[:, :2] /= k
+    pos[:, 0] /= k
+    vel[:, 0] /= k
     return pos, vel
 
 

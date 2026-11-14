@@ -236,7 +236,8 @@ def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
                         players=a.players, hitter_prior=not a.no_hitter_prior,
                         detections=Path(a.detections) if a.detections else None,
                         tracknet=Path(a.tracknet) if a.tracknet else None, tracknet_threshold=a.tracknet_threshold,
-                        joint_fit=a.joint_fit, joint_options=JointOptions(estimate_vt=not a.no_estimate_vt))
+                        joint_fit=a.joint_fit, joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
+                        fit_backend=a.fit_backend)
     info = analyze_video(o, cfg, progress=lambda m: print(m, flush=True))
     print()
     print("種類ごとの本数")
@@ -656,6 +657,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ラリーの中のショットをつないでまとめて当てはめ直す（打点・打った時刻をとなりのショットと合わせ、"
                         "長いショットからシャトルの終端速度も求める）")
     p.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit のとき、終端速度は設定の値のままにする")
+    p.add_argument("--fit-backend", choices=["cpu", "batch", "gpu"], default=None,
+                   help="軌道の当てはめの計算の仕方。cpu：1 回ずつ（プロセスで並べる）、batch：全部のラリーの当てはめを"
+                        "まとめて解く（速い。結果は最適化の終わりの判定の幅で同じ）、gpu：batch の積分を GPU で（速くならない）")
     p.set_defaults(func=cmd_shots)
 
     p = add("summarize")

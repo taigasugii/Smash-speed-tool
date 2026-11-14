@@ -1,25 +1,32 @@
 """軌道の当てはめを、何本もまとめて解く（``physics.fit_trajectory`` の plane モードと同じ問題・同じ手順）。
 
 ショットの一覧では、1 本のショットに 10〜30 回の当てはめ（平面の格子・打点をつないだ当てはめ直し・信頼区間）があり、
-1 回ずつ別のプロセスで ``scipy`` の積分（``solve_ivp``）と最適化（``least_squares``）を動かすと、時間のほとんどが
-Python の 1 歩ごとの手間になる（``docs/speed.md``）。ここでは、同じ計算を「何百〜何千の当てはめ × 配列の演算」にする。
+1 回ずつ別のプロセスで ``scipy`` の積分（``solve_ivp``）と最適化（``least_squares``）を動かすと、時間の 9 割が積分
+（そのうち 8 割は数値微分のヤコビアンのための積分）になる（``docs/speed.md``）。ここでは、同じ計算を
+「何百もの当てはめ × 配列の演算」にする。
 
 - **積分**：打点を原点、飛行平面の中の 2 次元（平面に沿った向き s・高さ z）の軌道を、すべての当てはめで同じ刻みの
   RK4 で進める（``integrate``）。初速 (vs, vz) についての傾き（変分方程式）も一緒に進めるので、ヤコビアンは数値微分ではなく
   式から出る。観測の時刻の位置は、刻みの間を 3 次のエルミート補間で出す。
   刻みは、打った直後は細かく、後は打ってからの時間に比例して広げる（空気抵抗が速さの 2 乗に比例するので、打ってから
-  τ 秒後の速さは初速によらず 1/(kτ) 以下。``time_grid``）。``physics.simulate``（DOP853）との差は 1 µm 以下。
+  τ 秒後の速さは初速によらず 1/(kτ) 以下。``time_grid``）。``physics.simulate``（DOP853）との差は 3 µm 以下
+  （初速 170 m/s まで。画像の上で 0.001 px ほど）。
 - **最適化**：``scipy.optimize.least_squares``（``method="trf"``・範囲なし・``x_scale="jac"``）と同じ信頼領域法を、当てはめごとに
-  状態を持たせてまとめて進める（``_trf``）。同じ損失（Huber・soft_l1）・同じ終わりの判定・同じ評価の回数の数え方。
+  状態を持たせてまとめて進める（``_trf``）。同じ損失（Huber・soft_l1）・同じ終わりの判定・同じ評価の回数の数え方で、
+  同じ残差とヤコビアンを渡せば scipy と同じ道すじをたどる（テストで確かめている）。
 - **手順**：``fit_trajectory`` と同じ（3 次元点への当てはめで初期値 → 初期値ごとに解いてずれの小さい方 → 打点の目安の重みを
   直して解き直す → 共分散と信頼区間）。
+- **まとめ方**：当てはめの時間のほとんどは「ほかが終わった後に残った数本の、何百回もの繰り返し」で、NumPy では 1 回の積分の
+  手間が本数にあまりよらない。そこで、最適化は積分を自分ではせず、積分の要求を ``yield`` で外へ出し（``Steps``）、
+  同時に進んでいるすべての計算（ラリー・当てはめの形）の要求を 1 回の積分にまとめる（``serve``・``together``・``run``）。
 
-違うのは、積分の誤差（どちらも 1 µm 以下）と、ヤコビアン（数値微分 → 式）だけ。最適化の途中の道すじは少し変わるので、
-結果は丸めではなく「終わりの判定の幅」（``FitOptions.ftol`` = 1e-5）の中で一致する（``docs/speed.md`` の比べた結果）。
+1 回ずつの当てはめと違うのは、積分の誤差（上のとおり）と、ヤコビアン（数値微分 → 式）だけ。最適化の途中の道すじは
+少し変わるので、結果は丸めではなく「終わりの判定の幅」（``FitOptions.ftol`` = 1e-5）の中で一致する。道すじが不安定な
+当てはめ（合わない平面・別の物の軌道で、ずれが何十 px もあるもの）は結果が変わることがある（``docs/speed.md`` の比べた結果）。
 
 積分は ``backend`` で差し替えられる（``numpy``：CPU の倍精度。``dml``：onnxruntime-directml で GPU の単精度。
-``docs/gpu.md``）。まとめて解けない当てはめ（free モード・終端速度の推定・ブートストラップ・打点より前の観測）は、
-1 本ずつ ``fit_trajectory`` で解く。
+``fit_gpu``）。GPU は 1 回の積分の手間が大きく、この問題では速くならない（``docs/gpu.md``）。まとめて解けない当てはめ
+（終端速度の推定・ブートストラップ・打点より前の観測）は、1 本ずつ ``fit_trajectory`` で解く。
 """
 
 from __future__ import annotations
@@ -87,24 +94,23 @@ def time_grid(t_end: float) -> np.ndarray:
     return g[:max(n, 2)]
 
 
-def _acc(w: np.ndarray, kg: np.ndarray) -> np.ndarray:
-    """速度と、その初速 (vs, vz) についての傾き ``w`` (6, B) の時間微分。
+def _acc(w: np.ndarray, ikg: np.ndarray) -> np.ndarray:
+    """速度と、その初速 (vs, vz) についての傾き ``w`` (3, B)（複素数。実部が平面に沿った向き、虚部が上向き）の時間微分。
 
-    行は [k·vs, k·vz, vs の vs0 についての傾き, vz の同じ傾き, vs の vz0 についての傾き, vz の同じ傾き]。
-    速度に抵抗係数 k をかけておくと、運動方程式は d(kv)/dt = −|kv|·kv − k·g·ez で、k をかける演算がいらない。
+    行 0 が k × 速度、行 1・2 が速度の vs0・vz0 についての傾き。速度に抵抗係数 k をかけておくと、運動方程式は
+    d(kv)/dt = −|kv|·kv − k·g·ez で、k をかける演算がいらない。2 次元のベクトルを複素数 1 つで持つのは、
+    NumPy を呼ぶ回数を減らすため（残った数本の当てはめの繰り返しでは、時間のほとんどが呼び出しの手間）。
     """
-    u, v = w[0], w[1]
-    q = np.hypot(u, v)
+    z = w[0]
+    q = np.abs(z)
     a = q * w
     np.maximum(q, _TINY, out=q)
     # 速さの傾き dq = (v · dv) / q
-    c = w[2::2] * u
-    c += w[3::2] * v
+    c = (w[1:] * np.conj(z)).real
     c /= q
-    a[2::2] += c * u
-    a[3::2] += c * v
+    a[1:] += c * z
     np.negative(a, out=a)
-    a[1] -= kg
+    a[0] -= ikg
     return a
 
 
@@ -119,44 +125,56 @@ def integrate(v0: np.ndarray, k: np.ndarray, g: np.ndarray, grid: np.ndarray, n_
             それより先の値は使えない
 
     Returns:
-        (位置 (len(grid), 6, B) [m], 速度 (len(grid), 6, B) [m/s])。2 つ目の軸は [s, z, s の vs0 についての傾き,
-        z の同じ傾き, s の vz0 についての傾き, z の同じ傾き]
+        (位置 (len(grid), 3, B) [m], 速度 (len(grid), 3, B) [m/s])。複素数（実部が s、虚部が z）で、2 つ目の軸は
+        [値, vs0 についての傾き, vz0 についての傾き]
     """
     b, n = len(v0), len(grid) - 1
-    pos = np.empty((n + 1, 6, b))
-    vel = np.empty((n + 1, 6, b))
-    p = np.zeros((6, b))
-    w = np.zeros((6, b))
-    w[0], w[1] = v0[:, 0] * k, v0[:, 1] * k
-    w[2] = w[5] = 1.0
-    kg = k * g
-    pos[0], vel[0] = p, w
+    pos = np.empty((n + 1, 3, b), complex)
+    vel = np.empty((n + 1, 3, b), complex)
+    p, w = pos[0], vel[0]
+    p[:] = 0.0
+    w[0] = (v0[:, 0] + 1j * v0[:, 1]) * k
+    w[1], w[2] = 1.0, 1j
+    ikg = 1j * k * g
+    # 刻み i を進める軌道の本数（n_steps > i の本数）
+    count = np.full(n, b) if n_steps is None else np.searchsorted(-n_steps, -np.arange(n), side="left")
+    h_all = np.diff(grid).tolist()
     m = b
+    tmp = np.empty((3, b), complex)
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        for i in range(n):
-            if n_steps is not None:
-                m_new = int(np.searchsorted(-n_steps, -i, side="left"))   # n_steps > i の本数
+        for i, h in enumerate(h_all):
+            m_new = int(count[i])
+            if m_new < m:
                 if m_new == 0:
                     break
-                if m_new < m:
-                    m = m_new
-                    p, w, kg = p[:, :m], w[:, :m], kg[:m]
-            h = grid[i + 1] - grid[i]
-            a1 = _acc(w, kg)
-            a2 = _acc(w + (0.5 * h) * a1, kg)
-            a3 = _acc(w + (0.5 * h) * a2, kg)
-            a4 = _acc(w + h * a3, kg)
+                m = m_new
+                p, w, ikg, tmp = p[:, :m], w[:, :m], ikg[:m], tmp[:, :m]
+            a1 = _acc(w, ikg)
+            np.multiply(a1, 0.5 * h, out=tmp)
+            tmp += w
+            a2 = _acc(tmp, ikg)
+            np.multiply(a2, 0.5 * h, out=tmp)
+            tmp += w
+            a3 = _acc(tmp, ikg)
+            np.multiply(a3, h, out=tmp)
+            tmp += w
+            a4 = _acc(tmp, ikg)
             a2 += a3
             a1 += a2
-            p = p + h * w
-            p += (h * h / 6.0) * a1
+            # 位置：p + h·w + (h²/6)(a1 + a2 + a3)、速度：w + (h/6)(a1 + 2 a2 + 2 a3 + a4)
+            p_new, w_new = pos[i + 1, :, :m], vel[i + 1, :, :m]
+            np.multiply(w, h, out=p_new)
+            p_new += p
+            np.multiply(a1, h * h / 6.0, out=tmp)
+            p_new += tmp
             a1 += a2
             a1 += a4
-            w = w + (h / 6.0) * a1
-            pos[i + 1, :, :m], vel[i + 1, :, :m] = p, w
+            np.multiply(a1, h / 6.0, out=w_new)
+            w_new += w
+            p, w = p_new, w_new
         # k をかけて進めた値を戻す（傾きの行は、初速にも k がかかっているので、そのまま）
-        pos[:, :2] /= k
-        vel[:, :2] /= k
+        pos[:, 0] /= k
+        vel[:, 0] /= k
     return pos, vel
 
 
@@ -176,7 +194,7 @@ def interpolate(grid: np.ndarray, pos: np.ndarray, vel: np.ndarray, tau: np.ndar
     with np.errstate(invalid="ignore", over="ignore"):
         out = ((2 * u3 - 3 * u2 + 1) * pos[i, :, col] + (u3 - 2 * u2 + u) * h * vel[i, :, col]
                + (3 * u2 - 2 * u3) * pos[i + 1, :, col] + (u3 - u2) * h * vel[i + 1, :, col])
-    return out.reshape(tau.shape + (3, 2))
+    return np.ascontiguousarray(out).view(float).reshape(tau.shape + (3, 2))
 
 
 Integrator = Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
