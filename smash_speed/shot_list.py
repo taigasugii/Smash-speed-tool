@@ -96,7 +96,7 @@ class ShotListOptions:
     joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
                                       # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
     joint_options: JointOptions | None = None
-    fit_backend: str = "cpu"          # 当てはめの計算の仕方（``shot_fit.run_fits``）："cpu"（1 つずつプロセスで並べる）、
+    fit_backend: str = "auto"         # 当てはめの計算の仕方（``shot_fit.run_fits``）："cpu"（1 つずつプロセスで並べる）、
                                       # "batch"（段階ごとにまとめて解く。ROADMAP F3e）、"auto"（batch が使えれば batch）
 
 
@@ -678,6 +678,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "hit_methods": pd.Series([h.method for h in hits], dtype=object).value_counts().to_dict(),
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),
         "joint_fit": joint_info if o.joint_fit else None,
+        "fit_backend": resolve_backend(o.fit_backend),   # 当てはめの計算の仕方（cpu・batch。ROADMAP F3e）
         "meta": run_metadata(),
     }
     if players_info is not None:
@@ -770,8 +771,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--joint-fit", action="store_true",
                     help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
     ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
-    ap.add_argument("--fit-backend", default="cpu", choices=["auto", "cpu", "batch"],
-                    help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く）")
+    ap.add_argument("--fit-backend", default="auto", choices=["auto", "cpu", "batch"],
+                    help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く、auto：batch が使えれば batch）")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)

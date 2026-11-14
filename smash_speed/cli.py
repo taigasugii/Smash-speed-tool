@@ -657,8 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ラリーの中のショットをつないでまとめて当てはめ直す（打点・打った時刻をとなりのショットと合わせ、"
                         "長いショットからシャトルの終端速度も求める）")
     p.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit のとき、終端速度は設定の値のままにする")
-    p.add_argument("--fit-backend", default="cpu", choices=["auto", "cpu", "batch"],
-                   help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く）")
+    p.add_argument("--fit-backend", default="auto", choices=["auto", "cpu", "batch"],
+                   help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く、auto：batch が使えれば batch）")
     p.set_defaults(func=cmd_shots)
 
     p = add("summarize")
