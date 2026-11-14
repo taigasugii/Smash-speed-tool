@@ -16,13 +16,16 @@
   同じ残差とヤコビアンを渡せば scipy と同じ道すじをたどる（テストで確かめている）。
 - **手順**：``fit_trajectory`` と同じ（3 次元点への当てはめで初期値 → 初期値ごとに解いてずれの小さい方 → 打点の目安の重みを
   直して解き直す → 共分散と信頼区間）。
-- **まとめ方**：当てはめの時間のほとんどは「ほかが終わった後に残った数本の、何百回もの繰り返し」で、NumPy では 1 回の積分の
-  手間が本数にあまりよらない。そこで、最適化は積分を自分ではせず、積分の要求を ``yield`` で外へ出し（``Steps``）、
-  同時に進んでいるすべての計算（ラリー・当てはめの形）の要求を 1 回の積分にまとめる（``serve``・``together``・``run``）。
+- **まとめ方**：当てはめの時間のほとんどは「ほかが終わった後に残った数本の、何百回もの繰り返し」で、NumPy では 1 回の積分・
+  1 回の配列の演算の手間が本数にあまりよらない。そこで、すべてのラリーの同じ段階の当てはめを 1 つにまとめ（``solve_together``）、
+  最適化は積分を自分ではせずに積分の要求を ``yield`` で外へ出して（``Steps``）、同時に進んでいる当てはめの形（パラメータの数・
+  損失）の要求を 1 回の積分にまとめる（``serve``・``together``・``run``）。
 
 1 回ずつの当てはめと違うのは、積分の誤差（上のとおり）と、ヤコビアン（数値微分 → 式）だけ。最適化の途中の道すじは
 少し変わるので、結果は丸めではなく「終わりの判定の幅」（``FitOptions.ftol`` = 1e-5）の中で一致する。道すじが不安定な
 当てはめ（合わない平面・別の物の軌道で、ずれが何十 px もあるもの）は結果が変わることがある（``docs/speed.md`` の比べた結果）。
+同じ入力なら毎回同じ結果になるが、一緒に解く当てはめの組み合わせが変わると、配列の和の順序（丸め）が変わるので、
+結果は終わりの判定の幅で変わる。
 
 積分は ``backend`` で差し替えられる（``numpy``：CPU の倍精度。``dml``：onnxruntime-directml で GPU の単精度。
 ``fit_gpu``）。GPU は 1 回の積分の手間が大きく、この問題では速くならない（``docs/gpu.md``）。まとめて解けない当てはめ
@@ -55,6 +58,7 @@ STEP_MIN_S = 5e-4
 STEP_GROWTH = 0.05
 STEP_MAX_S = 0.04
 CHUNK = 4096                    # 1 回の積分でまとめる当てはめの数の上限（メモリ：1 本 × 1 刻みで 96 バイト）
+GROUP_MAX = 1024                # 残差・ヤコビアンを 1 つの配列で持つ当てはめの数の上限（``fit_steps``）
 _TINY = 1e-300
 # 1 回ずつの当てはめ（``fit_trajectory``）のヤコビアンは、パラメータを「その値 × ``FitOptions.diff_step``」だけ動かした
 # 数値微分で、値がごく小さい（0 ではない）と動かす幅が倍精度の丸めより小さくなり、観測の行の傾きがちょうど 0 になる。
@@ -743,10 +747,15 @@ def fit_steps(jobs: list[FitJob]) -> Steps:
             groups.setdefault((id(job.obs.camera), n_plane, job.opts.loss), []).append(j)
         else:
             out[j] = _one(job)
-    keys = list(groups)
-    res = yield from together([_fit_group([jobs[j] for j in groups[key]], key[1], key[2]) for key in keys])
-    for key, part in zip(keys, res):
-        for j, f in zip(groups[key], part):
+    # 同じ形の当てはめを 1 つの組にする。大きい組は、観測のコマの数の順に GROUP_MAX 個ずつに分ける（配列はいちばん
+    # 長い観測に合わせるので、長さの近いものを集めるとメモリも計算も少ない）
+    parts = []
+    for (_, n_plane, loss), idx in groups.items():
+        idx = sorted(idx, key=lambda j: len(jobs[j].obs.t))
+        parts += [(n_plane, loss, idx[at:at + GROUP_MAX]) for at in range(0, len(idx), GROUP_MAX)]
+    res = yield from together([_fit_group([jobs[j] for j in idx], n_plane, loss) for n_plane, loss, idx in parts])
+    for (_, _, idx), part in zip(parts, res):
+        for j, f in zip(idx, part):
             out[j] = f
     return out
 
@@ -762,22 +771,33 @@ def fit_trajectories(jobs: list[FitJob], backend: str | None = None) -> list[Fit
 
 def solve_together(tasks: list[Generator[list[FitJob], list[FitResult | None], Any]], backend: str | None = None
                    ) -> list[Any]:
-    """「当てはめのリストを出して、その結果を受け取りながら進む計算」をいくつか、同時に進める。
+    """「当てはめのリストを出して、その結果を受け取りながら進む計算」をいくつか、歩調をそろえて進める。
 
     ラリーごとの当てはめ（``shot_fit.fit_shots`` の中身）は、段階ごとに何百もの当てはめを出す。ラリーどうしは
-    関係しないので、すべてのラリーの当てはめの積分を 1 回にまとめる（当てはめの時間は「残った数本の繰り返し」が
-    ほとんどで、1 回の積分の手間は本数にあまりよらないため）。戻り値は、それぞれの計算の戻り値のリスト。
+    関係しないので、すべてのラリーの同じ段階の当てはめを 1 つにまとめて解く（当てはめの時間は「残った数本の繰り返し」が
+    ほとんどで、1 回の積分・1 回の配列の演算の手間は本数にあまりよらないため。ラリーごとに別々に進めると、ラリーの数だけ
+    手間が増える）。戻り値は、それぞれの計算の戻り値のリスト。
     """
-    def steps(task: Generator[list[FitJob], list[FitResult | None], Any]) -> Steps:
-        res: list[FitResult | None] | None = None
-        while True:
+    out: list[Any] = [None] * len(tasks)
+    pending: dict[int, list[FitJob]] = {}
+    for j, task in enumerate(tasks):
+        try:
+            pending[j] = next(task)
+        except StopIteration as e:
+            out[j] = e.value
+    while pending:
+        order = list(pending)
+        res = fit_trajectories([job for j in order for job in pending[j]], backend)
+        at = 0
+        for j in order:
+            n = len(pending[j])
             try:
-                jobs = task.send(res) if res is not None else next(task)
+                pending[j] = tasks[j].send(res[at:at + n])
             except StopIteration as e:
-                return e.value
-            res = yield from fit_steps(jobs)
-
-    return run(together([steps(t) for t in tasks]), backend)
+                out[j] = e.value
+                del pending[j]
+            at += n
+    return out
 
 
 def _fit_group(jobs: list[FitJob], n_plane: int, loss: str) -> Steps:

@@ -228,7 +228,8 @@ def test_fit_shots_batch_backend_matches_cpu(cam):
 
 
 def test_solve_together_gives_each_task_its_own_results(rally, cam):
-    """いくつかの計算（ラリー）を同時に進めても、それぞれの結果は 1 つずつ解いたときと同じ。"""
+    """いくつかの計算（ラリー）の当てはめを 1 つにまとめて解いても、それぞれの結果は 1 つずつ解いたときと合う
+    （一緒に解く当てはめが変わると、配列の和の丸めが変わるので、最適化の終わりの判定の幅で）。"""
     r, _, obs = rally
     segs = r.segments
     lists = []
@@ -248,7 +249,8 @@ def test_solve_together_gives_each_task_its_own_results(rally, cam):
         alone = fb.fit_trajectories(jobs)
         assert len(res) == 2
         for a, b in zip(alone, res):
-            assert np.allclose(b.theta, a.theta, rtol=1e-9, atol=1e-12)
+            _close(a, b)
+            assert np.allclose(b.theta, a.theta, rtol=1e-4, atol=1e-6)
 
 
 def test_finite_difference_emulation_keeps_tiny_plane_corrections_frozen(rally, cam, monkeypatch):
