@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -52,8 +53,9 @@ from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.rally_fit import JointOptions, fit_rallies
-from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, shot_fits_to_shots,
-                                  worker_pool)
+from smash_speed.fit_batch import gate_session
+from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, resolve_backend,
+                                  shot_fits_to_shots, worker_pool)
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
                                write_shots)
@@ -63,6 +65,7 @@ SHOT_LIST_FILE = "shot_list.json"
 DETECTIONS_FILE = "detections.csv"
 TRACKNET_DIR = "tracknet"         # 学習したモデルの検出の作業場所（``<出力先>/tracknet/detections.csv``）
 TRACKNET_THRESHOLD = 0.25         # 学習したモデルの熱の地図の閾値（F1b：打球の見つけ方で 0.25 が良い）
+BATCH_RALLIES = 8                 # 当てはめをまとめて解くとき（``fit_backend="batch"``）に同時に進めるラリーの数
 
 
 @dataclass
@@ -93,6 +96,8 @@ class ShotListOptions:
     joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
                                       # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
     joint_options: JointOptions | None = None
+    fit_backend: str = "cpu"          # 当てはめの計算の仕方（``shot_fit.run_fits``）："cpu"（1 つずつプロセスで並べる）、
+                                      # "batch"（段階ごとにまとめて解く。ROADMAP F3e）、"auto"（batch が使えれば batch）
 
 
 # =============================================================================
@@ -347,8 +352,8 @@ def rally_groups(hits: list[Hit], gap_s: float) -> list[list[int]]:
 def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: PhysicsParams, cfg: dict[str, Any],
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
-                 players: pd.DataFrame | None = None, rally_threads: int = 4, joint: JointOptions | None = None,
-                 joint_info: dict[str, Any] | None = None) -> list[Shot]:
+                 players: pd.DataFrame | None = None, rally_threads: int | None = None, joint: JointOptions | None = None,
+                 joint_info: dict[str, Any] | None = None, fit_backend: str = "cpu") -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -361,19 +366,34 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
             （4K で 38 px。合成ラリーでは 1〜2 px、実動画の正しい当てはめも数 px）
         workers: 当てはめを並べて動かすプロセスの数（``fit_shots``）
         players: 選手の位置（``players.csv``）。あれば打球ごとの打つ人の足元（``hitter_at``）を打点の手がかりにする
-        rally_threads: 同時に当てはめを進めるラリーの数（``workers`` が 2 以上のとき。結果は 1 つずつと同じ）
+        rally_threads: 同時に当てはめを進めるラリーの数（``workers`` が 2 以上のとき。結果は 1 つずつと同じ）。
+            None なら 4（``fit_backend`` が "batch" なら ``BATCH_RALLIES``）
         joint: 与えると、ショットごとの当てはめの後に、打球の組ごとにショットをつないでまとめて当てはめ直す
             （``rally_fit.fit_rallies``。終端速度は動画全体で 1 つ）
         joint_info: 辞書を渡すと、まとめた当てはめの記録（つないだショットの数・終端速度・かかった時間）を入れる
+        fit_backend: 当てはめの計算の仕方（``shot_fit.resolve_backend``）。"batch" では、ラリーを ``rally_threads`` 個
+ずつ同時に進め、それぞれの段階の当てはめをほかのラリーの分とまとめて解く
+            （``fit_batch.BatchGate``。プロセスは使わない）。結果はラリーの組み方によらない
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
+    backend = resolve_backend(fit_backend)
     vis_t = det.timestamp.to_numpy(float)
     groups = rally_groups(hits, rally_gap_s)
     shots: list[Shot] = []
 
+    if rally_threads is None:
+        rally_threads = BATCH_RALLIES if backend == "batch" else 4
+    n_batch = max(1, min(rally_threads, len(groups)))
+
     def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
-        return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
-                          workers, players)
+        if gate is not None:
+            gate.enter()        # 同時に進めているほかのラリーの当てはめとまとめて解く（``fit_batch.BatchGate``）
+        try:
+            return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
+                              workers, players, backend)
+        finally:
+            if gate is not None:
+                gate.leave()
 
     def to_shots(g: int, fits: list[ShotFit]) -> list[Shot]:
         return _rally_shots([hits[i] for i in groups[g]], fits, camera, phys, max_kmh, max_rms_frac)
@@ -381,8 +401,14 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
     # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）。
     # ラリーどうしは関係しないので、``rally_threads`` 個のラリーを同時に進めて同じプロセスの組に仕事を渡す
     # （1 つのラリーの中では段階ごとに全部の当てはめの終わりを待つので、その間ほかのプロセスが空いていた。F3b）
-    with worker_pool(workers):
-        n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
+    # まとめて解くときは、当てはめにプロセスを使わない（まとめた当てはめ ``joint`` だけプロセスで並べる）
+    pool_workers = workers if backend == "cpu" or joint is not None else 1
+    with worker_pool(pool_workers), (gate_session(n_batch, len(groups)) if backend == "batch"
+                                     else nullcontext()) as gate:
+        if backend == "batch":
+            n_threads = n_batch
+        else:
+            n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
         fitted: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
         by_group: dict[int, list[Shot]] = {}
         if n_threads > 1:
@@ -429,8 +455,8 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
 
 def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
                camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
-               max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None
-               ) -> tuple[list[ShotFit], dict[str, Any]]:
+               max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None,
+               backend: str = "cpu") -> tuple[list[ShotFit], dict[str, Any]]:
     """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）のショットごとの当てはめと、まとめて当てはめ直すときの
     引数（``shot_fit.joint_job``）。"""
     hs = [hits[i] for i in groups[g]]
@@ -446,7 +472,7 @@ def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: i
     sound = cfg.get("events", {}).get("speed_of_sound_mps", 343.0)
     fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
                      max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
-                     speed_of_sound_mps=sound, hitter_xy=feet)
+                     speed_of_sound_mps=sound, hitter_xy=feet, backend=backend)
     return fits, joint_job(fits, part, camera, feet, [h.t_audio for h in hs], speed_of_sound_mps=sound,
                            max_rms_px=max_rms_frac * camera.width)
 
@@ -566,7 +592,8 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     joint_info: dict[str, Any] = {}
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
                          players=players if o.hitter_prior else None,
-                         joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info)
+                         joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info,
+                         fit_backend=o.fit_backend)
     lap("fit")
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
@@ -681,6 +708,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--joint-fit", action="store_true",
                     help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
     ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
+    ap.add_argument("--fit-backend", default="cpu", choices=["auto", "cpu", "batch"],
+                    help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く）")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
@@ -690,7 +719,8 @@ def main(argv: list[str] | None = None) -> None:
                                          hit_players=not a.no_hit_players, detections=a.detections,
                                          tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold,
                                          joint_fit=a.joint_fit,
-                                         joint_options=JointOptions(estimate_vt=not a.no_estimate_vt)), cfg)
+                                         joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
+                                         fit_backend=a.fit_backend), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

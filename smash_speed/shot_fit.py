@@ -162,14 +162,65 @@ def grid_planes(side: str, hitter_xy: np.ndarray | None = None,
             for sx in _x_signs(side) for origin in origins for yaw in np.deg2rad(yaw_deg)]
 
 
+FitJob = tuple  # ``fit_trajectory`` の引数 (obs, t_ref, mode, plane, phys, opts, theta0)
+
+
+def _fit_job(obs: Observations, t_ref: float, mode: str, plane: FlightPlane | None, phys: PhysicsParams,
+             opts: FitOptions, theta0: np.ndarray | None) -> FitResult | Exception:
+    """``fit_trajectory`` の結果。計算できなければ（ValueError・RuntimeError）その例外を返す。"""
+    try:
+        return fit_trajectory(obs, t_ref, mode, plane, phys, opts, theta0=theta0)
+    except (ValueError, RuntimeError) as e:
+        return e
+
+
+def _ok(f: Any) -> FitResult | None:
+    """``_fit_job``・``fit_batch.fit_trajectories`` の結果のうち、計算できたもの（できなければ None）。"""
+    if isinstance(f, (ValueError, RuntimeError)):
+        return None
+    if isinstance(f, BaseException):
+        raise f
+    return f
+
+
+def run_fits(jobs: list[FitJob], workers: int = 1, backend: str = "cpu") -> list[FitResult | None]:
+    """当てはめ ``jobs``（``fit_trajectory`` の引数）を全部計算する（計算できなければ None）。
+
+    ``backend``：``"cpu"`` は 1 つずつ（``workers`` が 2 以上ならプロセスで並べる）、``"batch"`` はまとめて
+    （``fit_batch.fit_trajectories``。ROADMAP F3e）。どちらも結果は同じ（差は積分の誤差の分だけ。``docs/speed.md``）。
+    """
+    if not jobs:
+        return []
+    if backend == "batch":
+        from smash_speed.fit_batch import fit_trajectories
+
+        return [_ok(f) for f in fit_trajectories(jobs)]
+    return [_ok(f) for f in _parallel_map(_fit_job, jobs, workers)]
+
+
+def resolve_backend(backend: str | None) -> str:
+    """当てはめの計算の仕方の名前（``"auto"`` は、まとめて解けるなら ``"batch"``、だめなら ``"cpu"``）。"""
+    backend = backend or "auto"
+    if backend not in ("auto", "cpu", "batch"):
+        raise ValueError(f"当てはめの計算の仕方 {backend!r} は使えません（auto・cpu・batch）")
+    if backend == "cpu":
+        return "cpu"
+    from smash_speed.fit_batch import AVAILABLE
+
+    if not AVAILABLE and backend == "batch":
+        raise ValueError("まとめて解く当てはめ（batch）が、この scipy では使えません")
+    return "batch" if AVAILABLE else "cpu"
+
+
+def _grid_job(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions) -> FitJob:
+    coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
+    return (obs, t_hit, "plane", plane, _phys_fast(phys), coarse, None)
+
+
 def grid_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions
              ) -> FitResult | None:
     """格子の平面 1 つで、粗い積分で当てはめる（計算できなければ None）。"""
-    coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
-    try:
-        return fit_trajectory(obs, t_hit, "plane", plane, _phys_fast(phys), coarse)
-    except (ValueError, RuntimeError):
-        return None
+    return _ok(_fit_job(*_grid_job(obs, t_hit, plane, phys, opts)))
 
 
 def best_grid_fit(grid: list[FitResult | None]) -> FitResult | None:
@@ -187,16 +238,18 @@ def loose_fit(obs: Observations, t_hit: float, best: FitResult | None, phys: Phy
     """格子でいちばん合った ``best`` から、平面の向き・位置を大きく動かせるようにして当てはめ直す（``initial_fit`` の後半）。"""
     if best is None:
         return None
+    f = _ok(_fit_job(*_loose_job(obs, t_hit, best, phys, opts, hitter_xy, hitter_sigma_m)))
+    return best if f is None else f
+
+
+def _loose_job(obs: Observations, t_hit: float, best: FitResult, phys: PhysicsParams, opts: FitOptions,
+               hitter_xy: np.ndarray | None, hitter_sigma_m: tuple[float, float]) -> FitJob:
     loose = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
                        plane_sigma_deg=30.0, plane_sigma_m=3.0, quadratic_priors=opts.quadratic_priors)
     if hitter_xy is not None:
         loose.p0_prior_m = np.r_[np.asarray(hitter_xy, float)[:2], np.clip(best.p0[2], 0.3, 3.5)]
         loose.p0_prior_sigma_m = hitter_sigma_m
-    try:
-        return fit_trajectory(obs, t_hit, "plane", best.plane, phys, loose,
-                              theta0=np.r_[best.theta[:4], 0.0, 0.0])
-    except (ValueError, RuntimeError):
-        return best
+    return (obs, t_hit, "plane", best.plane, phys, loose, np.r_[best.theta[:4], 0.0, 0.0])
 
 
 def wide_fit(obs: Observations, t_hit: float, side: str, first: FitResult, phys: PhysicsParams, opts: FitOptions,
@@ -206,20 +259,37 @@ def wide_fit(obs: Observations, t_hit: float, side: str, first: FitResult, phys:
     ありえる向きの平面を広い格子（``WIDE_YAW_DEG``）で探し、ずれの小さいものから 3 つ、平面を小さく動かして当てはめ、
     ありえる中でいちばん合うものにする（大きく動かすと、ありえない向きに戻ってしまう）。どれもありえなければ ``first``。
     """
-    wide = [f for f in (grid_fit(obs, t_hit, p, phys, opts) for p in grid_planes(side, hitter_xy, WIDE_YAW_DEG))
-            if f is not None and np.isfinite(f.rms_px) and _plausible_fit(f, side)]
-    wide.sort(key=lambda f: f.rms_px)
+    return wide_fits([(obs, t_hit, side, first, hitter_xy)], phys, opts)[0]
+
+
+def wide_fits(items: list[tuple[Observations, float, str, FitResult, np.ndarray | None]], phys: PhysicsParams,
+              opts: FitOptions, workers: int = 1, backend: str = "cpu") -> list[FitResult]:
+    """``wide_fit`` を、ショット ``items``（(obs, t_hit, side, first, hitter_xy)）についてまとめて計算する
+    （格子の当てはめ・当てはめ直しをそれぞれ ``run_fits`` で並べる）。"""
+    jobs, owner = [], []
+    for k, (obs, t_hit, side, _, hitter_xy) in enumerate(items):
+        for p in grid_planes(side, hitter_xy, WIDE_YAW_DEG):
+            jobs.append(_grid_job(obs, t_hit, p, phys, opts))
+            owner.append(k)
+    wide: list[list[FitResult]] = [[] for _ in items]
+    for k, f in zip(owner, run_fits(jobs, workers, backend)):
+        if f is not None and np.isfinite(f.rms_px) and _plausible_fit(f, items[k][2]):
+            wide[k].append(f)
     tight = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
                        plane_sigma_deg=10.0, plane_sigma_m=1.0)
-    ok = []
-    for g in wide[:3]:
-        try:
-            f = fit_trajectory(obs, t_hit, "plane", g.plane, phys, tight, theta0=np.r_[g.theta[:4], 0.0, 0.0])
-        except (ValueError, RuntimeError):
-            f = g
-        if _plausible_fit(f, side):
-            ok.append(f)
-    return min(ok, key=lambda f: f.rms_px) if ok else first
+    jobs, owner, grids = [], [], []
+    for k, (obs, t_hit, *_rest) in enumerate(items):
+        wide[k].sort(key=lambda f: f.rms_px)
+        for g in wide[k][:3]:
+            jobs.append((obs, t_hit, "plane", g.plane, phys, tight, np.r_[g.theta[:4], 0.0, 0.0]))
+            owner.append(k)
+            grids.append(g)
+    ok: list[list[FitResult]] = [[] for _ in items]
+    for k, g, f in zip(owner, grids, run_fits(jobs, workers, backend)):
+        f = g if f is None else f
+        if _plausible_fit(f, items[k][2]):
+            ok[k].append(f)
+    return [min(o, key=lambda f: f.rms_px) if o else it[3] for o, it in zip(ok, items)]
 
 
 def _state_at(f: FitResult, t: float, phys: PhysicsParams) -> tuple[np.ndarray, np.ndarray] | None:
@@ -569,10 +639,7 @@ def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: 
 def _try_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions,
              theta0: np.ndarray | None) -> FitResult | None:
     """plane モードで当てはめる（計算できなければ None）。"""
-    try:
-        return fit_trajectory(obs, t_hit, "plane", plane, phys, opts, theta0=theta0)
-    except (ValueError, RuntimeError):
-        return None
+    return _ok(_fit_job(obs, t_hit, "plane", plane, phys, opts, theta0))
 
 
 def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: PhysicsParams,
@@ -584,7 +651,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               bad_max_nfev_per_param: int = 30, hitter_xy: list[Any] | None = None,
               hitter_sigma_m: tuple[float, float] = (0.5, 2.0), max_hitter_gap_m: float = 2.5,
               serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5,
-              joint: Any = None) -> list[ShotFit]:
+              joint: Any = None, backend: str = "cpu") -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -625,6 +692,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
             となりのショットと打点・打った時刻をつなぎ、長いショットから終端速度も求める）。つながらなかった
             ショットは、ショットごとの当てはめのまま。動画に何ラリーもあるときは、ラリーごとにこの関数を
             ``joint=None`` で呼んでから ``fit_rallies`` をまとめて呼ぶ（終端速度を動画全体で 1 つにする）
+        backend: 当てはめの計算の仕方（``run_fits``。``"cpu"`` は 1 つずつ ``workers`` のプロセスで、``"batch"`` は
+            段階ごとの当てはめをまとめて解く。``fit_batch.BatchGate`` の中なら、ほかのラリーの当てはめとも一緒に）
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
@@ -655,14 +724,17 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
     # 当てはめで、実動画では 1 本に 1 分かかることがあり、ほかのプロセスが空いたまま待っていた（ROADMAP F3b）
     planes = {i: grid_planes(sides[i], feet[i]) for i in todo}
     grid_jobs = [(i, p) for i in todo for p in planes[i]]
-    grid = _parallel_map(grid_fit, [(fits[i].obs, fits[i].t_hit, p, phys, opts) for i, p in grid_jobs], workers)
+    grid = run_fits([_grid_job(fits[i].obs, fits[i].t_hit, p, phys, opts) for i, p in grid_jobs], workers, backend)
     best = {i: best_grid_fit([f for (j, _), f in zip(grid_jobs, grid) if j == i]) for i in todo}
-    first = _parallel_map(loose_fit, [(fits[i].obs, fits[i].t_hit, best[i], phys, opts, feet[i], hitter_sigma_m)
-                                      for i in todo], workers)
+    loose = [i for i in todo if best[i] is not None]
+    got = run_fits([_loose_job(fits[i].obs, fits[i].t_hit, best[i], phys, opts, feet[i], hitter_sigma_m)
+                    for i in loose], workers, backend)
+    redo = dict(zip(loose, got))
+    first = [None if best[i] is None else (best[i] if redo[i] is None else redo[i]) for i in todo]
     # 打った側から見てありえない結果だけ、広い向きの格子から当てはめ直す（``initial_fit`` の最後。ROADMAP B3b）
     retry = [k for k, (i, f) in enumerate(zip(todo, first)) if f is not None and not _plausible_fit(f, sides[i])]
-    wide = _parallel_map(wide_fit, [(fits[todo[k]].obs, fits[todo[k]].t_hit, sides[todo[k]], first[k], phys, opts,
-                                     feet[todo[k]]) for k in retry], workers)
+    wide = wide_fits([(fits[todo[k]].obs, fits[todo[k]].t_hit, sides[todo[k]], first[k], feet[todo[k]])
+                      for k in retry], phys, opts, workers, backend)
     for k, f in zip(retry, wide):
         first[k] = f
     for i, f in zip(todo, first):
@@ -705,11 +777,11 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                            if not (sf.fit.rms_px <= max_rms_px and sf.fit.speed0 * MPS_TO_KMH <= max_kmh)
                            else {})})
                     jobs.append((i, ka, kb))
-                    args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys,
+                    args.append((sf.obs, sf.t_hit, "plane", FlightPlane.from_points(a, b), phys,
                                  FitOptions(**{**fo.__dict__, "p0_prior_m": a,
                                                "p0_prior_sigma_m": hitter_sigma_m if on_foot else hit_sigma_m}),
                                  None))
-        res = {job: f for job, f in zip(jobs, _parallel_map(_try_fit, args, workers))
+        res = {job: f for job, f in zip(jobs, run_fits(args, workers, backend))
                if f is not None and f.success and np.isfinite(f.speed0)}
         chosen = choose_hit_points(fits, pts, res, opts)
         for i, sf in enumerate(fits):
@@ -733,8 +805,9 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                            "p0_prior_sigma_m": hitter_sigma_m if on_foot else hit_sigma_m,
                            "refine_plane": False, "init_state": None})
         jobs.append(i)
-        args.append((sf.obs, sf.t_hit, sf.fit.plane, phys, fo, sf.fit.theta[:4] if sf.fit.mode == "plane" else None))
-    for i, f in zip(jobs, _parallel_map(_try_fit, args, workers)):
+        args.append((sf.obs, sf.t_hit, "plane", sf.fit.plane, phys, fo,
+                     sf.fit.theta[:4] if sf.fit.mode == "plane" else None))
+    for i, f in zip(jobs, run_fits(args, workers, backend)):
         if f is not None:
             fits[i].fit = f
     if joint is not None:
@@ -786,7 +859,7 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                         cfg: dict[str, Any] | None = None, verbose: bool = False,
                         keep_shots: bool = False, feet_noise_m: float | None = None,
                         serve_depth_m: tuple[float, float] | None = None, joint: Any = None,
-                        true_vt: float | None = None, workers: int = 1) -> dict[str, Any]:
+                        true_vt: float | None = None, workers: int = 1, backend: str = "cpu") -> dict[str, Any]:
     """合成ラリーで、ショットの種類ごとの初速の誤差を測る。
 
     Args:
@@ -801,6 +874,7 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
             ``est_kmh``・``err_pct`` がまとめた後の値。戻り値の ``vt`` が終端速度の記録
         true_vt: 合成ラリーを作る・観測するときの本当の終端速度 [m/s]（省略時は設定の値と同じ。当てはめは設定の値から）
         workers: ショットごとの当てはめを並べるプロセスの数（``fit_shots``）
+        backend: 当てはめの計算の仕方（``fit_shots`` の ``backend``）
 
     Returns:
         ``rows``（1 ショット 1 行の DataFrame：種類・正解と推定の初速・誤差 [%]）と、
@@ -844,7 +918,7 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
             foot_rng = np.random.default_rng([seed, 3, r])
             feet = [None if j is None else segs[j].p0[:2] + foot_rng.normal(0.0, feet_noise_m, 2) for j in pairs]
         fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio, hitter_xy=feet, workers=workers,
-                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None)
+                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None, backend=backend)
         done.append((segs, pairs, fits, joint_job(fits, det, camera, feet, t_audio)))
     vt_rec, joined = None, [None] * len(done)
     if joint is not None:
@@ -913,6 +987,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="本当の打点の真下からこの大きさ [m] ずらした位置を、打つ人の足元として渡す")
     ap.add_argument("--camera", default="side", choices=["side", "corner", "low"],
                     help="合成のカメラの位置（side：横・遠く、corner：角の後ろ・低い、low：横・低い）")
+    ap.add_argument("--fit-backend", default="cpu", choices=["auto", "cpu", "batch"],
+                    help="当てはめの計算の仕方（cpu：1 本ずつ、batch：まとめて解く）")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     from smash_speed.config import load_config
@@ -924,7 +1000,7 @@ def main(argv: list[str] | None = None) -> None:
         for h in a.hits:
             t0 = time.time()
             r = synthetic_benchmark(a.rallies, fps, a.seed, h, camera=camera, cfg=cfg, verbose=a.verbose,
-                                    feet_noise_m=a.feet_noise)
+                                    feet_noise_m=a.feet_noise, backend=resolve_backend(a.fit_backend))
             parts = [f"{SHOT_TYPE_LABELS[k]} {v['mape']:.1f}%（{v['n']} 本"
                      + (f"・失敗 {v['n_failed']}" if v["n_failed"] else "") + "）"
                      for k, v in r["by_type"].items() if v["mape"] is not None]

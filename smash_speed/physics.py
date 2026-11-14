@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generator
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -439,6 +439,31 @@ def _speed_rate(p0: np.ndarray, v0: np.ndarray, phys: PhysicsParams) -> float:
     return float(a @ v0 / np.linalg.norm(v0))
 
 
+@dataclass
+class LsqRequest:
+    """当てはめの中の 1 回の最小 2 乗問題（``fit_plan`` が順に出す）。
+
+    ``kind`` が "image" なら画像上の残差（``_residuals``、``data`` は観測のリスト）、"points" なら 3 次元点の残差
+    （``_residuals_3d``、``data`` は (時刻, 点)）。``kwargs`` は ``least_squares`` にそのまま渡す設定。
+    1 つずつ解く（``solve_cpu``）か、まとめて解く（``fit_batch.solve_batch``）。
+    """
+
+    kind: str
+    model: "_Model"
+    data: Any
+    base: PhysicsParams
+    t_ref: float
+    x0: np.ndarray
+    kwargs: dict[str, Any]
+
+    def solve_cpu(self) -> Any:
+        if self.kind == "image":
+            return least_squares(_residuals, self.x0, args=(self.model, self.data, self.base, self.t_ref),
+                                 **self.kwargs)
+        t, X = self.data
+        return least_squares(_residuals_3d, self.x0, args=(self.model, t, X, self.base, self.t_ref), **self.kwargs)
+
+
 def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: str = "plane",
                    plane: FlightPlane | None = None, phys: PhysicsParams | None = None,
                    opts: FitOptions | None = None, theta0: np.ndarray | None = None
@@ -456,6 +481,28 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
 
     Returns:
         FitResult（信頼区間は ``opts.ci_method`` に従う）
+
+    中の手順は ``fit_plan``。ここでは最小 2 乗問題を 1 つずつ ``scipy.optimize.least_squares`` で解く
+    （たくさんの当てはめをまとめて解くのは ``fit_batch.fit_trajectories``）。
+    """
+    plan = fit_plan(obs, t_ref, mode, plane, phys, opts, theta0)
+    try:
+        reqs = next(plan)
+        while True:
+            reqs = plan.send([r.solve_cpu() for r in reqs])
+    except StopIteration as stop:
+        return stop.value
+
+
+def fit_plan(obs: Observations | list[Observations], t_ref: float, mode: str = "plane",
+             plane: FlightPlane | None = None, phys: PhysicsParams | None = None,
+             opts: FitOptions | None = None, theta0: np.ndarray | None = None
+             ) -> Generator[list[LsqRequest], list[Any], FitResult]:
+    """``fit_trajectory`` の手順。解く最小 2 乗問題（``LsqRequest``）のリストを出し、その解（``least_squares`` の
+    結果と同じ形）のリストを受け取って進む。最後に ``FitResult`` を返す（``StopIteration.value``）。
+
+    同じリストの問題は互いに関係しないので、まとめて解いてよい。解けなかった（``least_squares`` が例外を出した）
+    ときは、受け取る側で例外にする（この関数の中では受け止めない）。
     """
     obs = [obs] if isinstance(obs, Observations) else list(obs)
     phys = phys or PhysicsParams()
@@ -486,27 +533,28 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
             # 第1段階：3次元点に運動方程式を当てはめる（多項式外挿は強い減速を表せないため）。平面は固定
             m1 = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity,
                         max_speed=opts.max_speed_mps, speed_weight=0.1 * np.sqrt(3 * len(t3)))  # 残差は [m]
-            stage1 = least_squares(_residuals_3d, m1.clip_speed(m1.pack(p0, v0, phys.terminal_velocity)),
-                                   args=(m1, t3, X3, phys, t_ref), loss="soft_l1", f_scale=0.1,
-                                   diff_step=opts.diff_step, x_scale="jac",
-                                   max_nfev=opts.max_nfev_per_param * n_par)
+            (stage1,) = yield [LsqRequest("points", m1, (t3, X3), phys, t_ref,
+                                          m1.clip_speed(m1.pack(p0, v0, phys.terminal_velocity)),
+                                          dict(loss="soft_l1", f_scale=0.1, diff_step=opts.diff_step, x_scale="jac",
+                                               max_nfev=opts.max_nfev_per_param * n_par))]
             starts.append(np.insert(stage1.x, m1.n_kin, np.zeros(model.n_plane)))
         elif not starts:
             raise ValueError("初期値の計算に使える3次元点が3点未満です")
 
-    def solve(o: list[Observations], th0: np.ndarray):
-        return least_squares(_residuals, model.clip_speed(th0), args=(model, o, phys, t_ref), loss=opts.loss,
-                             f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
-                             x_scale="jac", max_nfev=opts.max_nfev_per_param * n_par,
-                             ftol=opts.ftol, xtol=opts.xtol)
+    def solve(o: list[Observations], th0: np.ndarray) -> LsqRequest:
+        # 事前分布の重み（``model.prior_px``）は、出した問題が解かれるまで変えない
+        return LsqRequest("image", model, o, phys, t_ref, model.clip_speed(th0),
+                          dict(loss=opts.loss, f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
+                               x_scale="jac", max_nfev=opts.max_nfev_per_param * n_par,
+                               ftol=opts.ftol, xtol=opts.xtol))
 
     # 初期値が複数あれば（探索で選んだ軌道・観測から計算した値）、それぞれから解いてずれの小さい方を使う
-    sol = min((solve(obs, th) for th in starts), key=lambda s_: s_.cost)
+    sol = min((yield [solve(obs, th) for th in starts]), key=lambda s_: s_.cost)
     if model.p0_prior is not None:
         # 事前分布の 1σ を、画像上の誤差の大きさ（当てはめの残差から見積もる）と同じ重みにして解き直す
         rms0 = float(np.sqrt(np.mean(sol.fun[:n_res] ** 2)))
         model.prior_px = max(opts.loss_scale_px, rms0)
-        sol = solve(obs, sol.x)
+        (sol,) = yield [solve(obs, sol.x)]
     p0, v0, vt = model.unpack(sol.x)
     r = sol.fun[:n_res]
     rms = float(np.sqrt(np.mean(r**2)))
@@ -546,14 +594,14 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
             res.ci_method = "jacobian(unreliable)"
     elif opts.ci_method == "bootstrap":
         rng = np.random.default_rng(opts.seed)
-        speeds = []
+        subs = []
         for _ in range(opts.bootstrap_n):
             sub = [o.subset(rng.integers(0, len(o.t), len(o.t))) for o in obs]
             if 2 * sum(len(o.t) for o in sub) <= n_par:
                 continue
-            b = solve(sub, sol.x)
-            speeds.append(np.linalg.norm(model.unpack(b.x)[1]))
-        speeds = np.asarray(speeds)
+            subs.append(sub)
+        boot = yield [solve(sub, sol.x) for sub in subs]
+        speeds = np.asarray([np.linalg.norm(model.unpack(b.x)[1]) for b in boot])
         if sd_timing > 0:  # 打点時刻の誤差を独立な正規誤差として加える
             speeds = speeds + rng.normal(0.0, sd_timing, len(speeds))
         lo, hi = np.quantile(speeds, [0.5 - opts.ci_level / 2, 0.5 + opts.ci_level / 2])
