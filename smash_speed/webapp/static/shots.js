@@ -19,14 +19,14 @@ App.views.shots = {
     this.notHit = r.not_hit || null;
     this.notHitLabel = r.not_hit_label || "打球ではない";
     this.stats = r.label_stats || null;
-    this.renderStart(el, info, shots.length > 0);
+    this.renderStart(el, info, shots.length > 0, !!r.model);
     if (!mine) return;
     this.renderSummary(el, info, shots);
     this.renderTable(el, info, shots, r.files || {});
   },
 
   // ---- 解析を始める
-  renderStart(el, info, has) {
+  renderStart(el, info, has, model) {
     const dur = App.meta.duration;
     // 選手なしで動画の長さの 1.4〜2.2 倍、練習の動画（打球が多くラリーが少ない）は約 3 倍（docs/speed.md、F3d）
     const minutes = (s) => Math.max(1, Math.round(s * 2.5 / 60));
@@ -40,6 +40,7 @@ App.views.shots = {
           <input class="input" id="s1" type="number" step="0.1" min="0" style="width:90px"> 秒まで</span>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す</label>` : ""}
         <label class="row small"><input type="checkbox" id="players" ${info.players ? "checked" : ""}> 選手の立ち位置も記録する（時間が延びます）</label>
+        ${model ? `<label class="row small" title="この動画のようなバドミントンの動画で練習させたシャトルの見つけ方です。打った瞬間の見落としと、ほかの物をシャトルと間違えることが減ります"><input type="checkbox" id="model" ${info.detector === "baseline" ? "" : "checked"}> 練習させた見つけ方でシャトルを探す（おすすめ）</label>` : ""}
       </div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="go">${has ? "解析し直す" : "解析を始める"}</button>
         <span class="muted small" id="eta"></span></div></div>`);
@@ -61,7 +62,8 @@ App.views.shots = {
     upd();
     $("#go", card).onclick = () => {
       if (has && !confirm("解析し直すと、前回の一覧は置き換わります。よろしいですか？")) return;
-      const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked), players: $("#players", card).checked };
+      const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked), players: $("#players", card).checked,
+        model: !!($("#model", card) && $("#model", card).checked) };
       if (part) {
         data.start = +$("#s0", card).value;
         data.end = +$("#s1", card).value;

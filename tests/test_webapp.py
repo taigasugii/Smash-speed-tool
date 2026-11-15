@@ -204,6 +204,21 @@ def test_shot_labels_api(client, tmp_path):
     assert g["label_stats"]["video"]["n"] == 0 and g["label_stats"]["all"]["n"] == 1
 
 
+def test_shot_list_uses_the_trained_model_only_when_chosen(client, tmp_path, monkeypatch):
+    """「練習させた見つけ方」を選んだときだけ、設定の学習したモデルで探す（選ばなければ --baseline-detector）。"""
+    from smash_speed.webapp import server
+
+    started = []
+    monkeypatch.setattr(server, "start_task", lambda title, cmds: started.append(cmds[0]) or server.Task(title, []))
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "calib.json").write_text("{}", encoding="utf-8")
+    server.S.state.update(video=str(tmp_path / "v.mp4"), calib=str(tmp_path / "calib.json"))
+    assert client.post("/api/run/shots", json={}).get_json()["ok"]
+    assert client.post("/api/run/shots", json={"model": True}).get_json()["ok"]
+    assert "--baseline-detector" in started[0] and "--baseline-detector" not in started[1]
+    assert started[0][:started[0].index("--baseline-detector")] == started[1]
+
+
 def test_shot_list_flow(client, tmp_path):
     """ショットの一覧：裏で ``shots`` を動かし、種類・初速つきのショットを返す。区間を決めて解析し直せる。"""
     from smash_speed.physics import PhysicsParams
@@ -231,6 +246,7 @@ def test_shot_list_flow(client, tmp_path):
     assert any("検出中" in s for s in lines)  # 進み具合が流れてくる
     g = client.get("/api/shots").get_json()
     assert g["ok"] and g["dir"].endswith("rally_shots") and g["files"]["shots"].endswith("shots.csv")
+    assert g["info"]["detector"] == "baseline" and isinstance(g["model"], bool)  # モデルは選んだときだけ（F1c）
     assert len(g["shots"]) == len(truth) and g["info"]["n_hits"] == len(truth)
     assert [s["shot_type"] for s in g["shots"]] == [s.shot_type for s in truth]
     assert all(s["label"] == g["labels"][s["shot_type"]] for s in g["shots"])
