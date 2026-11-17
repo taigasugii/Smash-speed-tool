@@ -14,6 +14,29 @@
 
 ---
 
+## 2026-11-17 16:45 F1c の続き：学習したシャトルの検出を ONNX で動かす（Opus の別セッション。ブランチ `opus/onnx-detector`、7c6c211 から）
+- 選んだ理由：人からの依頼（ショットの一覧の既定の検出 ft1 を、torch のない本体の `.venv` でも onnxruntime-directml の GPU で動かし、
+  検出を torch と同じにする）。
+- やったこと：
+  - `smash_speed/train/onnx_export.py`：`model.pt` を隣の `.onnx` に書き出す（`.venv-train`。opset 17、区間の数は自由）。`.venv-train` に
+    `onnx` がないので、`pip install --target .agent/onnx_export_deps onnx==1.17.0 protobuf --no-deps` を `PYTHONPATH` に足して書き出した
+    （`.venv-train` は変えていない）。
+  - `tracknet_train.predict_onnx`（`ClipData` の入力をそのまま `accel.make_session` で。0〜255 への丸めも同じ）、`predict_backend`
+    （torch がこの Python にあれば torch → `.onnx` と onnxruntime があれば ONNX → `.venv-train`。`SMASH_SPEED_DETECTOR_BACKEND`、
+    `detect --backend`、`predict --backend onnx`）。`can_predict(ckpt)` と `shot_list.default_tracknet` は `.onnx` も見る。
+    `shot_list.json` に `tracknet_backend`。
+  - テスト 3 件（`tests/test_tracknet_onnx.py`：選び方／小さな ONNX で `predict_onnx` がセッションの出力と同じ／本物の `.onnx` で GPU と CPU が
+    1 まで同じ（ないときは飛ばす））。`test_shot_list` の `can_predict` の差し替えを引数つきにした。
+- 結果（数字）：
+  - 答え合わせ用 112 区間・895 コマ（IMG_4397 80〜100 s・IMG_5109_2、閾値 0.25）：F1 は torch・ONNX（DirectML・CPU）とも 0.952・0.983 で同じ、
+    見つかったコマも点の位置も 895 コマすべて同じ。熱の地図（0〜255）の差は最大 1（0.0002% の画素）、丸める前は最大 1〜4×10⁻⁶。
+    時間（起動込み）：torch DirectML（`.venv-train` を呼ぶ）7.3 秒 → ONNX DirectML 5.2 秒（CPU は torch 43.3・ONNX 36.9 秒）。
+  - ショットの一覧（既定の ft1）：IMG_5109_2 13.1 → 10.9 秒、IMG_4397（4K 113 秒）96.0 → 93.2 秒。どちらも `detections.csv`・`shots.csv` が
+    1 バイトも同じ。4K の検出はコマを縮める所が 8 割で、熱の地図は 23 → 20 秒。
+  - IMG_4397 の torch の 1 回目は当てはめで 20 分以上止まった（再現せず。ROADMAP の提案）。
+- 品質チェック：テストは変えた所（`test_tracknet_onnx`・`test_tracknet_train`・`test_shot_list`）だけ通した。`agent/eval_gate.py` は実行中（結果は下に足す）。
+- 次にやること：`.venv-train` に `onnx` を入れるか（約 16 MB）は人が決める。入れなくても上の方法で書き出せる。
+
 ## 2026-11-16 00:00 進められる課題なし（新しい動画 4 本の確認と質問）
 - 選んだ理由：コメント・Issue はなし。ROADMAP の残りはすべて人の答え待ち：A5b・A5c（2 台の動画）、B7（種類のラベル。`shot_labels.csv` は
   2026-11-05 の 36 本のまま）、E1（関節のラベル。`pose_labels/` はない）、E1b（打点のラベル）、E6（側方のクリアの動画）。
