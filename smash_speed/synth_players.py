@@ -67,8 +67,12 @@ def _slow_noise(n: int, fps: float, tau_s: float, rng: np.random.Generator) -> n
 
 def observe_players(t: np.ndarray, feet: dict[str, np.ndarray], camera: Camera, rng: np.random.Generator,
                     jitter: float = 0.005, outlier_rate: float = 0.05, outlier: float = 0.04,
-                    drift: float = 0.01, swing: float = 0.12, height_m: float = 1.75) -> pd.DataFrame:
+                    drift: float = 0.01, swing: float = 0.12, height_m: float = 1.75,
+                    lift: dict[str, np.ndarray] | None = None) -> pd.DataFrame:
     """足元の軌跡（側 → (n, 2)）を写した ``players.csv`` の形。揺れの大きさは枠の高さに対する割合。
+
+    ``lift``（側 → (n,) [m]）があれば、そのコマは足が床からその高さだけ浮いている（スプリットステップ・ジャンプ。
+    ``footwork`` の正解に使う）。枠は上の辺も下の辺も同じだけ上がり、足元の床の位置は検出のまま（浮いた分だけずれる）。
 
     揺れは 4 つ：コマごとの小さな揺れ（``jitter``）、ときどき大きく外れるコマ（``outlier``）、
     0.2 秒ほど続くゆっくりした揺れ（``drift``。足の開き・体の傾き）、止まって打つたびに枠が横へ広がる分
@@ -78,8 +82,9 @@ def observe_players(t: np.ndarray, feet: dict[str, np.ndarray], camera: Camera, 
     fps = 1.0 / float(np.median(np.diff(t)))
     for side, xy in feet.items():
         n = len(xy)
-        foot = camera.project(np.column_stack([xy, np.zeros(n)]))
-        head = camera.project(np.column_stack([xy, np.full(n, height_m)]))
+        z = np.zeros(n) if lift is None or side not in lift else np.asarray(lift[side], float)
+        foot = camera.project(np.column_stack([xy, z]))
+        head = camera.project(np.column_stack([xy, z + height_m]))
         h = foot[:, 1] - head[:, 1]
         noise = rng.normal(0, jitter, (n, 2)) * h[:, None]
         wild = rng.random(n) < outlier_rate

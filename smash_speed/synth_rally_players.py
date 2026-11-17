@@ -205,3 +205,47 @@ def observe_player_session(session: list[SyntheticRally], extras: list[ExtraShot
     feet = session_feet(session, extras, t, rng, court)
     players = observe_players(t, feet, camera, rng)
     return det, players, feet
+
+
+@dataclass
+class Hop:
+    """足が床から浮いた 1 回（``footwork`` の正解）。"""
+
+    side: str
+    t_peak: float          # いちばん高い時刻 [s]
+    height_m: float        # 足の高さ [m]
+    duration_s: float      # 浮いている長さ [s]
+    kind: str              # split（相手が打つ前後のスプリットステップ）| jump（スマッシュのジャンプ）
+    seg_index: int         # どのショットに合わせたか（ラリーをつないだ通しの番号。0 から）
+
+
+def session_hops(session: list[SyntheticRally], rng: np.random.Generator, p_split: float = 0.75,
+                 p_jump: float = 0.7) -> list[Hop]:
+    """スプリットステップとジャンプの正解。
+
+    相手が打つたび（サーブも）に、受ける選手は ``p_split`` の割合で小さく跳ぶ（高さ 5〜12 cm、0.2〜0.26 秒。
+    いちばん高い所が相手の打つ 0.12 秒前〜0.02 秒後）。スマッシュは ``p_jump`` の割合で、打つ選手が跳んで打つ
+    （高さ 25〜45 cm、0.5 秒。いちばん高い所が打つ 0.05 秒前）。
+    """
+    hops: list[Hop] = []
+    k = 0
+    for r in session:
+        for seg in r.segments:
+            other = "o" if seg.side == "h" else "h"
+            if rng.uniform() < p_split:
+                hops.append(Hop(other, seg.t_hit + rng.uniform(-0.12, 0.02), rng.uniform(0.05, 0.12),
+                                rng.uniform(0.2, 0.26), "split", k))
+            if seg.shot_type == "smash" and rng.uniform() < p_jump:
+                hops.append(Hop(seg.side, seg.t_hit - 0.05, rng.uniform(0.25, 0.45), 0.5, "jump", k))
+            k += 1
+    return hops
+
+
+def hop_lift(hops: list[Hop], times: np.ndarray) -> dict[str, np.ndarray]:
+    """``hops`` の、各時刻の足の高さ（側 → (n,) [m]。放物線の形）。``synth_players.observe_players`` の ``lift``。"""
+    t = np.asarray(times, float)
+    out = {"h": np.zeros(len(t)), "o": np.zeros(len(t))}
+    for hp in hops:
+        w = (t - hp.t_peak) / (hp.duration_s / 2)
+        out[hp.side] = np.maximum(out[hp.side], np.where(np.abs(w) < 1, hp.height_m * (1 - w * w), 0.0))
+    return out
