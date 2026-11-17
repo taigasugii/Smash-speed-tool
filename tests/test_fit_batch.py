@@ -221,3 +221,27 @@ def test_gate_does_not_wait_for_a_task_that_never_comes(monkeypatch):
     tc.join(5)
     assert not tc.is_alive(), "残りの仕事の当てはめが待ち続けた"
     assert out == [[("job",)]]
+
+
+def test_gate_short_task_finishing_before_the_others_start(monkeypatch):
+    """仕事の数だけスレッドがあり、当てはめのない短いラリーがほかのラリーの ``enter`` より先に終わっても止まらない。"""
+    monkeypatch.setattr(fit_batch, "_fit_now", lambda jobs: list(jobs))
+    gate = BatchGate(n_threads=3, n_tasks=3)
+    t = threading.Thread(target=lambda: (gate.enter(), gate.leave()))
+    t.start(); t.join(5)
+    out: list = []
+    ready = threading.Barrier(2)
+
+    def task() -> None:
+        ready.wait(5)
+        gate.enter()
+        out.append(gate.run([("job",)]))
+        gate.leave()
+
+    ts = [threading.Thread(target=task, daemon=True) for _ in range(2)]
+    for x in ts:
+        x.start()
+    for x in ts:
+        x.join(5)
+    assert not any(x.is_alive() for x in ts), "ほかのラリーの当てはめが待ち続けた"
+    assert out == [[("job",)], [("job",)]]
