@@ -190,3 +190,58 @@ def test_balanced_chunks():
     assert _balanced_chunks([40, 5, 5, 30, 20], 2) == [[0, 1, 2], [3, 4]]   # 50 本と 50 本
     assert _balanced_chunks([3, 4], 4) == [[1], [0]]
     assert _balanced_chunks([3, 4, 5], 1) == [[0, 1, 2]]
+
+
+def test_gate_does_not_wait_for_a_task_that_never_comes(monkeypatch):
+    """2 つのスレッドが、残り 1 つの仕事の前に続けて ``leave`` しても、その仕事の当てはめは待ち続けない。
+    （前は ``leave`` ごとに「すぐ始まるはずの仕事」を 1 つ足していて、残りの仕事より多くなり、IMG_4397 で 20 分以上止まった）"""
+    monkeypatch.setattr(fit_batch, "_fit_now", lambda jobs: list(jobs))
+    gate = BatchGate(n_threads=2, n_tasks=3)
+    a_in, b_in, both_out = threading.Event(), threading.Event(), threading.Barrier(2)
+
+    def worker(ev: threading.Event) -> None:
+        gate.enter()
+        ev.set()
+        a_in.wait(5)
+        b_in.wait(5)
+        gate.leave()
+        both_out.wait(5)        # 2 つとも ``leave`` してから、片方が残りの仕事を始める
+
+    ta, tb = threading.Thread(target=worker, args=(a_in,)), threading.Thread(target=worker, args=(b_in,))
+    ta.start(); tb.start(); ta.join(5); tb.join(5)
+    out: list = []
+
+    def last() -> None:
+        gate.enter()
+        out.append(gate.run([("job",)]))
+        gate.leave()
+
+    tc = threading.Thread(target=last, daemon=True)
+    tc.start()
+    tc.join(5)
+    assert not tc.is_alive(), "残りの仕事の当てはめが待ち続けた"
+    assert out == [[("job",)]]
+
+
+def test_gate_short_task_finishing_before_the_others_start(monkeypatch):
+    """仕事の数だけスレッドがあり、当てはめのない短いラリーがほかのラリーの ``enter`` より先に終わっても止まらない。"""
+    monkeypatch.setattr(fit_batch, "_fit_now", lambda jobs: list(jobs))
+    gate = BatchGate(n_threads=3, n_tasks=3)
+    t = threading.Thread(target=lambda: (gate.enter(), gate.leave()))
+    t.start(); t.join(5)
+    out: list = []
+    ready = threading.Barrier(2)
+
+    def task() -> None:
+        ready.wait(5)
+        gate.enter()
+        out.append(gate.run([("job",)]))
+        gate.leave()
+
+    ts = [threading.Thread(target=task, daemon=True) for _ in range(2)]
+    for x in ts:
+        x.start()
+    for x in ts:
+        x.join(5)
+    assert not any(x.is_alive() for x in ts), "ほかのラリーの当てはめが待ち続けた"
+    assert out == [[("job",)], [("job",)]]
