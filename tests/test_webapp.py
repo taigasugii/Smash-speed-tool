@@ -451,3 +451,41 @@ def test_shot_label_reports_a_locked_file(client, tmp_path, monkeypatch):
     monkeypatch.setattr(shot_labels, "write_labels", locked)
     r = client.post("/api/shot_label", json={"i": 0, "label": "clear"})
     assert r.status_code == 400 and "閉じてください" in r.get_json()["error"]
+
+
+def test_shots_api_footwork(client, tmp_path, monkeypatch):
+    """フットワーク（footwork.csv）は、この解析で出したとき（shot_list.json の footwork）だけ各ショットに付く。
+    「選手の動きも出す」を選ぶと --footwork で解析する。"""
+    from smash_speed.footwork import write_footwork
+    from smash_speed.shots import Shot, write_shots
+    from smash_speed.synth_players import observe_players
+    from smash_speed.synth_rally import rally_camera
+    from smash_speed.webapp import server
+
+    cfg = load_config()
+    cam = rally_camera(cfg)
+    out = tmp_path / "IMG_1_shots"
+    out.mkdir()
+    shots = [Shot(t_hit_s=1.0, side="h", shot_type="serve", rally_id=1, index_in_rally=1),
+             Shot(t_hit_s=2.0, side="o", shot_type="clear", rally_id=1, index_in_rally=2, hit_z_m=2.5, land_x_m=-5.5)]
+    write_shots(out / "shots.csv", shots)
+    t = np.arange(0, 4, 1 / 30)
+    feet = {"h": np.tile([-3.0, 0.0], (len(t), 1)), "o": np.tile([3.0, 0.5], (len(t), 1))}
+    write_footwork(out, shots, observe_players(t, feet, cam, np.random.default_rng(0)), cam, cfg["court"])
+    info = {"video": r"C:\v\IMG_1.MOV", "by_type": {}}
+    (out / "shot_list.json").write_text(json.dumps(info), encoding="utf-8")
+    client.post("/api/state", json={"shots_dir": str(out), "out_root": str(tmp_path / "out")})
+    assert [s["footwork"] for s in client.get("/api/shots").get_json()["shots"]] == [None, None]
+    (out / "shot_list.json").write_text(json.dumps({**info, "footwork": {"players": {}}}), encoding="utf-8")
+    g = client.get("/api/shots").get_json()["shots"]
+    assert g[0]["footwork"]["prev_t_hit_s"] is None and g[1]["footwork"]["prev_t_hit_s"] == 1.0
+    assert g[1]["footwork"]["quality"] is not None
+    json.dumps(g)   # NaN を含まない
+
+    started = []
+    monkeypatch.setattr(server, "start_task", lambda title, cmds: started.append(cmds[0]) or server.Task(title, []))
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "calib.json").write_text("{}", encoding="utf-8")
+    server.S.state.update(video=str(tmp_path / "v.mp4"), calib=str(tmp_path / "calib.json"))
+    assert client.post("/api/run/shots", json={"players": True, "footwork": True}).get_json()["ok"]
+    assert "--footwork" in started[0]

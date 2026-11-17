@@ -23,6 +23,8 @@
   このときは ``shots.csv`` の ``hitter_x_m``・``hitter_y_m`` に打つ人の足元も入れ（``hitter.attach_hitters``）、
   当てはめの前に出して打点の手がかりにもする（``hitter_prior``。``shot_fit.fit_shots`` の ``hitter_xy``）
 - ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
+- ``footwork.csv``・``footwork.json``：ショットごとのフットワーク（スプリットステップ・反応・移動・準備・戻り・ジャンプ）と
+  出来の目安の点数（``footwork=True`` のとき。選手の位置も出す。``footwork``）
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -99,6 +101,7 @@ class ShotListOptions:
     joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
                                       # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
     joint_options: JointOptions | None = None
+    footwork: bool = False            # ショットごとのフットワークと出来の目安も出す（``footwork``。選手の位置も出す）
     fit_backend: str = "auto"         # 当てはめの計算の仕方（``shot_fit.run_fits``）："cpu"（1 つずつプロセスで並べる）、
                                       # "batch"（段階ごとにまとめて解く。ROADMAP F3e）、"auto"（batch が使えれば batch）
 
@@ -678,7 +681,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     # 選手の位置は打球を見つける前に出し、打った時刻にシャトルに届く選手から打球と打った側を確かめる
     # （``find_hits`` の ``players``）。当てはめでは打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     players_info = players = None
-    if o.players:
+    if o.players or o.footwork:
         players_info = players_step(o, cfg, out, progress)
         if "error" not in players_info and (out / PLAYERS_FILE).exists():
             players = pd.read_csv(out / PLAYERS_FILE)
@@ -729,6 +732,8 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
             info["players"]["hitter_prior"] = o.hitter_prior
             progress(f"[進行] 打つ人の足元：{n} / {len(shots)} 本")
         rallies = rallies_with_players(shots, rallies, det, o, cfg, out, info, progress)
+        if o.footwork and players is not None:
+            info["footwork"] = footwork_step(shots, players, camera, cfg, out, (meta.width, meta.height), progress)
     info["elapsed_s"] = round(time.time() - t_start, 1)
     # レポートは shot_list.json を読むので先に書き、書き出しの時間を足して書き直す
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -768,6 +773,21 @@ def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFr
     return new
 
 
+def footwork_step(shots: list[Shot], players: pd.DataFrame, camera: Camera, cfg: dict[str, Any], out: Path,
+                  image_size: tuple[int, int], progress: Callable[[str], None] = print) -> dict[str, Any]:
+    """``footwork.csv``・``footwork.json`` を書き、``shot_list.json`` に入れる短いまとめを返す（選手ごと）。
+    失敗しても一覧は止めず、``error`` に理由を残す。"""
+    from smash_speed.footwork import footwork_brief, write_footwork
+
+    try:
+        summary = write_footwork(out, shots, players, camera, cfg.get("court"), image_size)
+    except Exception as e:  # noqa: BLE001
+        progress(f"[注意] フットワークは出せませんでした：{e}")
+        return {"error": str(e)}
+    progress(f"[進行] フットワーク：{summary['n_shots']} 本")
+    return {"players": footwork_brief(summary)}
+
+
 def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: Callable[[str], None] = print
                  ) -> dict[str, Any]:
     """選手の位置を ``players.csv`` に書き、``shot_list.json`` に入れる要約を返す。
@@ -802,6 +822,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
     ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
+    ap.add_argument("--footwork", action="store_true",
+                    help="ショットごとのフットワークと出来の目安も出す（footwork.csv。選手の位置も出す）")
     ap.add_argument("--no-hit-players", action="store_true", help="打球を見つけるのに選手の位置を使わない")
     ap.add_argument("--detections", type=Path, default=None,
                     help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
@@ -821,7 +843,7 @@ def main(argv: list[str] | None = None) -> None:
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
                                          players=a.players, hitter_prior=not a.no_hitter_prior,
-                                         hit_players=not a.no_hit_players, detections=a.detections,
+                                         hit_players=not a.no_hit_players, footwork=a.footwork, detections=a.detections,
                                          tracknet=tracknet, tracknet_threshold=a.tracknet_threshold,
                                          tracknet_fallback=fallback, joint_fit=a.joint_fit,
                                          joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
