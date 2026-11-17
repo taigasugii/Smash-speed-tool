@@ -11,7 +11,8 @@
   相手の打った時刻の差（負なら打つ前）を出す。
 - **反応の速さ**：相手が打ってから、打つ所（自分が打った時の足元）へ向かって ``react_mps`` より速く
   ``react_hold_s`` 続けて動き出すまで [s]。打つ所へ向かう向き（速度と打つ所への向きのなす角の cos が
-  ``toward_cos`` 以上）だけを数える。負なら相手が打つ前に動き出した（読んでいた）。
+  ``toward_cos`` 以上）だけを数える。負なら相手が打つ前に動き出した（読んでいた）。相手が打つ ``react_lead_s`` 前から
+  もう打つ所へ向かって動いていたら、前の動きの続きなので空欄（練習の続けて打つ球に多い）。
 - **移動**：相手が打ってから自分が打つまでの移動距離と最高の速さ（``movement`` と同じならし方）。
 - **準備の時間**：打つ所（打った時の足元）から ``arrive_m`` 以内に着いてから打つまで [s]。
 - **戻り**：打った時の足元から、そのラリーでいちばん長くいた所（``base``。ラリーの間の足元の中央値）までの距離と、
@@ -73,7 +74,7 @@ class FootworkOptions:
     recover_max_s: float = 1.5      # 次に相手が打たないときに戻りを探す長さ [s]
     no_prev_s: float = 1.0          # 受けた球がない（サーブ）ときに移動・準備を見る、打つ前の長さ [s]
     jump_window_s: tuple[float, float] = (-0.35, 0.15)  # 打った時刻からの、ジャンプを探す範囲 [s]
-    jump_min_m: float = 0.15        # これより高く浮いたらジャンプ [m]
+    jump_min_m: float = 0.1         # これより高く浮いたらジャンプ [m]（IMG_5109 13.8 s の跳んだスマッシュが 14 cm）
     # いちばん高く浮いたコマの枠の高さが、前後の基準からこの割合より変わっていたら、カメラへ近づいた・離れた動きと
     # 跳んだのとが分けられないので、ジャンプは出さない（空欄）
     jump_max_depth: float = 0.03
@@ -269,7 +270,8 @@ def reaction_time(tr: pd.DataFrame, t_prev: float, t_hit: float, target: np.ndar
     t = w["t"].to_numpy(float)
     for k in np.flatnonzero(ok):
         if ok[k:k + n].all() and k + n <= len(ok):
-            return float(t[k] - t_prev)
+            # 探す範囲の始め（相手が打つ ``react_lead_s`` 前）から動いていたら、前の動きの続きで、動き出しは分からない
+            return None if k == 0 else float(t[k] - t_prev)
     return None
 
 
