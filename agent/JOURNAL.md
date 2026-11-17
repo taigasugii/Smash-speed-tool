@@ -34,7 +34,7 @@
   - ショットの一覧（既定の ft1）：IMG_5109_2 13.1 → 10.9 秒、IMG_4397（4K 113 秒）96.0 → 93.2 秒。どちらも `detections.csv`・`shots.csv` が
     1 バイトも同じ。4K の検出はコマを縮める所が 8 割で、熱の地図は 23 → 20 秒。
   - IMG_4397 の torch の 1 回目は当てはめで 20 分以上止まった（再現せず。ROADMAP の提案）。
-- 品質チェック：テストは変えた所（`test_tracknet_onnx`・`test_tracknet_train`・`test_shot_list`）だけ通した。`agent/eval_gate.py` 通った（44d3e3e の中身。テストは終了コード 0 だが件数の表示は「0 件通過」（件数の読み取りの問題、別に確かめる）、合成 MAPE 30fps 3.688% / 240fps 4.193%（基準と同じ）、check_real_videos・check_real_hits・check_shot_speeds ほかすべて OK）。
+- 品質チェック：テストは変えた所（`test_tracknet_onnx`・`test_tracknet_train`・`test_shot_list`）だけ通した。`agent/eval_gate.py` 通った（44d3e3e の中身。テストは通過 481 件・飛ばした 9 件・失敗 0（`pyproject.toml` の `addopts = "-q"` に eval_gate の `-q` が重なって pytest が最後の件数の行を出さず、表示は「0 件通過」になる。前からのこと）、合成 MAPE 30fps 3.688% / 240fps 4.193%（基準と同じ）、check_real_videos・check_real_hits・check_shot_speeds ほかすべて OK）。
 - 次にやること：`.venv-train` に `onnx` を入れるか（約 16 MB）は人が決める。入れなくても上の方法で書き出せる。
 
 ## 2026-11-16 00:00 進められる課題なし（新しい動画 4 本の確認と質問）
