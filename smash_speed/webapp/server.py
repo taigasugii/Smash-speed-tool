@@ -766,6 +766,27 @@ def run(kind: str):
         if not b.get("model"):   # 学習したモデル（設定の detection.shot_list_model）は画面で選んだときだけ使う
             args.append("--baseline-detector")
         t = start_task("すべてのショットを解析", [cli(*args)])
+    elif kind == "overlay":
+        # ショットの一覧の結果を重ねた動画（mode=video）か、見どころの動画（mode=highlights）を書き出す
+        from smash_speed.overlay import HIGHLIGHTS_DIR, OVERLAY_FILE
+        from smash_speed.shot_list import SHOT_LIST_FILE
+
+        d = _shots_dir()
+        if not d or not (Path(d) / SHOT_LIST_FILE).exists():
+            return err("先にショットの一覧を作ってください。")
+        if b.get("mode") == "highlights":
+            args = ["overlay", d, "--highlights", "--out", Path(d) / HIGHLIGHTS_DIR,
+                    "--top", int(b.get("top", 5)), "--rallies", int(b.get("rallies", 0)),
+                    "--type", b.get("type") or "smash"]
+            title = "見どころの動画を書き出す"
+        else:
+            args = ["overlay", d, "--out", Path(d) / OVERLAY_FILE]
+            if b.get("start") is not None and b.get("end") is not None:
+                if not float(b["end"]) > float(b["start"]):
+                    return err("終わりの時刻を始まりより後にしてください")
+                args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
+            title = "速さを重ねた動画を書き出す"
+        t = start_task(title, [cli(*args)])
     elif kind == "propose_calib":
         if S.meta is None:
             return err("動画を開いてください")
@@ -999,7 +1020,9 @@ def shots_get():
         r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
         r["truth"] = truth.get(k)
         rows.append(r)
-    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv"), ("report", "report.html"))
+    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv"), ("report", "report.html"),
+                                              ("overlay", "overlay.mp4"), ("highlights", "highlights/highlights.mp4"),
+                                              ("highlights_dir", "highlights"))
              if (Path(d) / f).exists()}
     # 正しい種類として選べるのは、labels の 8 種類（unknown のほか）と「打球ではない」（not_hit）
     return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,

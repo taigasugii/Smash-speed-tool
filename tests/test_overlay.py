@@ -152,3 +152,33 @@ def test_cli_overlay(shots_dir, tmp_path):
     assert out.exists() and len(_frames(out)) > 10
     # 一覧がないフォルダは、原因を出して 2 で終わる
     assert cli_main(["overlay", str(tmp_path)]) == 2
+
+
+def test_gui_starts_overlay_and_highlights(shots_dir, tmp_path, monkeypatch):
+    """ショットの一覧の画面の「動画に書き出す」：裏で ``overlay`` を動かすコマンドを組み、できた動画を一覧に出す。"""
+    from smash_speed.webapp import server
+
+    d, shots, truth = shots_dir
+    monkeypatch.setattr(server, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(server, "S", server.Session())
+    server.S.state = {"out_root": str(tmp_path / "out")}
+    started = []
+    monkeypatch.setattr(server, "start_task", lambda title, cmds: started.append((title, cmds[0])) or server.Task(title, []))
+    client = server.app.test_client()
+    assert not client.post("/api/run/overlay", json={}).get_json()["ok"]   # 一覧がない
+    server.S.state["shots_dir"] = str(d)
+    assert client.post("/api/run/overlay", json={"mode": "video", "start": 1, "end": 3}).get_json()["ok"]
+    assert not client.post("/api/run/overlay", json={"mode": "video", "start": 3, "end": 1}).get_json()["ok"]
+    assert client.post("/api/run/overlay", json={"mode": "highlights", "top": 3, "rallies": 1, "type": "all"}).get_json()["ok"]
+    (_, a), (_, b) = started
+    assert a[a.index("overlay") + 1] == str(d) and a[a.index("--start") + 1] == "1.000" and a[-1] == "3.000"
+    assert a[a.index("--out") + 1].endswith("overlay.mp4")
+    assert "--highlights" in b and b[b.index("--top") + 1] == "3" and b[b.index("--type") + 1] == "all"
+    assert b[b.index("--rallies") + 1] == "1"
+    # 書き出した動画は一覧の files に出る
+    (d / "overlay.mp4").write_bytes(b"x")
+    try:
+        files = client.get("/api/shots").get_json()["files"]
+        assert files["overlay"].endswith("overlay.mp4") and "highlights" not in files
+    finally:
+        (d / "overlay.mp4").unlink()

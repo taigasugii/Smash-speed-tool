@@ -22,7 +22,68 @@ App.views.shots = {
     this.renderStart(el, info, shots.length > 0, !!r.model);
     if (!mine) return;
     this.renderSummary(el, info, shots);
+    this.renderExport(el, info, shots, r.files || {});
     this.renderTable(el, info, shots, r.files || {});
+  },
+
+  // ---- 動画に書き出す（シャトルの通り道・種類・初速を重ねた動画と、見どころの動画）
+  renderExport(el, info, shots, files) {
+    const nSmash = shots.filter((s) => s.shot_type === "smash" && s.speed_kmh != null).length;
+    const dur = (info.end_s ?? App.meta.duration) - (info.start_s ?? 0);
+    const card = h(`<div class="card"><h2>動画に書き出す</h2>
+      <p class="desc">元の動画に、シャトルの通り道と、打ったときの種類・初速（例「スマッシュ 312 km/h」）を重ねた動画を作ります。
+        音も元の動画から入ります。大きい動画は 1080p に小さくして書きます。</p>
+      <div class="row" style="flex-wrap:wrap;gap:12px;margin-top:8px">
+        <div class="seg" id="xrng"><button data-v="all">解析した区間すべて</button><button data-v="part">区間を決める</button></div>
+        <span id="xpart" class="row small hidden">
+          <input class="input" id="x0" type="number" step="0.1" min="0" style="width:90px"> 秒から
+          <input class="input" id="x1" type="number" step="0.1" min="0" style="width:90px"> 秒まで</span>
+        <button class="btn primary" id="xgo">重ねた動画を書き出す</button>
+        ${files.overlay ? '<button class="btn sm" id="xopen">できた動画を開く</button>' : ""}
+        <span class="muted small" id="xeta"></span></div>
+      <div class="row" style="flex-wrap:wrap;gap:12px;margin-top:14px">
+        <span class="small">見どころ：</span>
+        <label class="row small">速い <select class="input" id="htype" style="width:auto">
+          <option value="smash">スマッシュ</option><option value="all">ショット（種類を問わない）</option></select>
+          を <input class="input" id="htop" type="number" min="0" max="20" value="5" style="width:60px"> 本</label>
+        <label class="row small">長いラリーを <input class="input" id="hral" type="number" min="0" max="10" value="0" style="width:60px"> 本</label>
+        <button class="btn" id="hgo">見どころの動画を作る</button>
+        ${files.highlights ? '<button class="btn sm" id="hopen">見どころを開く</button><button class="btn sm ghost" id="hdir">フォルダを開く</button>' : ""}
+      </div>
+      <p class="muted small" style="margin-top:6px">見どころは、打つ 1 秒前から 2 秒後までを 1 本ずつ切り出し、つないだ 1 本（highlights.mp4）も作ります。</p></div>`);
+    if (!nSmash) $("#htype", card).value = "all";
+    let part = false;
+    $("#x0", card).value = fmt(info.start_s ?? 0, 1);
+    $("#x1", card).value = fmt(info.end_s ?? App.meta.duration, 1);
+    const upd = () => {
+      $$("#xrng button", card).forEach((b) => b.classList.toggle("on", (b.dataset.v === "part") === part));
+      $("#xpart", card).classList.toggle("hidden", !part);
+      const len = part ? Math.max(0, +$("#x1", card).value - +$("#x0", card).value) : dur;
+      // 4K 30fps の動画を 1080p で書くと、動画の長さの約 0.7 倍（IMG_5109 の 16 秒で 11 秒）
+      $("#xeta", card).textContent = `目安 約 ${Math.max(1, Math.round(len * 0.7 / 60))} 分`;
+    };
+    $$("#xrng button", card).forEach((b) => { b.onclick = () => { part = b.dataset.v === "part"; upd(); }; });
+    $("#x0", card).oninput = upd;
+    $("#x1", card).oninput = upd;
+    upd();
+    const open = (p) => api.post("/api/open", { path: p }).then((r) => r.ok || toast(r.error, "bad"));
+    $("#xgo", card).onclick = () => {
+      const data = { mode: "video" };
+      if (part) { data.start = +$("#x0", card).value; data.end = +$("#x1", card).value; }
+      Task.start("overlay", data, (okk) => { toast(okk ? "動画を書き出しました" : "書き出せませんでした（ログを見てください）", okk ? "ok" : "bad"); go("shots"); },
+        "速さを重ねた動画を書き出しています");
+    };
+    $("#hgo", card).onclick = () => {
+      const top = +$("#htop", card).value || 0, rallies = +$("#hral", card).value || 0;
+      if (top + rallies <= 0) return toast("本数を 1 本以上にしてください", "bad");
+      Task.start("overlay", { mode: "highlights", type: $("#htype", card).value, top, rallies },
+        (okk) => { toast(okk ? "見どころの動画を作りました" : "作れませんでした（ログを見てください）", okk ? "ok" : "bad"); go("shots"); },
+        "見どころの動画を作っています");
+    };
+    if (files.overlay) $("#xopen", card).onclick = () => open(files.overlay);
+    if (files.highlights) $("#hopen", card).onclick = () => open(files.highlights);
+    if (files.highlights_dir) $("#hdir", card).onclick = () => open(files.highlights_dir);
+    el.appendChild(card);
   },
 
   // ---- 解析を始める
