@@ -590,8 +590,9 @@ class BatchGate:
     def leave(self) -> None:
         with self._cv:
             self._members.discard(threading.get_ident())
-            if self._unstarted > 0:
-                self._expected += 1      # 空いたスレッドが次の仕事を始める
+            # 空いたスレッドが次の仕事を始める。ただし、まだ始まっていない仕事の数より多くは待たない
+            # （2 つのスレッドが続けて抜けて残りの仕事が 1 つのとき、2 つ待つと来ない仕事を待ち続けて止まる）
+            self._expected = min(self._expected + 1, self._unstarted)
             self._cv.notify_all()
         self._maybe_run()
 
