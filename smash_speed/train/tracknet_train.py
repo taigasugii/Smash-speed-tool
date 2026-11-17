@@ -587,25 +587,89 @@ def train_python() -> Path | None:
     return None
 
 
-def can_predict() -> bool:
-    """``predict_in_train_env`` を動かせるか（この Python に torch があるか、``.venv-train`` があるか）。"""
+BACKEND_ENV = "SMASH_SPEED_DETECTOR_BACKEND"
+_BACKENDS = ("auto", "torch", "onnx")
+
+
+def onnx_for(ckpt: str | Path) -> Path:
+    """``model.pt`` を ONNX に書き出したファイルのパス（隣の同じ名前の ``.onnx``。``onnx_export`` で作る）。"""
+    return Path(ckpt).with_suffix(".onnx")
+
+
+def _has(module: str) -> bool:
     import importlib.util
 
-    return importlib.util.find_spec("torch") is not None or train_python() is not None
+    return importlib.util.find_spec(module) is not None
 
 
-def predict_in_train_env(data_dir: Path, ckpt: Path, out: Path | None = None, prefer: str | None = None) -> Path:
-    """``predict`` を、torch のある Python（この Python か、なければ ``.venv-train``）で動かす。"""
-    import importlib.util
+def predict_backend(ckpt: str | Path | None = None, backend: str | None = None) -> str | None:
+    """熱の地図をどれで作るか（``torch``：この Python の torch、``onnx``：onnxruntime、``train-env``：``.venv-train`` の
+    torch を呼ぶ）。動かせなければ None。
+
+    ``auto``（既定。環境変数 ``SMASH_SPEED_DETECTOR_BACKEND`` が引数より優先）は、この Python に torch があれば torch、
+    なければ ``model.pt`` の隣に ``.onnx`` があり onnxruntime が入っていれば ONNX、なければ ``.venv-train``。
+    """
+    import os
+
+    backend = (os.environ.get(BACKEND_ENV) or backend or "auto").strip().lower()
+    if backend not in _BACKENDS:
+        raise ValueError(f"熱の地図の作り方は {', '.join(_BACKENDS)} のどれかにしてください: {backend!r}")
+    onnx_ok = ckpt is not None and onnx_for(ckpt).exists() and _has("onnxruntime")
+    torch_here = _has("torch")
+    if backend == "onnx":
+        return "onnx" if onnx_ok else None
+    if torch_here:
+        return "torch"
+    if backend == "auto" and onnx_ok:
+        return "onnx"
+    return "train-env" if train_python() is not None else None
+
+
+def can_predict(ckpt: str | Path | None = None, backend: str | None = None) -> bool:
+    """``predict_in_train_env`` を動かせるか（この Python の torch・``.venv-train``・``ckpt`` の隣の ONNX のどれか）。"""
+    return predict_backend(ckpt, backend) is not None
+
+
+def predict_onnx(data_dir: Path, onnx: Path, out: Path | None = None, batch: int = 2, prefer: str | None = None
+                 ) -> Path:
+    """``predict`` と同じ熱の地図を、ONNX に書き出したモデル（``onnx_export``）と onnxruntime で作る（torch は要らない）。
+
+    GPU（DirectML）があれば GPU、なければ CPU（``accel.make_session``）。入力の作り方・0〜255 への丸め方は ``predict`` と同じ。
+    """
+    from smash_speed.accel import make_session
+
+    data = ClipData(data_dir)
+    sess = make_session(Path(onnx), prefer)
+    name = sess.get_inputs()[0].name
+    out = out or Path(onnx).with_name(Path(onnx).stem + "_pred.npy")
+    heat = np.lib.format.open_memmap(out, mode="w+", dtype=np.uint8, shape=(len(data), data.seq_len, HEIGHT, WIDTH))
+    for b in range(0, len(data), batch):
+        idx = list(range(b, min(b + batch, len(data))))
+        y = sess.run(None, {name: data.batch(idx)[0]})[0]
+        heat[idx] = (y * 255).round().astype(np.uint8)
+    heat.flush()
+    return out
+
+
+def predict_in_train_env(data_dir: Path, ckpt: Path, out: Path | None = None, prefer: str | None = None,
+                         backend: str | None = None) -> Path:
+    """``predict`` を、torch のある Python（この Python か ``.venv-train``）か、ONNX（``predict_onnx``）で動かす。
+
+    どれを使うかは ``predict_backend``。
+    """
     import os
     import subprocess
 
-    if importlib.util.find_spec("torch") is not None:
+    how = predict_backend(ckpt, backend)
+    if how is None:
+        raise FileNotFoundError("torch の入った Python（.venv-train）か、model.pt の隣の .onnx と onnxruntime が"
+                                "見つかりません（docs/gpu.md）")
+    if how == "torch":
         return predict(data_dir, ckpt, out, prefer=prefer)
+    if how == "onnx":
+        return predict_onnx(data_dir, onnx_for(ckpt), out, prefer=prefer)
     root = Path(__file__).resolve().parents[2]
     py = train_python()
-    if py is None:
-        raise FileNotFoundError("torch の入った Python（.venv-train）が見つかりません（docs/gpu.md）")
     out = out or Path(ckpt).with_name(Path(ckpt).stem + "_pred.npy")
     args = [str(py), "-W", "ignore", "-m", "smash_speed.train.tracknet_train", "predict", str(data_dir), str(ckpt),
             "--out", str(out)] + (["--device", prefer] if prefer else [])
@@ -617,17 +681,22 @@ def predict_in_train_env(data_dir: Path, ckpt: Path, out: Path | None = None, pr
 
 
 def detect_video(video: Path, ckpt: Path, out_dir: Path, start_s: float | None = None, end_s: float | None = None,
-                 threshold: float = 0.5, prefer: str | None = None, keep_frames: bool = False, progress=print):
+                 threshold: float = 0.5, prefer: str | None = None, keep_frames: bool = False, progress=print,
+                 backend: str | None = None):
     """動画の区間の全コマを学習したモデルで検出し、``out_dir/detections.csv`` に書いて表を返す。
+
+    熱の地図の作り方（``predict_backend``：torch / ONNX）は表の ``attrs["backend"]`` に入れる。
 
     コマ（288×512）と熱の地図は大きい（1 コマ 0.6 MB）ので、``keep_frames`` でなければ最後に消す。
     """
     out_dir = Path(out_dir)
     build_video(video, out_dir, start_s, end_s, progress=progress)
     t0 = time.time()
-    heat = predict_in_train_env(out_dir, Path(ckpt), out_dir / "heat.npy", prefer)
-    progress(f"熱の地図（{time.time() - t0:.0f} 秒）")
+    how = predict_backend(ckpt, backend)
+    heat = predict_in_train_env(out_dir, Path(ckpt), out_dir / "heat.npy", prefer, backend)
+    progress(f"熱の地図（{how}、{time.time() - t0:.0f} 秒）")
     det = detections_from_heat(out_dir, heat, threshold, out_dir / "detections.csv")
+    det.attrs["backend"] = how
     if not keep_frames:
         for name in ("frames.npy", "heat.npy"):
             (out_dir / name).unlink(missing_ok=True)
@@ -665,6 +734,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("ckpt", type=Path)
     pr.add_argument("--out", type=Path)
     pr.add_argument("--device", default=None)
+    pr.add_argument("--backend", default="torch", choices=["torch", "onnx"],
+                    help="onnx なら ckpt の隣の .onnx を onnxruntime で動かす（torch は要らない）")
     e = sub.add_parser("eval", help="熱の地図を正解と比べる（.venv）")
     e.add_argument("data", type=Path)
     e.add_argument("heat", type=Path)
@@ -688,6 +759,8 @@ def main(argv: list[str] | None = None) -> int:
     dv.add_argument("--threshold", type=float, default=0.5)
     dv.add_argument("--device", default=None)
     dv.add_argument("--keep-frames", action="store_true", help="書き出したコマと熱の地図を消さない")
+    dv.add_argument("--backend", default=None, choices=list(_BACKENDS),
+                    help="熱の地図の作り方（既定 auto：torch があれば torch、なければ ckpt の隣の .onnx）")
     a = p.parse_args(argv)
     if a.cmd == "frames":
         info = build_video(a.video, a.out, a.start, a.end)
@@ -697,8 +770,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"n_frames": len(det), "n_visible": int(det.visible.sum()),
                           "n_tracks": int(det.track_id.max() + 1)}, ensure_ascii=False))
     elif a.cmd == "detect":
-        det = detect_video(a.video, a.ckpt, a.out, a.start, a.end, a.threshold, a.device, a.keep_frames)
-        print(json.dumps({"n_frames": len(det), "n_visible": int(det.visible.sum()),
+        det = detect_video(a.video, a.ckpt, a.out, a.start, a.end, a.threshold, a.device, a.keep_frames,
+                           backend=a.backend)
+        print(json.dumps({"backend": det.attrs.get("backend"), "n_frames": len(det), "n_visible": int(det.visible.sum()),
                           "n_tracks": int(det.track_id.max() + 1), "csv": str(a.out / "detections.csv")},
                          ensure_ascii=False))
     elif a.cmd == "build":
@@ -707,6 +781,8 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "train":
         h = train(a.data, a.out, a.epochs, a.batch, a.lr, a.init, a.width, a.val_frac, a.seed, a.device, a.max_minutes)
         print(json.dumps({"best_epoch": h["best_epoch"], "val_loss": min(h["val_loss"], default=h["val_loss_init"])}))
+    elif a.cmd == "predict" and a.backend == "onnx":
+        print(predict_onnx(a.data, onnx_for(a.ckpt), a.out, prefer=a.device))
     elif a.cmd == "predict":
         print(predict(a.data, a.ckpt, a.out, prefer=a.device))
     elif len(a.threshold) > 1:

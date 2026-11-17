@@ -170,8 +170,9 @@ def load_detections(path: Path, meta: VideoMeta, start_s: float | None = None, e
 
 
 def default_tracknet(cfg: dict[str, Any]) -> Path | None:
-    """設定の ``detection.shot_list_model``（F1c。相対パスはこのリポジトリから）が置いてあり、torch の入った
-    Python（``.venv-train``）があればそのパス。どちらかがなければ None（今の検出で探す）。"""
+    """設定の ``detection.shot_list_model``（F1c。相対パスはこのリポジトリから）が置いてあり、熱の地図を作れれば
+    （torch の入った Python（``.venv-train``）か、隣の ``.onnx`` と onnxruntime。``tracknet_train.predict_backend``）
+    そのパス。どちらかがなければ None（今の検出で探す）。"""
     from smash_speed.config import PROJECT_ROOT
     from smash_speed.train.tracknet_train import can_predict
 
@@ -179,7 +180,7 @@ def default_tracknet(cfg: dict[str, Any]) -> Path | None:
     if not p:
         return None
     p = Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p
-    return p if p.exists() and can_predict() else None
+    return p if p.exists() and can_predict(p) else None
 
 
 def choose_tracknet(tracknet: Path | None, detections: Path | None, baseline: bool, cfg: dict[str, Any]
@@ -193,6 +194,15 @@ def choose_tracknet(tracknet: Path | None, detections: Path | None, baseline: bo
         return tracknet, False
     p = default_tracknet(cfg)
     return p, p is not None
+
+
+def _tracknet_backend(tracknet: Path | None) -> str | None:
+    """学習したモデルの熱の地図を作ったもの（torch / onnx / train-env。``tracknet_train.predict_backend``）。"""
+    if tracknet is None:
+        return None
+    from smash_speed.train.tracknet_train import predict_backend
+
+    return predict_backend(tracknet)
 
 
 def tracknet_detections(o: ShotListOptions, out: Path, progress: Callable[[str], None] = print) -> Path:
@@ -707,6 +717,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "detections": str(Path(det_path).resolve()) if det_path is not None else None,
         "tracknet": str(Path(tracknet).resolve()) if tracknet is not None else None,
         "tracknet_threshold": o.tracknet_threshold if tracknet is not None else None,
+        "tracknet_backend": _tracknet_backend(tracknet),
         "detector_note": detector_note,
         "used_audio": onsets is not None, "n_onsets": None if onsets is None else len(onsets),
         "n_frames": len(det), "n_visible": n_vis,
