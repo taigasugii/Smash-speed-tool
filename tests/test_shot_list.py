@@ -377,7 +377,7 @@ def test_default_tracknet_is_used_only_when_the_model_and_torch_are_there(tmp_pa
 
     model = tmp_path / "model.pt"
     cfg = {"detection": {"shot_list_model": str(model)}}
-    monkeypatch.setattr(tt, "can_predict", lambda: True)
+    monkeypatch.setattr(tt, "can_predict", lambda *a, **k: True)
     assert default_tracknet(cfg) is None                       # まだ置いていない
     model.write_bytes(b"")
     assert default_tracknet(cfg) == model
@@ -388,7 +388,7 @@ def test_default_tracknet_is_used_only_when_the_model_and_torch_are_there(tmp_pa
     assert choose_tracknet(None, None, True, cfg) == (None, False)
     assert choose_tracknet(tmp_path / "x.pt", None, False, cfg) == (tmp_path / "x.pt", False)
     assert choose_tracknet(None, tmp_path / "d.csv", False, cfg) == (None, False)
-    monkeypatch.setattr(tt, "can_predict", lambda: False)     # .venv-train がない PC
+    monkeypatch.setattr(tt, "can_predict", lambda *a, **k: False)     # .venv-train がない PC
     assert default_tracknet(cfg) is None and choose_tracknet(None, None, False, cfg) == (None, False)
 
 

@@ -296,7 +296,7 @@ ft1・ft2・2 つの熱の地図の平均を比べ、**ft1（閾値 0.25）を�
 
 - 置き場所：`ckpts/shuttle/model_ft1.pt`（`outputs/f1b/ft1/model.pt` を写したもの。45 MB。`ckpts/` は Git に入らない）。
   設定は `configs/default.yaml` の `detection.shot_list_model`。作り直すときは「学習済みの重みからの追加学習」の手順で学習し、ここに置く。
-- 使う条件：ファイルがあり、torch の入った Python（この Python か `.venv-train`）があるとき（`shot_list.default_tracknet`）。
+- 使う条件：ファイルがあり、torch の入った Python（この Python か `.venv-train`）があるか、隣に `.onnx` があり onnxruntime が入っているとき（`shot_list.default_tracknet`。2026-11-17 から。下の「学習したモデルを ONNX で動かす」）。
   なければ今の検出で探す。既定のモデルで検出に失敗したら（DirectML のエラーなど）、今の検出で作り直し、理由を `shot_list.json` の
   `detector_note` に残す。`smash-speed shots`・`python -m smash_speed.shot_list` は `--baseline-detector` で今の検出に戻せる。
   GUI は「練習させた見つけ方でシャトルを探す（おすすめ）」（モデルがある PC だけに出る。前の解析が今の検出なら外れた状態）。
@@ -337,6 +337,61 @@ ft1・ft2・2 つの熱の地図の平均を比べ、**ft1（閾値 0.25）を�
 - 時間（IMG_4397、113 秒の 4K）：今の検出で 384 秒、ft1 で 210 秒 ＋ モデルの検出（測ったのはコマの書き出しと 2 つのモデルの熱の地図を
   合わせて 185 秒。1 つ分は測っていない）。当てはめが速くなる分で、合わせるとほぼ同じ。短い IMG_3391（13 秒）を `smash-speed shots --players`
   で通すと、今の検出 44 秒・既定（ft1）75 秒。
+
+### 学習したモデルを ONNX で動かす（2026-11-17）
+
+ショットの一覧の既定のモデル（ft1）を ONNX に書き出し、**torch のない本体の `.venv` でも onnxruntime-directml（GPU、なければ CPU）で
+同じ検出ができる**ようにした。`.venv-train` を呼ぶより少し速く、`.venv-train` のない PC でも学習したモデルでショットの一覧を作れる。
+
+書き出し（1 回だけ。`.venv-train` で動かす。書き出しには `onnx` が要る）：
+
+```
+.venv-train\Scripts\python.exe -m pip install onnx          # .venv-train に onnx がなければ（約 16 MB）
+.venv-train\Scripts\python.exe -m smash_speed.train.onnx_export ckpts\shuttle\model_ft1.pt
+```
+
+- `ckpts/shuttle/model_ft1.onnx`（45 MB。`ckpts/` は Git に入らない）ができる。入力は `frames`（区間の数 × 27 × 288 × 512）、出力は
+  `heat`（区間の数 × 8 × 288 × 512、0〜1）。opset 17、区間の数は自由。
+- `.venv-train` に `onnx` を入れたくないときは、別のフォルダーに入れて `PYTHONPATH` に足しても書き出せる
+  （`pip install --target <フォルダー> onnx==1.17.0 protobuf --no-deps`。2026-11-17 はこれで書き出した）。
+
+使い方：
+
+- 熱の地図の作り方（`tracknet_train.predict_backend`）：この Python に torch があれば torch、なければ `model.pt` の隣に
+  同じ名前の `.onnx` があり onnxruntime が入っていれば **ONNX**（`predict_onnx`。`accel.make_session` なので GPU がなければ CPU）、
+  どちらもなければ今までどおり `.venv-train` を呼ぶ。ショットの一覧の既定（`shot_list.default_tracknet`）も、`.onnx` があれば
+  `.venv-train` がなくても使う。
+- 選び方を変えるとき：環境変数 `SMASH_SPEED_DETECTOR_BACKEND`（`auto`・`torch`・`onnx`）、`tracknet_train detect --backend`、
+  `tracknet_train predict --backend onnx`。装置は今までどおり `SMASH_SPEED_DEVICE`（`cpu` にすると onnxruntime も CPU）。
+- `shot_list.json` の `tracknet_backend` に、どれで作ったか（`torch`・`onnx`・`train-env`）を残す。
+- 入力の作り方（背景 ＋ 8 コマ、0〜1）・0〜255 への丸め方・閾値（0.25）・点の取り方は torch と同じ（`ClipData`・`heatmap_point` を共有）。
+
+比べた結果（ft1。答え合わせ用の 112 区間・895 コマ、IMG_4397 80〜100 s と IMG_5109_2。`.agent/onnx_cmp.py`）：
+
+| | 熱の地図（0〜255）の差 | IMG_4397 80〜100 s F1 | IMG_5109_2 F1 | 点の位置の差 | 時間（112 区間） |
+|---|---|---|---|---|---:|
+| torch（DirectML。`.venv-train` を呼ぶ） | — | 0.952 | 0.983 | — | 7.3 秒 |
+| torch（CPU） | 最大 1（0.0003% の画素） | 0.952 | 0.983 | 0 px | 43.3 秒 |
+| **ONNX（DirectML）** | 最大 1（0.0002% の画素） | 0.952 | 0.983 | 0 px | **5.2 秒** |
+| ONNX（CPU） | 最大 1（0.0005% の画素） | 0.952 | 0.983 | 0 px | 36.9 秒 |
+
+- 丸める前（0〜1）の差は、4 区間で最大 4×10⁻⁶（ONNX CPU と torch CPU）、1×10⁻⁶（ONNX DirectML と torch DirectML）。
+- 見つかったコマ・見つからないコマはすべて同じ（895 コマで違いなし）、両方で見つかった 557 コマの点の位置も同じ。
+- 時間は Python の起動・モデルの読み込みを含む（torch は `.venv-train` を呼ぶ分も）。
+
+ショットの一覧（`python -m smash_speed.shot_list`、既定の ft1、`--players` なし。`.agent/list_both.py`）：
+
+| 動画 | 熱の地図（torch → ONNX） | 検出全体（コマの書き出しを含む） | 一覧全体 | 一覧の中身 |
+|---|---|---|---|---|
+| IMG_5109_2（287 コマ） | 4 → 2 秒 | 7.4 → 5.2 秒 | 13.1 → 10.9 秒 | `detections.csv`・`shots.csv` が 1 バイトも同じ |
+| IMG_4397（4K・113 秒・3,394 コマ） | 23 → 20 秒 | 82.4 → 79.4 秒 | 96.0 → 93.2 秒 | `detections.csv`・`shots.csv` が 1 バイトも同じ（73 本、初速あり 60 本） |
+
+- 4K の動画では、検出の時間のほとんどはコマを読んで 288×512 に縮める所（`build_video`）で、熱の地図は 2 割ほど。ONNX で速くなるのは
+  `.venv-train` の起動と torch の読み込みの分（数秒）だけ。
+- IMG_4397 の torch の 1 回目は、検出の後の当てはめ（4 プロセス）で止まった（20 分以上、どのプロセスも計算していなかった）。
+  同じ条件の 2 回目と ONNX は 1 分半で終わり、検出は 1 バイトも同じなので、検出の作り方ではなく当てはめ側で、まれに起きるものらしい。
+  再現していない（ROADMAP の提案）。
+
 
 ## 軌道の当てはめには GPU を使わない（F3e、2026-11-14）
 
