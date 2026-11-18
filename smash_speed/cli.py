@@ -226,6 +226,12 @@ def cmd_find_smashes(a: argparse.Namespace, cfg: dict) -> int:
     return 0
 
 
+def cmd_overlay(a: argparse.Namespace, cfg: dict) -> int:
+    from smash_speed.overlay import run_from_args
+
+    return run_from_args(a, cfg)
+
+
 def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
     from smash_speed.rally_fit import JointOptions
     from smash_speed.shot_list import ShotListOptions, analyze_video, choose_tracknet
@@ -441,6 +447,7 @@ SUBCOMMANDS: dict[str, str] = {
     "find-smashes": "動画全体からスマッシュの候補を探し、だいたいの初速を出す（いちばん速いスマッシュ探しの 1 段目）",
     "analyze-smashes": "確認した候補を詳しく解析して速い順に並べる（2 段目）",
     "shots": "動画のすべてのショットを、種類・初速つきで一覧にする（shots.csv）",
+    "overlay": "ショットの一覧の結果（軌跡・軌道・種類と初速）を重ねた動画と、見どころの動画を書き出す",
 }
 
 
@@ -664,6 +671,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fit-backend", default="auto", choices=["auto", "cpu", "batch"],
                    help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く、auto：batch が使えれば batch）")
     p.set_defaults(func=cmd_shots)
+
+    p = add("overlay")
+    from smash_speed.overlay import add_arguments as overlay_arguments
+    overlay_arguments(p)
+    p.set_defaults(func=cmd_overlay)
 
     p = add("summarize")
     p.add_argument("--results", required=True, help="result.csv を含むディレクトリ")
