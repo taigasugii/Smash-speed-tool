@@ -38,7 +38,7 @@ import pandas as pd
 
 from smash_speed.camera import Camera
 from smash_speed.geometry import FlightPlane
-from smash_speed.physics import (MPS_TO_KMH, FitOptions, FitResult, Observations, PhysicsParams, fit_trajectory,
+from smash_speed.physics import (MAX_FIT_SPEED_MPS, MPS_TO_KMH, FitOptions, FitResult, Observations, PhysicsParams, fit_trajectory,
                                  simulate, simulate_until_ground)
 from smash_speed.shots import Shot, side_of
 
@@ -162,14 +162,65 @@ def grid_planes(side: str, hitter_xy: np.ndarray | None = None,
             for sx in _x_signs(side) for origin in origins for yaw in np.deg2rad(yaw_deg)]
 
 
+FitJob = tuple  # ``fit_trajectory`` の引数 (obs, t_ref, mode, plane, phys, opts, theta0)
+
+
+def _fit_job(obs: Observations, t_ref: float, mode: str, plane: FlightPlane | None, phys: PhysicsParams,
+             opts: FitOptions, theta0: np.ndarray | None) -> FitResult | Exception:
+    """``fit_trajectory`` の結果。計算できなければ（ValueError・RuntimeError）その例外を返す。"""
+    try:
+        return fit_trajectory(obs, t_ref, mode, plane, phys, opts, theta0=theta0)
+    except (ValueError, RuntimeError) as e:
+        return e
+
+
+def _ok(f: Any) -> FitResult | None:
+    """``_fit_job``・``fit_batch.fit_trajectories`` の結果のうち、計算できたもの（できなければ None）。"""
+    if isinstance(f, (ValueError, RuntimeError)):
+        return None
+    if isinstance(f, BaseException):
+        raise f
+    return f
+
+
+def run_fits(jobs: list[FitJob], workers: int = 1, backend: str = "cpu") -> list[FitResult | None]:
+    """当てはめ ``jobs``（``fit_trajectory`` の引数）を全部計算する（計算できなければ None）。
+
+    ``backend``：``"cpu"`` は 1 つずつ（``workers`` が 2 以上ならプロセスで並べる）、``"batch"`` はまとめて
+    （``fit_batch.fit_trajectories``。ROADMAP F3e）。どちらも結果は同じ（差は積分の誤差の分だけ。``docs/speed.md``）。
+    """
+    if not jobs:
+        return []
+    if backend == "batch":
+        from smash_speed.fit_batch import fit_trajectories
+
+        return [_ok(f) for f in fit_trajectories(jobs)]
+    return [_ok(f) for f in _parallel_map(_fit_job, jobs, workers)]
+
+
+def resolve_backend(backend: str | None) -> str:
+    """当てはめの計算の仕方の名前（``"auto"`` は、まとめて解けるなら ``"batch"``、だめなら ``"cpu"``）。"""
+    backend = backend or "auto"
+    if backend not in ("auto", "cpu", "batch"):
+        raise ValueError(f"当てはめの計算の仕方 {backend!r} は使えません（auto・cpu・batch）")
+    if backend == "cpu":
+        return "cpu"
+    from smash_speed.fit_batch import AVAILABLE
+
+    if not AVAILABLE and backend == "batch":
+        raise ValueError("まとめて解く当てはめ（batch）が、この scipy では使えません")
+    return "batch" if AVAILABLE else "cpu"
+
+
+def _grid_job(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions) -> FitJob:
+    coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
+    return (obs, t_hit, "plane", plane, _phys_fast(phys), coarse, None)
+
+
 def grid_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions
              ) -> FitResult | None:
     """格子の平面 1 つで、粗い積分で当てはめる（計算できなければ None）。"""
-    coarse = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", diff_step=1e-5)
-    try:
-        return fit_trajectory(obs, t_hit, "plane", plane, _phys_fast(phys), coarse)
-    except (ValueError, RuntimeError):
-        return None
+    return _ok(_fit_job(*_grid_job(obs, t_hit, plane, phys, opts)))
 
 
 def best_grid_fit(grid: list[FitResult | None]) -> FitResult | None:
@@ -187,16 +238,18 @@ def loose_fit(obs: Observations, t_hit: float, best: FitResult | None, phys: Phy
     """格子でいちばん合った ``best`` から、平面の向き・位置を大きく動かせるようにして当てはめ直す（``initial_fit`` の後半）。"""
     if best is None:
         return None
+    f = _ok(_fit_job(*_loose_job(obs, t_hit, best, phys, opts, hitter_xy, hitter_sigma_m)))
+    return best if f is None else f
+
+
+def _loose_job(obs: Observations, t_hit: float, best: FitResult, phys: PhysicsParams, opts: FitOptions,
+               hitter_xy: np.ndarray | None, hitter_sigma_m: tuple[float, float]) -> FitJob:
     loose = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
-                       plane_sigma_deg=30.0, plane_sigma_m=3.0)
+                       plane_sigma_deg=30.0, plane_sigma_m=3.0, quadratic_priors=opts.quadratic_priors)
     if hitter_xy is not None:
         loose.p0_prior_m = np.r_[np.asarray(hitter_xy, float)[:2], np.clip(best.p0[2], 0.3, 3.5)]
         loose.p0_prior_sigma_m = hitter_sigma_m
-    try:
-        return fit_trajectory(obs, t_hit, "plane", best.plane, phys, loose,
-                              theta0=np.r_[best.theta[:4], 0.0, 0.0])
-    except (ValueError, RuntimeError):
-        return best
+    return (obs, t_hit, "plane", best.plane, phys, loose, np.r_[best.theta[:4], 0.0, 0.0])
 
 
 def wide_fit(obs: Observations, t_hit: float, side: str, first: FitResult, phys: PhysicsParams, opts: FitOptions,
@@ -206,20 +259,37 @@ def wide_fit(obs: Observations, t_hit: float, side: str, first: FitResult, phys:
     ありえる向きの平面を広い格子（``WIDE_YAW_DEG``）で探し、ずれの小さいものから 3 つ、平面を小さく動かして当てはめ、
     ありえる中でいちばん合うものにする（大きく動かすと、ありえない向きに戻ってしまう）。どれもありえなければ ``first``。
     """
-    wide = [f for f in (grid_fit(obs, t_hit, p, phys, opts) for p in grid_planes(side, hitter_xy, WIDE_YAW_DEG))
-            if f is not None and np.isfinite(f.rms_px) and _plausible_fit(f, side)]
-    wide.sort(key=lambda f: f.rms_px)
+    return wide_fits([(obs, t_hit, side, first, hitter_xy)], phys, opts)[0]
+
+
+def wide_fits(items: list[tuple[Observations, float, str, FitResult, np.ndarray | None]], phys: PhysicsParams,
+              opts: FitOptions, workers: int = 1, backend: str = "cpu") -> list[FitResult]:
+    """``wide_fit`` を、ショット ``items``（(obs, t_hit, side, first, hitter_xy)）についてまとめて計算する
+    （格子の当てはめ・当てはめ直しをそれぞれ ``run_fits`` で並べる）。"""
+    jobs, owner = [], []
+    for k, (obs, t_hit, side, _, hitter_xy) in enumerate(items):
+        for p in grid_planes(side, hitter_xy, WIDE_YAW_DEG):
+            jobs.append(_grid_job(obs, t_hit, p, phys, opts))
+            owner.append(k)
+    wide: list[list[FitResult]] = [[] for _ in items]
+    for k, f in zip(owner, run_fits(jobs, workers, backend)):
+        if f is not None and np.isfinite(f.rms_px) and _plausible_fit(f, items[k][2]):
+            wide[k].append(f)
     tight = FitOptions(loss=opts.loss, loss_scale_px=opts.loss_scale_px, ci_method="none", refine_plane=True,
                        plane_sigma_deg=10.0, plane_sigma_m=1.0)
-    ok = []
-    for g in wide[:3]:
-        try:
-            f = fit_trajectory(obs, t_hit, "plane", g.plane, phys, tight, theta0=np.r_[g.theta[:4], 0.0, 0.0])
-        except (ValueError, RuntimeError):
-            f = g
-        if _plausible_fit(f, side):
-            ok.append(f)
-    return min(ok, key=lambda f: f.rms_px) if ok else first
+    jobs, owner, grids = [], [], []
+    for k, (obs, t_hit, *_rest) in enumerate(items):
+        wide[k].sort(key=lambda f: f.rms_px)
+        for g in wide[k][:3]:
+            jobs.append((obs, t_hit, "plane", g.plane, phys, tight, np.r_[g.theta[:4], 0.0, 0.0]))
+            owner.append(k)
+            grids.append(g)
+    ok: list[list[FitResult]] = [[] for _ in items]
+    for k, g, f in zip(owner, grids, run_fits(jobs, workers, backend)):
+        f = g if f is None else f
+        if _plausible_fit(f, items[k][2]):
+            ok[k].append(f)
+    return [min(o, key=lambda f: f.rms_px) if o else it[3] for o, it in zip(ok, items)]
 
 
 def _state_at(f: FitResult, t: float, phys: PhysicsParams) -> tuple[np.ndarray, np.ndarray] | None:
@@ -459,6 +529,40 @@ def audio_hit_times(fits: list[ShotFit], t_audio: list[float | None], camera: Ca
     return out
 
 
+def foot_hit_times(fits: list[ShotFit], feet: list[np.ndarray | None], t_audio: list[float | None],
+                   phys: PhysicsParams, times: list[float], reach_m: float = 1.5, max_shift_s: float = 0.1,
+                   step_s: float = 0.002, max_speed_mps: float = MAX_FIT_SPEED_MPS) -> list[float]:
+    """打球音のないショットの打った時刻を、当てはめた軌道が打つ人の足元に水平にいちばん近づく時刻へ戻す。
+
+    軌道の向きの変化から決めた打球の時刻は、打った後に最初に見えたコマに寄って遅れやすい（実動画の 30 fps で 70 ms）。
+    遅れた時刻の「打点」は飛んだ先にあり（速いショットは 2 m）、初速はその時刻の速さなので大きく下がる。
+    当てはめた軌道を前へ戻すと打つ人の所を通るので、打点が足元から ``reach_m`` より離れているときだけ、
+    ``max_shift_s`` 前までの間でいちばん足元に近い時刻にする（そこでも ``reach_m`` より離れていれば、足元か軌道が
+    合っていないので直さない）。前へ戻すと速さは急に上がるので、
+    ``max_speed_mps`` を超える所までは戻さない。前のショットの最後の観測より前にも戻さない。
+    """
+    out = list(times)
+    for i, sf in enumerate(fits):
+        if feet[i] is None or t_audio[i] is not None or sf.fit is None:
+            continue
+        lo = times[i] - max_shift_s
+        prev = fits[i - 1] if i > 0 else None
+        if prev is not None and prev.obs is not None and len(prev.obs.t):
+            lo = max(lo, float(prev.obs.t[-1]))
+        t = np.arange(times[i], lo - step_s / 2, -step_s)
+        if len(t) < 2:
+            continue
+        pos, vel = simulate(sf.fit.p0, sf.fit.v0, sf.fit.t_ref, t, sf.fit.phys(phys))
+        ok = np.isfinite(pos).all(axis=1) & (np.linalg.norm(vel, axis=1) <= max_speed_mps)
+        gap = np.where(ok, np.hypot(pos[:, 0] - feet[i][0], pos[:, 1] - feet[i][1]), np.inf)
+        if not np.isfinite(gap[0]) or gap[0] <= reach_m:
+            continue
+        k = int(np.argmin(gap))
+        if gap[k] <= reach_m and gap[k] < gap[0] - 0.3:
+            out[i] = float(t[k])
+    return out
+
+
 # 並べて動かすプロセスでは、numpy・scipy の行列計算（OpenBLAS）を 1 スレッドにする。プロセスの数だけで並べているので
 # スレッドを増やしても速くならず、28 スレッドの PC では読み込むだけで 1 プロセス 1.5 GB を確保する（1 スレッドなら 0.1 GB。
 # 15 プロセスで 23 GB になり、ほかのアプリが動いていると確保に失敗して 1 つずつの計算に戻っていた）
@@ -501,6 +605,16 @@ def worker_pool(workers: int) -> Iterator[None]:
             ex.shutdown(cancel_futures=True)
 
 
+def pool_executor() -> Any:
+    """``worker_pool`` のプロセスの組（``concurrent.futures.ProcessPoolExecutor``。なければ None）。"""
+    return _shared_pool[0] if pool_active() else None
+
+
+def worker_env() -> Any:
+    """この中で起動したプロセスに、並べて動かすときの環境変数（行列計算を 1 スレッド）を渡す。"""
+    return _worker_env()
+
+
 def pool_active() -> bool:
     """``worker_pool`` のプロセスの組が使える（壊れていない）か。"""
     return bool(_shared_pool) and _shared_pool[0] is not None
@@ -535,10 +649,7 @@ def _parallel_map(fn: Callable[..., Any], args: list[tuple[Any, ...]], workers: 
 def _try_fit(obs: Observations, t_hit: float, plane: FlightPlane, phys: PhysicsParams, opts: FitOptions,
              theta0: np.ndarray | None) -> FitResult | None:
     """plane モードで当てはめる（計算できなければ None）。"""
-    try:
-        return fit_trajectory(obs, t_hit, "plane", plane, phys, opts, theta0=theta0)
-    except (ValueError, RuntimeError):
-        return None
+    return _ok(_fit_job(obs, t_hit, "plane", plane, phys, opts, theta0))
 
 
 def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: PhysicsParams,
@@ -549,7 +660,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               speed_of_sound_mps: float = 343.0, max_kmh: float = np.inf,
               bad_max_nfev_per_param: int = 30, hitter_xy: list[Any] | None = None,
               hitter_sigma_m: tuple[float, float] = (0.5, 2.0), max_hitter_gap_m: float = 2.5,
-              serve_depth_m: tuple[float, float] | None = None) -> list[ShotFit]:
+              serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5,
+              joint: Any = None, backend: str = "cpu") -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
     Args:
@@ -579,16 +691,25 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         hitter_sigma_m: 足元を打点の目安にするときの不確かさ（水平, 高さ）[m]。高さは分からないので大きくする
             （水平は IMG_4397 80〜100 s で 1.0 m より 0.5 m の方が足元から 2.5 m 以上離れた打点が少なく、14 → 12 → 8 本）
         max_hitter_gap_m: 足元からこれより離れた打点は外れとみなす [m]
+        hitter_reach_m: 足元から打点まで水平に届く距離 [m]。打球音のないショットの打点がこれより離れていたら、
+            打った時刻を、当てはめた軌道が足元にいちばん近づく時刻へ戻す（``foot_hit_times``。None なら直さない）
         serve_depth_m: 最初のショットをサーブとみなすときの、打点のネットからの深さの目安（平均, 標準偏差）[m]。
             サーブは前の軌道がないので、角・後ろのカメラでは打点の奥行きが決まらず、初速が 15〜40% ずれる。
             最初の当てはめの打点を、飛行平面に沿ってこの目安と重みつきで平均する（``serve_hit_point``）。
             None なら使わない（ラリーの最初の打球が見つかっていない動画では、サーブではないので）。
             最初のショットの打つ人の足元（``hitter_xy``）があれば、足元の方を使う
+        joint: 与えると（``rally_fit.JointOptions``）、最後にラリー全体をまとめて当てはめ直す（``rally_fit.fit_rallies``。
+            となりのショットと打点・打った時刻をつなぎ、長いショットから終端速度も求める）。つながらなかった
+            ショットは、ショットごとの当てはめのまま。動画に何ラリーもあるときは、ラリーごとにこの関数を
+            ``joint=None`` で呼んでから ``fit_rallies`` をまとめて呼ぶ（終端速度を動画全体で 1 つにする）
+        backend: 当てはめの計算の仕方（``run_fits``。``"cpu"`` は 1 つずつ ``workers`` のプロセスで、``"batch"`` は
+            段階ごとの当てはめをまとめて解く。``fit_batch.BatchGate`` の中なら、ほかのラリーの当てはめとも一緒に）
 
     Returns:
         ``t_hits`` と同じ順の ``ShotFit``（``t_hit`` は直した時刻）
     """
     opts = opts or FitOptions(refine_plane=True)
+    opts = FitOptions(**{**opts.__dict__, "quadratic_priors": True})
     t_hits = [float(t) for t in t_hits]
     sides = list(sides) if sides is not None else [""] * len(t_hits)
     vis_t = det.timestamp[(det.visible > 0) & det.x_px.notna()].to_numpy(float)
@@ -613,14 +734,17 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
     # 当てはめで、実動画では 1 本に 1 分かかることがあり、ほかのプロセスが空いたまま待っていた（ROADMAP F3b）
     planes = {i: grid_planes(sides[i], feet[i]) for i in todo}
     grid_jobs = [(i, p) for i in todo for p in planes[i]]
-    grid = _parallel_map(grid_fit, [(fits[i].obs, fits[i].t_hit, p, phys, opts) for i, p in grid_jobs], workers)
+    grid = run_fits([_grid_job(fits[i].obs, fits[i].t_hit, p, phys, opts) for i, p in grid_jobs], workers, backend)
     best = {i: best_grid_fit([f for (j, _), f in zip(grid_jobs, grid) if j == i]) for i in todo}
-    first = _parallel_map(loose_fit, [(fits[i].obs, fits[i].t_hit, best[i], phys, opts, feet[i], hitter_sigma_m)
-                                      for i in todo], workers)
+    loose = [i for i in todo if best[i] is not None]
+    got = run_fits([_loose_job(fits[i].obs, fits[i].t_hit, best[i], phys, opts, feet[i], hitter_sigma_m)
+                    for i in loose], workers, backend)
+    redo = dict(zip(loose, got))
+    first = [None if best[i] is None else (best[i] if redo[i] is None else redo[i]) for i in todo]
     # 打った側から見てありえない結果だけ、広い向きの格子から当てはめ直す（``initial_fit`` の最後。ROADMAP B3b）
     retry = [k for k, (i, f) in enumerate(zip(todo, first)) if f is not None and not _plausible_fit(f, sides[i])]
-    wide = _parallel_map(wide_fit, [(fits[todo[k]].obs, fits[todo[k]].t_hit, sides[todo[k]], first[k], phys, opts,
-                                     feet[todo[k]]) for k in retry], workers)
+    wide = wide_fits([(fits[todo[k]].obs, fits[todo[k]].t_hit, sides[todo[k]], first[k], feet[todo[k]])
+                      for k in retry], phys, opts, workers, backend)
     for k, f in zip(retry, wide):
         first[k] = f
     for i, f in zip(todo, first):
@@ -633,7 +757,11 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         times = refine_hit_times(fits, camera, phys) if refine_times else [sf.t_hit for sf in fits]
         if any(t is not None for t in t_audio):
             times = audio_hit_times(fits, t_audio, camera, phys, times, speed_of_sound_mps)
-        if refine_times or any(t is not None for t in t_audio):
+        moved = False
+        if hitter_reach_m is not None and any(f is not None for f in feet):
+            new = foot_hit_times(fits, feet, t_audio, phys, times, hitter_reach_m)
+            moved, times = new != times, new
+        if refine_times or moved or any(t is not None for t in t_audio):
             split(times)
         pts = hit_point_options(fits, phys, feet=feet if any(f is not None for f in feet) else None,
                                 max_foot_m=max_hitter_gap_m)
@@ -659,11 +787,11 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                            if not (sf.fit.rms_px <= max_rms_px and sf.fit.speed0 * MPS_TO_KMH <= max_kmh)
                            else {})})
                     jobs.append((i, ka, kb))
-                    args.append((sf.obs, sf.t_hit, FlightPlane.from_points(a, b), phys,
+                    args.append((sf.obs, sf.t_hit, "plane", FlightPlane.from_points(a, b), phys,
                                  FitOptions(**{**fo.__dict__, "p0_prior_m": a,
                                                "p0_prior_sigma_m": hitter_sigma_m if on_foot else hit_sigma_m}),
                                  None))
-        res = {job: f for job, f in zip(jobs, _parallel_map(_try_fit, args, workers))
+        res = {job: f for job, f in zip(jobs, run_fits(args, workers, backend))
                if f is not None and f.success and np.isfinite(f.speed0)}
         chosen = choose_hit_points(fits, pts, res, opts)
         for i, sf in enumerate(fits):
@@ -687,11 +815,26 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                            "p0_prior_sigma_m": hitter_sigma_m if on_foot else hit_sigma_m,
                            "refine_plane": False, "init_state": None})
         jobs.append(i)
-        args.append((sf.obs, sf.t_hit, sf.fit.plane, phys, fo, sf.fit.theta[:4] if sf.fit.mode == "plane" else None))
-    for i, f in zip(jobs, _parallel_map(_try_fit, args, workers)):
+        args.append((sf.obs, sf.t_hit, "plane", sf.fit.plane, phys, fo,
+                     sf.fit.theta[:4] if sf.fit.mode == "plane" else None))
+    for i, f in zip(jobs, run_fits(args, workers, backend)):
         if f is not None:
             fits[i].fit = f
+    if joint is not None:
+        from smash_speed.rally_fit import fit_rallies
+
+        res, _ = fit_rallies([joint_job(fits, det, camera, feet, t_audio, margin_s, t_last, speed_of_sound_mps,
+                                        max_rms_px)], phys, opts, joint)
+        fits = res[0].fits
     return fits
+
+
+def joint_job(fits: list[ShotFit], det: pd.DataFrame, camera: Camera, feet: list[Any] | None = None,
+              t_audio: list[float | None] | None = None, margin_s: float = 0.01, t_last: float | None = None,
+              speed_of_sound_mps: float = 343.0, max_rms_px: float = np.inf) -> dict[str, Any]:
+    """``rally_fit.fit_rallies`` に渡す 1 ラリー分の引数（``fit_shots`` の結果と、そのときの引数から）。"""
+    return {"fits": fits, "det": det, "camera": camera, "feet": feet, "t_audio": t_audio, "margin_s": margin_s,
+            "t_last": t_last, "speed_of_sound_mps": speed_of_sound_mps, "max_rms_px": max_rms_px}
 
 
 def shot_fits_to_shots(fits: list[ShotFit], phys: PhysicsParams, source: str = "shot_fit") -> list[Shot]:
@@ -714,7 +857,7 @@ def shot_fits_to_shots(fits: list[ShotFit], phys: PhysicsParams, source: str = "
             land_x_m=float(tr["pos"][-1, 0]) if t_land else None, land_y_m=float(tr["pos"][-1, 1]) if t_land else None,
             t_land_s=t_land, v0_x_mps=float(f.v0[0]), v0_y_mps=float(f.v0[1]), v0_z_mps=float(f.v0[2]),
             terminal_velocity_mps=f.terminal_velocity, confidence=conf, source=source,
-            note=f"{sf.n_obs} コマ・ずれ {f.rms_px:.1f} px"))
+            note=f"{sf.n_obs} コマ・ずれ {f.rms_px:.1f} px" + ("・ラリーでつないだ" if f.message == "joint" else "")))
     return out
 
 
@@ -725,7 +868,8 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                         noise_px: float = 1.5, dropout: float = 0.1, camera: Camera | None = None,
                         cfg: dict[str, Any] | None = None, verbose: bool = False,
                         keep_shots: bool = False, feet_noise_m: float | None = None,
-                        serve_depth_m: tuple[float, float] | None = None) -> dict[str, Any]:
+                        serve_depth_m: tuple[float, float] | None = None, joint: Any = None,
+                        true_vt: float | None = None, workers: int = 1, backend: str = "cpu") -> dict[str, Any]:
     """合成ラリーで、ショットの種類ごとの初速の誤差を測る。
 
     Args:
@@ -735,6 +879,12 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
         keep_shots: ``rows`` に、推定したショット（``Shot``。``index_in_rally`` は見つけた打球の順）の列 ``shot`` を足す
         feet_noise_m: 与えると、本当の打点の真下からこの大きさ（水平の各向きの標準偏差）[m] だけずらした位置を
             打つ人の足元として渡す（``fit_shots`` の ``hitter_xy``。足元の手がかりの効き目を見る）
+        joint: 与えると（``rally_fit.JointOptions``）、ショットごとの当てはめの後に、全部のラリーを 1 本の動画として
+            まとめて当てはめ直す（``rally_fit.fit_rallies``）。``rows`` の ``base_kmh``・``base_err_pct`` がショットごと、
+            ``est_kmh``・``err_pct`` がまとめた後の値。戻り値の ``vt`` が終端速度の記録
+        true_vt: 合成ラリーを作る・観測するときの本当の終端速度 [m/s]（省略時は設定の値と同じ。当てはめは設定の値から）
+        workers: ショットごとの当てはめを並べるプロセスの数（``fit_shots``）
+        backend: 当てはめの計算の仕方（``fit_shots`` の ``backend``）
 
     Returns:
         ``rows``（1 ショット 1 行の DataFrame：種類・正解と推定の初速・誤差 [%]）と、
@@ -749,12 +899,13 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
     phys = PhysicsParams.from_config(cfg)
     camera = camera or rally_camera(cfg)
     opts = FitOptions.from_config(cfg, ci_method="none")
+    true_phys = phys if true_vt is None else PhysicsParams(phys.g, true_vt, phys.method, phys.rtol, phys.atol)
     rally_rng = np.random.default_rng([seed, 1])
-    rows = []
+    done = []
     for r in range(n_rallies):
-        rally = make_rally(rally_rng, phys, n_shots=int(rally_rng.integers(4, 13)),
+        rally = make_rally(rally_rng, true_phys, n_shots=int(rally_rng.integers(4, 13)),
                            server_side="h" if r % 2 == 0 else "o")
-        det = observe_rally(rally, camera, fps, phys, np.random.default_rng([seed, 2, r]), noise_px=noise_px,
+        det = observe_rally(rally, camera, fps, true_phys, np.random.default_rng([seed, 2, r]), noise_px=noise_px,
                             dropout=dropout)
         segs = rally.segments
         if hits == "true":
@@ -776,8 +927,18 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
         if feet_noise_m is not None:
             foot_rng = np.random.default_rng([seed, 3, r])
             feet = [None if j is None else segs[j].p0[:2] + foot_rng.normal(0.0, feet_noise_m, 2) for j in pairs]
-        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio, hitter_xy=feet,
-                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None)
+        fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio, hitter_xy=feet, workers=workers,
+                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None, backend=backend)
+        done.append((segs, pairs, fits, joint_job(fits, det, camera, feet, t_audio)))
+    vt_rec, joined = None, [None] * len(done)
+    if joint is not None:
+        from smash_speed.rally_fit import fit_rallies
+
+        joined, vt_rec = fit_rallies([d[3] for d in done], phys,
+                                     FitOptions(**{**opts.__dict__, "quadratic_priors": True}), joint)
+    rows = []
+    for r, (segs, pairs, base, _) in enumerate(done):
+        fits = base if joined[r] is None else joined[r].fits
         shots = shot_fits_to_shots(fits, phys) if keep_shots else [None] * len(fits)
         for i, (sf, j) in enumerate(zip(fits, pairs)):
             if j is None:
@@ -792,6 +953,13 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                          "dt_hit_ms": 1000 * (sf.t_hit - s.t_hit),
                          "err_pct": None if est is None else 100 * (est / true - 1),
                          **({"shot": shots[i]} if keep_shots else {})})
+            if joint is not None:
+                b = base[i].speed_kmh
+                rows[-1].update(base_kmh=b, base_err_pct=None if b is None else 100 * (b / true - 1),
+                                joint=bool(joined[r].joint[i]), base_dt_hit_ms=1000 * (base[i].t_hit - s.t_hit),
+                                hit_err_m=None if sf.fit is None else float(np.linalg.norm(sf.fit.p0 - s.p0)),
+                                base_hit_err_m=None if base[i].fit is None
+                                else float(np.linalg.norm(base[i].fit.p0 - s.p0)))
             if verbose and (est is None or abs(est / true - 1) > 0.1):
                 print(f"ラリー {r} の {j + 1} 本目 {s.profile}：正解 {true:.1f} km/h、推定 "
                       f"{'-' if est is None else f'{est:.1f}'} km/h（{sf.n_obs} コマ）{sf.message}")
@@ -804,8 +972,13 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                          "median_abs_pct": float(e.median()) if len(e) else None,
                          "p90_abs_pct": float(e.quantile(0.9)) if len(e) else None}
     e = df.err_pct.dropna().abs() if len(df) else pd.Series(dtype=float)
-    return {"n_rallies": n_rallies, "fps": fps, "hits": hits, "rows": df, "by_type": by_type,
-            "mape": float(e.mean()) if len(e) else None, "n_failed": int(df.err_pct.isna().sum()) if len(df) else 0}
+    out = {"n_rallies": n_rallies, "fps": fps, "hits": hits, "rows": df, "by_type": by_type,
+           "mape": float(e.mean()) if len(e) else None, "n_failed": int(df.err_pct.isna().sum()) if len(df) else 0}
+    if joint is not None:
+        b = df.base_err_pct.dropna().abs() if len(df) else pd.Series(dtype=float)
+        out.update(vt=vt_rec, base_mape=float(b.mean()) if len(b) else None,
+                   n_joint=int(df.joint.sum()) if len(df) else 0)
+    return out
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -824,6 +997,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="本当の打点の真下からこの大きさ [m] ずらした位置を、打つ人の足元として渡す")
     ap.add_argument("--camera", default="side", choices=["side", "corner", "low"],
                     help="合成のカメラの位置（side：横・遠く、corner：角の後ろ・低い、low：横・低い）")
+    ap.add_argument("--fit-backend", default="cpu", choices=["auto", "cpu", "batch"],
+                    help="当てはめの計算の仕方（cpu：1 本ずつ、batch：まとめて解く）")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     from smash_speed.config import load_config
@@ -835,7 +1010,7 @@ def main(argv: list[str] | None = None) -> None:
         for h in a.hits:
             t0 = time.time()
             r = synthetic_benchmark(a.rallies, fps, a.seed, h, camera=camera, cfg=cfg, verbose=a.verbose,
-                                    feet_noise_m=a.feet_noise)
+                                    feet_noise_m=a.feet_noise, backend=resolve_backend(a.fit_backend))
             parts = [f"{SHOT_TYPE_LABELS[k]} {v['mape']:.1f}%（{v['n']} 本"
                      + (f"・失敗 {v['n_failed']}" if v["n_failed"] else "") + "）"
                      for k, v in r["by_type"].items() if v["mape"] is not None]

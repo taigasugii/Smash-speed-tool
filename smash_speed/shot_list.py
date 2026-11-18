@@ -2,9 +2,11 @@
 
 1. 動画全体を 1 回だけ縮小して読み、シャトルを検出する（``detection.baseline``。1 コマ 1 点）。
    学習したモデル（``tracknet``）か、外の検出 CSV（``detections``）を代わりに使うこともできる（F1b）。
+   コマンドでは、設定の ``detection.shot_list_model`` が置いてあればそれを使う（F1c。``choose_tracknet``）。
 2. 打球音（音声があれば）と軌道の向きの変化から、すべての打球の時刻と打った側を出す（``hits.find_hits``）。
 3. 打球の間隔で組に分け、組ごとに軌道と初速を当てはめる（``shot_fit.fit_shots``）。ほかの組の検出が
-   混ざらないよう、組の前後で検出を切り分ける。
+   混ざらないよう、組の前後で検出を切り分ける。``joint_fit=True`` なら、その後に組の中のショットをつないで
+   まとめて当てはめ直し、長いショットからシャトルの終端速度も求める（``rally_fit.fit_rallies``）。
 4. 打球の間隔・シャトルの着地・シャトルが飛んでいるかから、ラリーに区切る（``rallies.split_rallies``）。
 5. 軌道から種類を決める（``shot_types.classify_shots``。ラリーの最初のショットはサーブ）。
 6. 選手の位置も出すとき（``players=True``）は、選手の動きで短いラリーを確かめ、ラリーの間に拾って返した・
@@ -21,6 +23,11 @@
   このときは ``shots.csv`` の ``hitter_x_m``・``hitter_y_m`` に打つ人の足元も入れ（``hitter.attach_hitters``）、
   当てはめの前に出して打点の手がかりにもする（``hitter_prior``。``shot_fit.fit_shots`` の ``hitter_xy``）
 - ``movement.json``・``movement.csv``・``movement.svg``：選手の移動距離・速さ・いた場所（同じく ``players=True`` のとき。``movement``）
+- ``footwork.csv``・``footwork.json``：ショットごとのフットワーク（スプリットステップ・反応・移動・準備・戻り・ジャンプ）と
+  出来の目安の点数（``footwork=True`` のとき。選手の位置も出す。``footwork``）
+- ``doubles.json``・``formation.csv``：ダブルスのまとめ（誰が打ったか・陣形・ローテーション・2 人の間）と、コマごとの陣形
+  （``players=True`` で、1 側に 2 人の選手がいたときだけ。``doubles``）。このときは ``shots.csv`` の ``hitter_id``（P1〜P4）・
+  ``hitter_conf``・``formation``・``opp_formation`` も入れる
 
 ``python -m smash_speed.shot_list <動画> --calib <calibration.json> --out <出力先>`` で動かす。
 """
@@ -30,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -42,6 +49,7 @@ from smash_speed.calibration.io import load_calibration
 from smash_speed.camera import Camera
 from smash_speed.detection.baseline import BaselineParams, detect_frames
 from smash_speed.errors import AnalysisError
+from smash_speed.doubles import assign_doubles, doubles_brief, pair_sides, prefit_feet, write_doubles
 from smash_speed.hitter import attach_hitters, hitter_at
 from smash_speed.hits import Hit, find_hits
 from smash_speed.physics import FitOptions, PhysicsParams
@@ -50,7 +58,10 @@ from smash_speed.rallies import RallyOptions, split_rallies
 from smash_speed.rally_report import write_report
 from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
-from smash_speed.shot_fit import fit_shots, pool_active, shot_fits_to_shots, worker_pool
+from smash_speed.rally_fit import JointOptions, fit_rallies
+from smash_speed.fit_batch import gate_session
+from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, pool_executor,
+                                  resolve_backend, shot_fits_to_shots, worker_env, worker_pool)
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
                                write_shots)
@@ -60,6 +71,8 @@ SHOT_LIST_FILE = "shot_list.json"
 DETECTIONS_FILE = "detections.csv"
 TRACKNET_DIR = "tracknet"         # 学習したモデルの検出の作業場所（``<出力先>/tracknet/detections.csv``）
 TRACKNET_THRESHOLD = 0.25         # 学習したモデルの熱の地図の閾値（F1b：打球の見つけ方で 0.25 が良い）
+BATCH_RALLIES = 8                 # 当てはめをまとめて解くとき（``fit_backend="batch"``）に、1 つのプロセスで同時に進めるラリーの数
+BATCH_PROCESSES = 4               # 同・ラリーを分けて進めるプロセスの数
 
 
 @dataclass
@@ -79,6 +92,8 @@ class ShotListOptions:
     workers: int | None = None        # 当てはめを並べて動かすプロセスの数（None なら CPU の数 − 1、16 まで）
     players: bool = False             # 選手の位置も出す（``players.analyze_players``。人の検出のモデルを使うので遅くなる）
     player_options: PlayerOptions | None = None
+    doubles: str = "auto"             # auto：両側とも 2 人の選手がいるときだけダブルス（そうでなければ今までどおり 1 側 1 人）
+                                      # on：2 人いる側は 2 人とも追う（片側だけ 2 人の練習もこれ）| off：いつも 1 側 1 人
     hitter_prior: bool = True         # 選手の位置があれば、打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     hit_players: bool = True          # 選手の位置があれば、打球を見つけるのにも使う（``find_hits`` の ``players``。
                                       # どちらの選手にも届かない所の打球を捨て、近い方を打った側にする）
@@ -87,6 +102,14 @@ class ShotListOptions:
     tracknet: Path | None = None      # 学習したモデル（``tracknet_train`` の model.pt）。あればこれで全コマを検出し
                                       # （``tracknet_train.detect_video``。torch は ``.venv-train``）、自前の検出の代わりに使う
     tracknet_threshold: float = TRACKNET_THRESHOLD
+    tracknet_fallback: bool = False   # 真なら、学習したモデルで検出できなかったとき（torch が動かないなど）今の検出に戻す
+                                      # （設定の既定のモデルを使うとき。``default_tracknet``）
+    joint_fit: bool = False           # ラリーの中のショットをつないでまとめて当てはめ直す（``rally_fit``。打点・打った時刻を
+                                      # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
+    joint_options: JointOptions | None = None
+    footwork: bool = False            # ショットごとのフットワークと出来の目安も出す（``footwork``。選手の位置も出す）
+    fit_backend: str = "auto"         # 当てはめの計算の仕方（``shot_fit.run_fits``）："cpu"（1 つずつプロセスで並べる）、
+                                      # "batch"（段階ごとにまとめて解く。ROADMAP F3e）、"auto"（batch が使えれば batch）
 
 
 # =============================================================================
@@ -153,6 +176,42 @@ def load_detections(path: Path, meta: VideoMeta, start_s: float | None = None, e
     cols = ["frame", "timestamp", "x_px", "y_px", "visible", "confidence", "track_id"]
     return det[cols + [c for c in det.columns if c not in cols]].sort_values("frame", kind="stable"
                                                                              ).reset_index(drop=True)
+
+
+def default_tracknet(cfg: dict[str, Any]) -> Path | None:
+    """設定の ``detection.shot_list_model``（F1c。相対パスはこのリポジトリから）が置いてあり、熱の地図を作れれば
+    （torch の入った Python（``.venv-train``）か、隣の ``.onnx`` と onnxruntime。``tracknet_train.predict_backend``）
+    そのパス。どちらかがなければ None（今の検出で探す）。"""
+    from smash_speed.config import PROJECT_ROOT
+    from smash_speed.train.tracknet_train import can_predict
+
+    p = (cfg.get("detection") or {}).get("shot_list_model")
+    if not p:
+        return None
+    p = Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p
+    return p if p.exists() and can_predict(p) else None
+
+
+def choose_tracknet(tracknet: Path | None, detections: Path | None, baseline: bool, cfg: dict[str, Any]
+                    ) -> tuple[Path | None, bool]:
+    """コマンドの引数から、使う学習したモデルと、失敗したら今の検出に戻すか（``tracknet_fallback``）を決める。
+
+    モデルか検出 CSV を指定したらそれ、``baseline``（``--baseline-detector``）なら今の検出、どちらでもなければ
+    設定の既定のモデル（``default_tracknet``。失敗したら今の検出に戻す）。
+    """
+    if tracknet is not None or detections is not None or baseline:
+        return tracknet, False
+    p = default_tracknet(cfg)
+    return p, p is not None
+
+
+def _tracknet_backend(tracknet: Path | None) -> str | None:
+    """学習したモデルの熱の地図を作ったもの（torch / onnx / train-env。``tracknet_train.predict_backend``）。"""
+    if tracknet is None:
+        return None
+    from smash_speed.train.tracknet_train import predict_backend
+
+    return predict_backend(tracknet)
 
 
 def tracknet_detections(o: ShotListOptions, out: Path, progress: Callable[[str], None] = print) -> Path:
@@ -341,7 +400,9 @@ def rally_groups(hits: list[Hit], gap_s: float) -> list[list[int]]:
 def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: PhysicsParams, cfg: dict[str, Any],
                  rally_gap_s: float = 3.0, tail_s: float = 4.0, ci: bool = True, max_kmh: float = 600.0,
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
-                 players: pd.DataFrame | None = None, rally_threads: int = 4) -> list[Shot]:
+                 players: pd.DataFrame | None = None, rally_threads: int | None = None, joint: JointOptions | None = None,
+                 joint_info: dict[str, Any] | None = None, fit_backend: str = "cpu",
+                 batch_processes: int | None = None) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -354,45 +415,160 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
             （4K で 38 px。合成ラリーでは 1〜2 px、実動画の正しい当てはめも数 px）
         workers: 当てはめを並べて動かすプロセスの数（``fit_shots``）
         players: 選手の位置（``players.csv``）。あれば打球ごとの打つ人の足元（``hitter_at``）を打点の手がかりにする
-        rally_threads: 同時に当てはめを進めるラリーの数（``workers`` が 2 以上のとき。結果は 1 つずつと同じ）
+        rally_threads: 同時に当てはめを進めるラリーの数（``workers`` が 2 以上のとき。結果は 1 つずつと同じ）。
+            None なら 4（``fit_backend`` が "batch" なら ``BATCH_RALLIES``）
+        joint: 与えると、ショットごとの当てはめの後に、打球の組ごとにショットをつないでまとめて当てはめ直す
+            （``rally_fit.fit_rallies``。終端速度は動画全体で 1 つ）
+        joint_info: 辞書を渡すと、まとめた当てはめの記録（つないだショットの数・終端速度・かかった時間）を入れる
+        fit_backend: 当てはめの計算の仕方（``shot_fit.resolve_backend``）。"batch" では、ラリーを打球の数がなるべく
+            同じ ``batch_processes`` 組に分けてプロセスごとに進め、それぞれの中でラリーを ``rally_threads`` 個ずつ
+            同時に進めて、段階ごとの当てはめをほかのラリーの分とまとめて解く（``_fit_groups``・``fit_batch.BatchGate``）。
+            結果はラリーの組み方・プロセスの数によらない
+        batch_processes: "batch" で使うプロセスの数（None なら ``BATCH_PROCESSES``。``workers`` まで）
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
+    backend = resolve_backend(fit_backend)
     vis_t = det.timestamp.to_numpy(float)
     groups = rally_groups(hits, rally_gap_s)
     shots: list[Shot] = []
 
-    def one(g: int) -> list[Shot]:
-        return _analyze_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
-                              max_rms_frac, workers, players)
+    if rally_threads is None:
+        rally_threads = BATCH_RALLIES if backend == "batch" else 4
+    fit_args = (det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players)
+
+    def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
+        return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
+                          workers, players, backend)
+
+    def to_shots(g: int, fits: list[ShotFit]) -> list[Shot]:
+        return _rally_shots([hits[i] for i in groups[g]], fits, camera, phys, max_kmh, max_rms_frac)
 
     # 当てはめのプロセスはラリーをまたいで使い回す（起動に 1 回 4〜5 秒かかる。ROADMAP F3）。
     # ラリーどうしは関係しないので、``rally_threads`` 個のラリーを同時に進めて同じプロセスの組に仕事を渡す
     # （1 つのラリーの中では段階ごとに全部の当てはめの終わりを待つので、その間ほかのプロセスが空いていた。F3b）
-    with worker_pool(workers):
+    # まとめて解くときは、ラリーを ``batch_processes`` 組に分けてプロセスごとに進め、それぞれの中で
+    # ``rally_threads`` 個ずつ同時に進めて当てはめをまとめる（``_fit_groups``）
+    n_proc = max(1, min(batch_processes or BATCH_PROCESSES, workers, len(groups))) if backend == "batch" else 1
+    pool_workers = workers if backend == "cpu" else (max(n_proc, workers) if joint is not None else n_proc)
+    with worker_pool(pool_workers):
         n_threads = min(rally_threads, len(groups)) if workers > 1 and pool_active() else 1
+        fitted: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
         by_group: dict[int, list[Shot]] = {}
-        if n_threads > 1:
+        if backend == "batch":
+            chunks = _balanced_chunks([len(g) for g in groups], n_proc if pool_active() else 1)
+
+            def done(part: dict[int, tuple[list[ShotFit], dict[str, Any]]]) -> None:
+                for g in sorted(part):
+                    fitted[g] = part[g]
+                    by_group[g] = to_shots(g, part[g][0])
+                    _rally_progress(progress, g, len(groups), by_group[g], len(by_group))
+
+            left = chunks
+            if len(chunks) > 1:
+                from concurrent.futures import as_completed
+                from concurrent.futures.process import BrokenProcessPool
+
+                got: set[int] = set()
+                try:
+                    with worker_env():
+                        futs = {pool_executor().submit(_fit_groups, fit_args, c, rally_threads): k
+                                for k, c in enumerate(chunks)}
+                    for fut in as_completed(futs):
+                        done(fut.result())
+                        got.add(futs[fut])
+                    left = []
+                except (BrokenProcessPool, OSError):  # プロセスを使えなければ、残りをこのプロセスで
+                    left = [c for k, c in enumerate(chunks) if k not in got]
+            for c in left:
+                done(_fit_groups(fit_args, c, rally_threads))
+        elif n_threads > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             with ThreadPoolExecutor(n_threads) as ex:
                 futs = {ex.submit(one, g): g for g in range(len(groups))}
                 for fut in as_completed(futs):
-                    by_group[futs[fut]] = fut.result()
-                    _rally_progress(progress, futs[fut], len(groups), by_group[futs[fut]], len(by_group))
+                    g = futs[fut]
+                    fitted[g] = fut.result()
+                    by_group[g] = to_shots(g, fitted[g][0])
+                    _rally_progress(progress, g, len(groups), by_group[g], len(by_group))
         else:
             for g in range(len(groups)):
-                by_group[g] = one(g)
+                fitted[g] = one(g)
+                by_group[g] = to_shots(g, fitted[g][0])
                 _rally_progress(progress, g, len(groups), by_group[g], g + 1)
+        if joint is not None and groups:
+            t0 = time.time()
+            n_before = sum(s.speed_kmh is not None for g in by_group for s in by_group[g])
+            res, vt = fit_rallies([fitted[g][1] for g in range(len(groups))], phys, opts, joint,
+                                  mapper=lambda fn, args: _parallel_map(fn, args, workers))
+            for g, r in enumerate(res):
+                by_group[g] = to_shots(g, r.fits)
+            rec = {"n_joint": int(sum(sum(r.joint) for r in res)),
+                   "n_links": int(sum(sum(r.links) for r in res)),
+                   "n_cut": int(sum(len(r.cut) for r in res)), "terminal_velocity": vt,
+                   "n_speed_before": n_before,
+                   "n_speed": sum(s.speed_kmh is not None for g in by_group for s in by_group[g]),
+                   "elapsed_s": round(time.time() - t0, 1)}
+            if joint_info is not None:
+                joint_info.update(rec)
+            progress(f"[進行] ラリーの中のショットをつないで当てはめ直しました：{rec['n_joint']} 本"
+                     f"（{rec['elapsed_s']:.0f} 秒）")
+            if vt["value_mps"] is not None:
+                progress(f"[進行] シャトルの終端速度：{vt['value_mps']:.2f} ± {vt['sigma_mps']:.2f} m/s"
+                         + ("（この値で計算しました）" if vt["used"]
+                            else f"（{vt['reason']}ので、設定の {vt['default_mps']} m/s のまま）"))
     for g in range(len(groups)):
         shots += by_group[g]
     split_rallies(shots, det, RallyOptions(max_gap_s=rally_gap_s), cfg.get("court"))
     return classify_shots(shots, phys)
 
 
-def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
-                   camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
-                   max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None) -> list[Shot]:
-    """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）の ``Shot`` の列。"""
+def _balanced_chunks(sizes: list[int], n: int) -> list[list[int]]:
+    """番号 0..len(sizes)−1 を、大きさ（打球の数）の合計がなるべく同じ ``n`` 組に分ける（大きい順に、いちばん軽い組へ）。
+    組の中は番号の順。空の組は返さない。"""
+    load = [0] * max(1, n)
+    out: list[list[int]] = [[] for _ in load]
+    for g in sorted(range(len(sizes)), key=lambda g: (-sizes[g], g)):
+        k = int(np.argmin(load))
+        out[k].append(g)
+        load[k] += sizes[g]
+    return [sorted(c) for c in out if c]
+
+
+def _fit_groups(fit_args: tuple, gids: list[int], rally_threads: int
+                ) -> dict[int, tuple[list[ShotFit], dict[str, Any]]]:
+    """ラリー ``gids`` を、``rally_threads`` 個ずつ同時に進め、当てはめをまとめて解く（``fit_backend="batch"``。
+    ``analyze_hits`` の中の 1 組。別のプロセスでも動かす）。結果はラリーの組み方・スレッドの数によらない。"""
+    det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players = fit_args
+    n_threads = max(1, min(rally_threads, len(gids)))
+    out: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
+    with gate_session(n_threads, len(gids)) as gate:
+        def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
+            gate.enter()        # 同時に進めているほかのラリーの当てはめとまとめて解く（``fit_batch.BatchGate``）
+            try:
+                return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
+                                  max_rms_frac, workers, players, "batch")
+            finally:
+                gate.leave()
+
+        if n_threads > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(n_threads) as ex:
+                for g, r in zip(gids, ex.map(one, gids)):
+                    out[g] = r
+        else:
+            for g in gids:
+                out[g] = one(g)
+    return out
+
+
+def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
+               camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
+               max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None,
+               backend: str = "cpu") -> tuple[list[ShotFit], dict[str, Any]]:
+    """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）のショットごとの当てはめと、まとめて当てはめ直すときの
+    引数（``shot_fit.joint_job``）。"""
     hs = [hits[i] for i in groups[g]]
     lo = hs[0].t - 0.5
     hi = hs[-1].t + tail_s
@@ -401,12 +577,24 @@ def _analyze_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], 
     part = det[(vis_t >= lo) & (vis_t <= hi)]
     feet = None
     if players is not None and not players.empty:
-        feet = [None if e is None else np.array([e.x, e.y])
-                for e in (hitter_at(players, h.t, h.side) for h in hs)]
+        if pair_sides(players):
+            # ダブルス：打った側の 2 人のうち、打った人が確かに選べた打球だけ、その人の足元を手がかりにする
+            feet = prefit_feet([h.t if h.t_track is None else h.t_track for h in hs], [h.side for h in hs],
+                               players, part, camera)
+        else:
+            feet = [None if e is None else np.array([e.x, e.y])
+                    for e in (hitter_at(players, h.t, h.side) for h in hs)]
+    sound = cfg.get("events", {}).get("speed_of_sound_mps", 343.0)
     fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
                      max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
-                     speed_of_sound_mps=cfg.get("events", {}).get("speed_of_sound_mps", 343.0),
-                     hitter_xy=feet)
+                     speed_of_sound_mps=sound, hitter_xy=feet, backend=backend)
+    return fits, joint_job(fits, part, camera, feet, [h.t_audio for h in hs], speed_of_sound_mps=sound,
+                           max_rms_px=max_rms_frac * camera.width)
+
+
+def _rally_shots(hs: list[Hit], fits: list[ShotFit], camera: Camera, phys: PhysicsParams, max_kmh: float,
+                 max_rms_frac: float) -> list[Shot]:
+    """1 ラリー分の当てはめ ``fits``（打球 ``hs`` と同じ順）を ``Shot`` の列にする。"""
     rally_shots = shot_fits_to_shots(fits, phys, source="shot_list")
     for s, h, sf in zip(rally_shots, hs, fits):
         # ありえない速さ・画像の上で軌道が検出と合わない（別の物の検出が混ざった軌道など）ものは、
@@ -482,7 +670,15 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     if onsets is not None:
         progress(f"[進行] 打球音の候補 {len(onsets)} 個")
     lap("audio")
-    det_path = tracknet_detections(o, out, progress) if o.tracknet is not None else o.detections
+    tracknet, detector_note = o.tracknet, None
+    try:
+        det_path = tracknet_detections(o, out, progress) if tracknet is not None else o.detections
+    except (OSError, RuntimeError, ValueError, AnalysisError) as e:
+        if not o.tracknet_fallback:
+            raise
+        detector_note = f"学習したモデルで検出できなかったので、今の検出で探した（{str(e).strip()[-300:]}）"
+        progress(f"[進行] {detector_note}")
+        tracknet, det_path = None, o.detections
     if det_path is not None:
         det = load_detections(det_path, meta, o.start_s, o.end_s)
     else:
@@ -506,7 +702,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     # 選手の位置は打球を見つける前に出し、打った時刻にシャトルに届く選手から打球と打った側を確かめる
     # （``find_hits`` の ``players``）。当てはめでは打つ人の足元を打点の手がかりにする（``fit_shots`` の ``hitter_xy``）
     players_info = players = None
-    if o.players:
+    if o.players or o.footwork:
         players_info = players_step(o, cfg, out, progress)
         if "error" not in players_info and (out / PLAYERS_FILE).exists():
             players = pd.read_csv(out / PLAYERS_FILE)
@@ -516,8 +712,11 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     progress(f"[進行] 打球 {len(hits)} 本")
     lap("hits")
     workers = o.workers or max(1, min(16, (os.cpu_count() or 2) - 1))
+    joint_info: dict[str, Any] = {}
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
-                         players=players if o.hitter_prior else None)
+                         players=players if o.hitter_prior else None,
+                         joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info,
+                         fit_backend=o.fit_backend)
     lap("fit")
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
@@ -528,9 +727,12 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "capture_fps": o.capture_fps, "fps": meta.capture_fps, "width": meta.width, "height": meta.height,
         "start_s": o.start_s, "end_s": o.end_s, "roi": o.roi, "recorded_at": recorded_at(meta),
         "audio": str(Path(o.audio).resolve()) if o.audio else None,
-        "detector": "tracknet" if o.tracknet is not None else ("file" if o.detections is not None else "baseline"),
+        "detector": "tracknet" if tracknet is not None else ("file" if o.detections is not None else "baseline"),
         "detections": str(Path(det_path).resolve()) if det_path is not None else None,
-        "tracknet_threshold": o.tracknet_threshold if o.tracknet is not None else None,
+        "tracknet": str(Path(tracknet).resolve()) if tracknet is not None else None,
+        "tracknet_threshold": o.tracknet_threshold if tracknet is not None else None,
+        "tracknet_backend": _tracknet_backend(tracknet),
+        "detector_note": detector_note,
         "used_audio": onsets is not None, "n_onsets": None if onsets is None else len(onsets),
         "n_frames": len(det), "n_visible": n_vis,
         "n_tracks": None if tracks is None else len(tracks),
@@ -539,17 +741,26 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
         "n_hits": len(hits), "n_rallies": len(rallies),
         "hit_methods": pd.Series([h.method for h in hits], dtype=object).value_counts().to_dict(),
         "by_type": summarize(shots), "elapsed_s": round(time.time() - t_start, 1),
+        "joint_fit": joint_info if o.joint_fit else None,
+        "fit_backend": resolve_backend(o.fit_backend),   # 当てはめの計算の仕方（cpu・batch。ROADMAP F3e）
         "meta": run_metadata(),
     }
     if players_info is not None:
         info["players"] = players_info
         if players is not None:
-            n = attach_hitters(shots, players)
+            if pair_sides(players):
+                n = assign_doubles(shots, players, det, camera, phys)["n"]
+            else:
+                n = attach_hitters(shots, players)
             write_shots(out / SHOTS_FILE, shots)
             info["players"]["n_hitters"] = n
             info["players"]["hitter_prior"] = o.hitter_prior
             progress(f"[進行] 打つ人の足元：{n} / {len(shots)} 本")
         rallies = rallies_with_players(shots, rallies, det, o, cfg, out, info, progress)
+        if players is not None:
+            doubles_step(shots, rallies, players, cfg, out, info, progress)
+        if o.footwork and players is not None:
+            info["footwork"] = footwork_step(shots, players, camera, cfg, out, (meta.width, meta.height), progress)
     info["elapsed_s"] = round(time.time() - t_start, 1)
     # レポートは shot_list.json を読むので先に書き、書き出しの時間を足して書き直す
     (out / SHOT_LIST_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -589,6 +800,37 @@ def rallies_with_players(shots: list[Shot], rallies: list[Rally], det: pd.DataFr
     return new
 
 
+def footwork_step(shots: list[Shot], players: pd.DataFrame, camera: Camera, cfg: dict[str, Any], out: Path,
+                  image_size: tuple[int, int], progress: Callable[[str], None] = print) -> dict[str, Any]:
+    """``footwork.csv``・``footwork.json`` を書き、``shot_list.json`` に入れる短いまとめを返す（選手ごと）。
+    失敗しても一覧は止めず、``error`` に理由を残す。"""
+    from smash_speed.footwork import footwork_brief, write_footwork
+
+    try:
+        summary = write_footwork(out, shots, players, camera, cfg.get("court"), image_size)
+    except Exception as e:  # noqa: BLE001
+        progress(f"[注意] フットワークは出せませんでした：{e}")
+        return {"error": str(e)}
+    progress(f"[進行] フットワーク：{summary['n_shots']} 本")
+    return {"players": footwork_brief(summary)}
+
+
+def doubles_step(shots: list[Shot], rallies: list[Rally], players: pd.DataFrame, cfg: dict[str, Any], out: Path,
+                 info: dict[str, Any], progress: Callable[[str], None] = print) -> None:
+    """1 側に 2 人の選手がいたら、陣形・ローテーション・2 人の間を出して ``doubles.json``・``formation.csv`` を書き、
+    ``shots.csv`` を陣形つきで書き直す。いなければ、前の解析の ``doubles.json`` を消す。"""
+    movement = None
+    if (out / "movement.json").exists() and "movement" in info.get("players", {}):
+        movement = json.loads((out / "movement.json").read_text(encoding="utf-8"))
+    summary = write_doubles(out, shots, rallies, players, cfg.get("court"), movement)
+    if not summary:
+        return
+    write_shots(out / SHOTS_FILE, shots)
+    info["players"]["doubles"] = doubles_brief(summary)
+    h = summary["hitters"]
+    progress(f"[進行] ダブルス：打った人 {h['n']} / {h['n_shots']} 本（確かでないもの {h['n_low_conf']} 本）")
+
+
 def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: Callable[[str], None] = print
                  ) -> dict[str, Any]:
     """選手の位置を ``players.csv`` に書き、``shot_list.json`` に入れる要約を返す。
@@ -597,13 +839,16 @@ def players_step(o: ShotListOptions, cfg: dict[str, Any], out: Path, progress: C
     """
     progress("[進行] 選手を検出しています")
     try:
-        p = analyze_players(o.video, o.calib, out, cfg, o.player_options, o.start_s, o.end_s, o.capture_fps,
-                            progress=progress)
+        po = replace(o.player_options or PlayerOptions(), per_side=1 if o.doubles == "off" else 0,
+                     auto_each_side=o.doubles == "on")
+        p = analyze_players(o.video, o.calib, out, cfg, po, o.start_s, o.end_s, o.capture_fps, progress=progress)
     except Exception as e:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
         progress(f"[注意] 選手の位置は出せませんでした：{e}")
         return {"error": str(e)}
-    progress(f"[進行] 選手の位置：手前 {p['coverage']['h']:.0%}・奥 {p['coverage']['o']:.0%} のコマ")
-    return {k: p[k] for k in ("n_frames", "coverage", "provider", "detect_s", "movement") if k in p}
+    progress(f"[進行] 選手の位置：手前 {p['coverage']['h']:.0%}・奥 {p['coverage']['o']:.0%} のコマ"
+             + ("（ダブルスとして 2 人を追いました）" if max(p.get("per_side", {}).values(), default=0) >= 2 else ""))
+    return {"doubles_mode": o.doubles,
+            **{k: p[k] for k in ("n_frames", "coverage", "per_side", "provider", "detect_s", "movement") if k in p}}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -622,20 +867,35 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-audio", action="store_true", help="打球音を使わない")
     ap.add_argument("--all-tracks", action="store_true", help="シャトルらしい軌道に絞り込まない")
     ap.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv）")
+    ap.add_argument("--doubles", choices=["auto", "on", "off"], default="auto",
+                    help="--players のとき：auto は両側とも 2 人いればダブルス、on は 2 人いる側を 2 人とも追う、off は 1 側 1 人")
     ap.add_argument("--no-hitter-prior", action="store_true", help="打つ人の足元を打点の手がかりにしない")
+    ap.add_argument("--footwork", action="store_true",
+                    help="ショットごとのフットワークと出来の目安も出す（footwork.csv。選手の位置も出す）")
     ap.add_argument("--no-hit-players", action="store_true", help="打球を見つけるのに選手の位置を使わない")
     ap.add_argument("--detections", type=Path, default=None,
                     help="自前の検出の代わりに使う検出 CSV（tracknet_train detect の detections.csv など）")
     ap.add_argument("--tracknet", type=Path, default=None, help="学習したモデル（model.pt）で全コマを検出して使う")
     ap.add_argument("--tracknet-threshold", type=float, default=TRACKNET_THRESHOLD)
+    ap.add_argument("--baseline-detector", action="store_true",
+                    help="設定の学習したモデル（detection.shot_list_model）を使わず、今の検出で探す")
+    ap.add_argument("--joint-fit", action="store_true",
+                    help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
+    ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
+    ap.add_argument("--fit-backend", default="auto", choices=["auto", "cpu", "batch"],
+                    help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く、auto：batch が使えれば batch）")
     ap.add_argument("--config", type=Path, default=None)
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
+    tracknet, fallback = choose_tracknet(a.tracknet, a.detections, a.baseline_detector, cfg)
     info = analyze_video(ShotListOptions(a.video, a.calib, a.out, a.capture_fps, a.start, a.end, audio=a.audio,
                                          use_audio=not a.no_audio, filter_tracks=not a.all_tracks,
-                                         players=a.players, hitter_prior=not a.no_hitter_prior,
-                                         hit_players=not a.no_hit_players, detections=a.detections,
-                                         tracknet=a.tracknet, tracknet_threshold=a.tracknet_threshold), cfg)
+                                         players=a.players, doubles=a.doubles, hitter_prior=not a.no_hitter_prior,
+                                         hit_players=not a.no_hit_players, footwork=a.footwork, detections=a.detections,
+                                         tracknet=tracknet, tracknet_threshold=a.tracknet_threshold,
+                                         tracknet_fallback=fallback, joint_fit=a.joint_fit,
+                                         joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
+                                         fit_backend=a.fit_backend), cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

@@ -204,6 +204,21 @@ def test_shot_labels_api(client, tmp_path):
     assert g["label_stats"]["video"]["n"] == 0 and g["label_stats"]["all"]["n"] == 1
 
 
+def test_shot_list_uses_the_trained_model_only_when_chosen(client, tmp_path, monkeypatch):
+    """「練習させた見つけ方」を選んだときだけ、設定の学習したモデルで探す（選ばなければ --baseline-detector）。"""
+    from smash_speed.webapp import server
+
+    started = []
+    monkeypatch.setattr(server, "start_task", lambda title, cmds: started.append(cmds[0]) or server.Task(title, []))
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "calib.json").write_text("{}", encoding="utf-8")
+    server.S.state.update(video=str(tmp_path / "v.mp4"), calib=str(tmp_path / "calib.json"))
+    assert client.post("/api/run/shots", json={}).get_json()["ok"]
+    assert client.post("/api/run/shots", json={"model": True}).get_json()["ok"]
+    assert "--baseline-detector" in started[0] and "--baseline-detector" not in started[1]
+    assert started[0][:started[0].index("--baseline-detector")] == started[1]
+
+
 def test_shot_list_flow(client, tmp_path):
     """ショットの一覧：裏で ``shots`` を動かし、種類・初速つきのショットを返す。区間を決めて解析し直せる。"""
     from smash_speed.physics import PhysicsParams
@@ -231,6 +246,7 @@ def test_shot_list_flow(client, tmp_path):
     assert any("検出中" in s for s in lines)  # 進み具合が流れてくる
     g = client.get("/api/shots").get_json()
     assert g["ok"] and g["dir"].endswith("rally_shots") and g["files"]["shots"].endswith("shots.csv")
+    assert g["info"]["detector"] == "baseline" and isinstance(g["model"], bool)  # モデルは選んだときだけ（F1c）
     assert len(g["shots"]) == len(truth) and g["info"]["n_hits"] == len(truth)
     assert [s["shot_type"] for s in g["shots"]] == [s.shot_type for s in truth]
     assert all(s["label"] == g["labels"][s["shot_type"]] for s in g["shots"])
@@ -245,6 +261,7 @@ def test_shot_list_flow(client, tmp_path):
         v = client.get("/api/shot_view", query_string={"i": k}).get_json()
         assert v["ok"] and v["court"] and v["image_size"]
         assert v["t_hit_s"] < v["t_end_s"] and v["frame"] >= 0
+        assert v["people"] == [] and not s["hitter_id"]  # ダブルスでなければ、選手の立ち位置は出さない
         # 場面を前後に送れる・再生するコマ（B5c2）：打つ 0.8 秒前から次の打球まで、時刻の順。見えたコマは検出と同じ点
         fr = v["frames"]
         assert v["frame"] in [f[0] for f in fr] and np.all(np.diff([f[1] for f in fr]) > 0)
@@ -435,3 +452,41 @@ def test_shot_label_reports_a_locked_file(client, tmp_path, monkeypatch):
     monkeypatch.setattr(shot_labels, "write_labels", locked)
     r = client.post("/api/shot_label", json={"i": 0, "label": "clear"})
     assert r.status_code == 400 and "閉じてください" in r.get_json()["error"]
+
+
+def test_shots_api_footwork(client, tmp_path, monkeypatch):
+    """フットワーク（footwork.csv）は、この解析で出したとき（shot_list.json の footwork）だけ各ショットに付く。
+    「選手の動きも出す」を選ぶと --footwork で解析する。"""
+    from smash_speed.footwork import write_footwork
+    from smash_speed.shots import Shot, write_shots
+    from smash_speed.synth_players import observe_players
+    from smash_speed.synth_rally import rally_camera
+    from smash_speed.webapp import server
+
+    cfg = load_config()
+    cam = rally_camera(cfg)
+    out = tmp_path / "IMG_1_shots"
+    out.mkdir()
+    shots = [Shot(t_hit_s=1.0, side="h", shot_type="serve", rally_id=1, index_in_rally=1),
+             Shot(t_hit_s=2.0, side="o", shot_type="clear", rally_id=1, index_in_rally=2, hit_z_m=2.5, land_x_m=-5.5)]
+    write_shots(out / "shots.csv", shots)
+    t = np.arange(0, 4, 1 / 30)
+    feet = {"h": np.tile([-3.0, 0.0], (len(t), 1)), "o": np.tile([3.0, 0.5], (len(t), 1))}
+    write_footwork(out, shots, observe_players(t, feet, cam, np.random.default_rng(0)), cam, cfg["court"])
+    info = {"video": r"C:\v\IMG_1.MOV", "by_type": {}}
+    (out / "shot_list.json").write_text(json.dumps(info), encoding="utf-8")
+    client.post("/api/state", json={"shots_dir": str(out), "out_root": str(tmp_path / "out")})
+    assert [s["footwork"] for s in client.get("/api/shots").get_json()["shots"]] == [None, None]
+    (out / "shot_list.json").write_text(json.dumps({**info, "footwork": {"players": {}}}), encoding="utf-8")
+    g = client.get("/api/shots").get_json()["shots"]
+    assert g[0]["footwork"]["prev_t_hit_s"] is None and g[1]["footwork"]["prev_t_hit_s"] == 1.0
+    assert g[1]["footwork"]["quality"] is not None
+    json.dumps(g)   # NaN を含まない
+
+    started = []
+    monkeypatch.setattr(server, "start_task", lambda title, cmds: started.append(cmds[0]) or server.Task(title, []))
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "calib.json").write_text("{}", encoding="utf-8")
+    server.S.state.update(video=str(tmp_path / "v.mp4"), calib=str(tmp_path / "calib.json"))
+    assert client.post("/api/run/shots", json={"players": True, "footwork": True}).get_json()["ok"]
+    assert "--footwork" in started[0]

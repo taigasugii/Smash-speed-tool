@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generator
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -30,6 +30,11 @@ from smash_speed.geometry import FlightPlane, intersect_plane, triangulate
 
 MPS_TO_KMH = 3.6
 MAX_SIM_SPEED_MPS = 1000.0  # これより速い初速は積分しない（最速のスマッシュの約 6 倍。最適化の途中の極端な値）
+# 当てはめの初速の上限の目安（612 km/h。最速のスマッシュの記録 565 km/h の少し上）。
+# 空気抵抗が速さの 2 乗に比例するので、時刻を前へ戻すと速さは有限の時間で無限大になる（1/v = 1/v1 − k Δt）。
+# 打った時刻が早すぎる・奥行きが遠すぎると、観測の速さに合う初速がなくなり、最適化は初速をどこまでも上げていく
+MAX_FIT_SPEED_MPS = 170.0
+SPEED_PENALTY_SIGMA_MPS = 2.0   # 上限をこれだけ超えると、すべての観測が 1 px ずつずれたのと同じ罰
 
 
 # =============================================================================
@@ -236,7 +241,14 @@ class FitOptions:
     # 初期値にする打点時刻の位置 [m]・速度 [m/s]（打点から出る軌道の探索の結果など）。None なら観測から計算する。
     # カメラが飛行平面に近いと、視線と平面の交点（観測からの初期値）がカメラの後ろに出て計算できないため
     init_state: Any = None
-    max_nfev_per_param: int = 200    # 最適化の関数の評価の回数の上限（パラメータ 1 個あたり）
+    max_nfev_per_param: int = 60     # 最適化の関数の評価の回数の上限（パラメータ 1 個あたり）
+    # 初速の上限の目安 [m/s]（None なら使わない）。これを超えた分に罰を足す（``_Model.speed_residual``）
+    max_speed_mps: float | None = MAX_FIT_SPEED_MPS
+    # 打点の位置の目安・初速の上限の罰を、外れ値に強い損失（Huber）で弱めずに 2 乗のまま効かせる。
+    # 弱めると、目安から 1σ ほど離れた所から先は引き戻す力が頭打ちになり、数コマの観測に負けて打点が何 m も離れる
+    quadratic_priors: bool = False
+    ftol: float = 1e-5               # 最適化を終える目安（ずれの 2 乗和の減り方・パラメータの動きの割合）
+    xtol: float = 1e-5
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], **overrides: Any) -> "FitOptions":
@@ -258,7 +270,8 @@ class _Model:
 
     def __init__(self, mode: str, plane: FlightPlane | None, estimate_vt: bool, vt: float,
                  refine_plane: bool = False, plane_sigma_rad: float = 0.1, plane_sigma_m: float = 0.5,
-                 p0_prior: Any = None, p0_prior_sigma: tuple[float, float] = (0.6, 0.5)):
+                 p0_prior: Any = None, p0_prior_sigma: tuple[float, float] = (0.6, 0.5),
+                 max_speed: float | None = None, speed_weight: float = 1.0):
         if mode == "plane" and plane is None:
             raise ValueError("plane モードには飛行平面が必要です")
         self.mode, self.plane, self.estimate_vt, self.vt = mode, plane, estimate_vt, vt
@@ -269,6 +282,20 @@ class _Model:
         sh, sz = p0_prior_sigma
         self.p0_prior_sigma = np.array([sh, sh, sz])
         self.prior_px = 1.0  # 打点の位置の事前分布の重み（1σ が何 px の残差に当たるか）
+        self.max_speed, self.speed_weight = max_speed, speed_weight
+        self.huber_px: float | None = None  # 目安の残差を 2 乗のまま効かせるときの、Huber 損失の切り替え点 [px]
+
+    def _quadratic(self, r: np.ndarray) -> np.ndarray:
+        """Huber 損失をかけた後の罰が r の 2 乗の半分になるように、切り替え点より大きい残差を引き伸ばす。
+
+        Huber 損失は δ より大きい残差 r' の罰を δ(|r'| − δ/2) にするので、r' = r²/(2δ) + δ/2 にすると罰は r²/2、
+        傾きも 2 乗の罰と同じになる（最小の位置は、目安だけ損失をかけないときと同じ）。
+        """
+        d = self.huber_px
+        if d is None:
+            return r
+        a = np.abs(r)
+        return np.where(a > d, np.sign(r) * (a * a / (2 * d) + d / 2), r)
 
     def plane_at(self, theta: np.ndarray) -> FlightPlane | None:
         """θ に含まれる平面の補正（向き dψ [rad]・法線方向の平行移動 dn [m]）を反映した平面。"""
@@ -295,8 +322,28 @@ class _Model:
         """平面の補正・打点の位置に対する事前分布の残差（標準偏差で割った値。1σ ≈ 1 px の残差と同じ重み）。"""
         res = [theta[self.n_kin:self.n_kin + 2] / self.plane_sigma] if self.n_plane else []
         if self.p0_prior is not None:
-            res.append(self.prior_px * (self.unpack(theta)[0] - self.p0_prior) / self.p0_prior_sigma)
+            res.append(self._quadratic(self.prior_px * (self.unpack(theta)[0] - self.p0_prior) / self.p0_prior_sigma))
+        if self.max_speed is not None:
+            res.append(self._quadratic(self.speed_residual(theta)))
         return np.concatenate(res) if res else np.empty(0)
+
+    def speed_residual(self, theta: np.ndarray) -> np.ndarray:
+        """初速が上限の目安 ``max_speed`` を超えた分の罰（超えていなければ 0）。
+
+        積分できない速さ（``MAX_SIM_SPEED_MPS``）の罰は一定で傾きがなく、最適化がその手前で止まって何千回も
+        評価を続けていた。上限の手前から傾きのある罰にして、ありえる速さへ戻す。
+        """
+        over = float(np.linalg.norm(self.unpack(theta)[1])) - self.max_speed
+        return np.array([self.speed_weight * max(over, 0.0) / SPEED_PENALTY_SIGMA_MPS])
+
+    def clip_speed(self, theta: np.ndarray) -> np.ndarray:
+        """初速が上限の目安を超える初期値を、向きはそのままに上限まで遅くする（上限がなければそのまま）。"""
+        theta = np.array(theta, float)
+        i = slice(2, 4) if self.mode == "plane" else slice(3, 6)
+        v = float(np.linalg.norm(theta[i]))
+        if self.max_speed is not None and v > self.max_speed:
+            theta[i] *= self.max_speed / v
+        return theta
 
     def pack(self, p0: np.ndarray, v0: np.ndarray, vt: float) -> np.ndarray:
         if self.mode == "plane":
@@ -370,7 +417,8 @@ def _residuals_3d(theta: np.ndarray, model: _Model, t: np.ndarray, X: np.ndarray
     phys = PhysicsParams(base.g, vt, base.method, base.rtol, base.atol)
     pos, _ = simulate(p0, v0, t_ref, t, phys)
     r = (pos - X).ravel()
-    return np.where(np.isfinite(r), r, 1e3)  # 積分できなかった場合の罰則 [m]
+    r = np.where(np.isfinite(r), r, 1e3)  # 積分できなかった場合の罰則 [m]
+    return r if model.max_speed is None else np.concatenate([r, model.speed_residual(theta)])
 
 
 def _speed_gradient(theta: np.ndarray, model: _Model) -> np.ndarray:
@@ -391,6 +439,31 @@ def _speed_rate(p0: np.ndarray, v0: np.ndarray, phys: PhysicsParams) -> float:
     return float(a @ v0 / np.linalg.norm(v0))
 
 
+@dataclass
+class LsqRequest:
+    """当てはめの中の 1 回の最小 2 乗問題（``fit_plan`` が順に出す）。
+
+    ``kind`` が "image" なら画像上の残差（``_residuals``、``data`` は観測のリスト）、"points" なら 3 次元点の残差
+    （``_residuals_3d``、``data`` は (時刻, 点)）。``kwargs`` は ``least_squares`` にそのまま渡す設定。
+    1 つずつ解く（``solve_cpu``）か、まとめて解く（``fit_batch.solve_batch``）。
+    """
+
+    kind: str
+    model: "_Model"
+    data: Any
+    base: PhysicsParams
+    t_ref: float
+    x0: np.ndarray
+    kwargs: dict[str, Any]
+
+    def solve_cpu(self) -> Any:
+        if self.kind == "image":
+            return least_squares(_residuals, self.x0, args=(self.model, self.data, self.base, self.t_ref),
+                                 **self.kwargs)
+        t, X = self.data
+        return least_squares(_residuals_3d, self.x0, args=(self.model, t, X, self.base, self.t_ref), **self.kwargs)
+
+
 def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: str = "plane",
                    plane: FlightPlane | None = None, phys: PhysicsParams | None = None,
                    opts: FitOptions | None = None, theta0: np.ndarray | None = None
@@ -408,6 +481,28 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
 
     Returns:
         FitResult（信頼区間は ``opts.ci_method`` に従う）
+
+    中の手順は ``fit_plan``。ここでは最小 2 乗問題を 1 つずつ ``scipy.optimize.least_squares`` で解く
+    （たくさんの当てはめをまとめて解くのは ``fit_batch.fit_trajectories``）。
+    """
+    plan = fit_plan(obs, t_ref, mode, plane, phys, opts, theta0)
+    try:
+        reqs = next(plan)
+        while True:
+            reqs = plan.send([r.solve_cpu() for r in reqs])
+    except StopIteration as stop:
+        return stop.value
+
+
+def fit_plan(obs: Observations | list[Observations], t_ref: float, mode: str = "plane",
+             plane: FlightPlane | None = None, phys: PhysicsParams | None = None,
+             opts: FitOptions | None = None, theta0: np.ndarray | None = None
+             ) -> Generator[list[LsqRequest], list[Any], FitResult]:
+    """``fit_trajectory`` の手順。解く最小 2 乗問題（``LsqRequest``）のリストを出し、その解（``least_squares`` の
+    結果と同じ形）のリストを受け取って進む。最後に ``FitResult`` を返す（``StopIteration.value``）。
+
+    同じリストの問題は互いに関係しないので、まとめて解いてよい。解けなかった（``least_squares`` が例外を出した）
+    ときは、受け取る側で例外にする（この関数の中では受け止めない）。
     """
     obs = [obs] if isinstance(obs, Observations) else list(obs)
     phys = phys or PhysicsParams()
@@ -417,9 +512,12 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
         raise ValueError("free モードには2台以上のカメラの観測（または打点の位置の目安と初期値）が必要です")
     model = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity,
                    opts.refine_plane, np.deg2rad(opts.plane_sigma_deg), opts.plane_sigma_m,
-                   opts.p0_prior_m, opts.p0_prior_sigma_m)
+                   opts.p0_prior_m, opts.p0_prior_sigma_m, opts.max_speed_mps)
     n_par = model.n_kin + model.n_plane + int(opts.estimate_terminal_velocity)
     n_res = 2 * sum(len(o.t) for o in obs)
+    model.speed_weight = float(np.sqrt(n_res))
+    if opts.quadratic_priors and opts.loss == "huber":
+        model.huber_px = opts.loss_scale_px
     n_prior = 3 if (opts.prior_counts and opts.p0_prior_m is not None) else 0
     if n_res + n_prior <= n_par:
         raise ValueError(f"観測点が少なすぎます（残差 {n_res} 個 ≤ パラメータ {n_par} 個）")
@@ -433,27 +531,30 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
         if len(t3) >= 3:
             p0, v0 = initial_guess(t3, X3, t_ref)
             # 第1段階：3次元点に運動方程式を当てはめる（多項式外挿は強い減速を表せないため）。平面は固定
-            m1 = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity)
-            stage1 = least_squares(_residuals_3d, m1.pack(p0, v0, phys.terminal_velocity),
-                                   args=(m1, t3, X3, phys, t_ref), loss="soft_l1", f_scale=0.1,
-                                   diff_step=opts.diff_step, x_scale="jac",
-                                   max_nfev=opts.max_nfev_per_param * n_par)
+            m1 = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity,
+                        max_speed=opts.max_speed_mps, speed_weight=0.1 * np.sqrt(3 * len(t3)))  # 残差は [m]
+            (stage1,) = yield [LsqRequest("points", m1, (t3, X3), phys, t_ref,
+                                          m1.clip_speed(m1.pack(p0, v0, phys.terminal_velocity)),
+                                          dict(loss="soft_l1", f_scale=0.1, diff_step=opts.diff_step, x_scale="jac",
+                                               max_nfev=opts.max_nfev_per_param * n_par))]
             starts.append(np.insert(stage1.x, m1.n_kin, np.zeros(model.n_plane)))
         elif not starts:
             raise ValueError("初期値の計算に使える3次元点が3点未満です")
 
-    def solve(o: list[Observations], th0: np.ndarray):
-        return least_squares(_residuals, th0, args=(model, o, phys, t_ref), loss=opts.loss,
-                             f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
-                             x_scale="jac", max_nfev=opts.max_nfev_per_param * n_par)
+    def solve(o: list[Observations], th0: np.ndarray) -> LsqRequest:
+        # 事前分布の重み（``model.prior_px``）は、出した問題が解かれるまで変えない
+        return LsqRequest("image", model, o, phys, t_ref, model.clip_speed(th0),
+                          dict(loss=opts.loss, f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
+                               x_scale="jac", max_nfev=opts.max_nfev_per_param * n_par,
+                               ftol=opts.ftol, xtol=opts.xtol))
 
     # 初期値が複数あれば（探索で選んだ軌道・観測から計算した値）、それぞれから解いてずれの小さい方を使う
-    sol = min((solve(obs, th) for th in starts), key=lambda s_: s_.cost)
+    sol = min((yield [solve(obs, th) for th in starts]), key=lambda s_: s_.cost)
     if model.p0_prior is not None:
         # 事前分布の 1σ を、画像上の誤差の大きさ（当てはめの残差から見積もる）と同じ重みにして解き直す
         rms0 = float(np.sqrt(np.mean(sol.fun[:n_res] ** 2)))
         model.prior_px = max(opts.loss_scale_px, rms0)
-        sol = solve(obs, sol.x)
+        (sol,) = yield [solve(obs, sol.x)]
     p0, v0, vt = model.unpack(sol.x)
     r = sol.fun[:n_res]
     rms = float(np.sqrt(np.mean(r**2)))
@@ -493,14 +594,14 @@ def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: s
             res.ci_method = "jacobian(unreliable)"
     elif opts.ci_method == "bootstrap":
         rng = np.random.default_rng(opts.seed)
-        speeds = []
+        subs = []
         for _ in range(opts.bootstrap_n):
             sub = [o.subset(rng.integers(0, len(o.t), len(o.t))) for o in obs]
             if 2 * sum(len(o.t) for o in sub) <= n_par:
                 continue
-            b = solve(sub, sol.x)
-            speeds.append(np.linalg.norm(model.unpack(b.x)[1]))
-        speeds = np.asarray(speeds)
+            subs.append(sub)
+        boot = yield [solve(sub, sol.x) for sub in subs]
+        speeds = np.asarray([np.linalg.norm(model.unpack(b.x)[1]) for b in boot])
         if sd_timing > 0:  # 打点時刻の誤差を独立な正規誤差として加える
             speeds = speeds + rng.normal(0.0, sd_timing, len(speeds))
         lo, hi = np.quantile(speeds, [0.5 - opts.ci_level / 2, 0.5 + opts.ci_level / 2])

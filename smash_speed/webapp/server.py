@@ -763,7 +763,34 @@ def run(kind: str):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
         if b.get("players"):
             args.append("--players")
+            if b.get("doubles") in ("on", "off"):   # 省略・auto は自動（側ごとに 1 人か 2 人かを決める）
+                args += ["--doubles", b["doubles"]]
+        if b.get("footwork"):
+            args.append("--footwork")
+        if not b.get("model"):   # 学習したモデル（設定の detection.shot_list_model）は画面で選んだときだけ使う
+            args.append("--baseline-detector")
         t = start_task("すべてのショットを解析", [cli(*args)])
+    elif kind == "overlay":
+        # ショットの一覧の結果を重ねた動画（mode=video）か、見どころの動画（mode=highlights）を書き出す
+        from smash_speed.overlay import HIGHLIGHTS_DIR, OVERLAY_FILE
+        from smash_speed.shot_list import SHOT_LIST_FILE
+
+        d = _shots_dir()
+        if not d or not (Path(d) / SHOT_LIST_FILE).exists():
+            return err("先にショットの一覧を作ってください。")
+        if b.get("mode") == "highlights":
+            args = ["overlay", d, "--highlights", "--out", Path(d) / HIGHLIGHTS_DIR,
+                    "--top", int(b.get("top", 5)), "--rallies", int(b.get("rallies", 0)),
+                    "--type", b.get("type") or "smash"]
+            title = "見どころの動画を書き出す"
+        else:
+            args = ["overlay", d, "--out", Path(d) / OVERLAY_FILE]
+            if b.get("start") is not None and b.get("end") is not None:
+                if not float(b["end"]) > float(b["start"]):
+                    return err("終わりの時刻を始まりより後にしてください")
+                args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
+            title = "速さを重ねた動画を書き出す"
+        t = start_task(title, [cli(*args)])
     elif kind == "propose_calib":
         if S.meta is None:
             return err("動画を開いてください")
@@ -974,33 +1001,56 @@ def shots_get():
     """``shots`` の結果（``shot_list.json`` と ``shots.csv``）。ショットは打った時刻の順。
 
     種類の正解ラベル（ROADMAP B6）は出力の場所の ``shot_labels.csv`` から付け直し、各ショットの ``truth`` に入れる。
+    ``model`` は、学習したシャトルの検出（設定の ``detection.shot_list_model``。F1c）を使えるか（画面の選択肢を出すか）。
     """
     from dataclasses import asdict
 
     from smash_speed.shot_labels import LABELS_FILE, NOT_A_HIT, NOT_A_HIT_LABEL, match_labels, read_labels
-    from smash_speed.shot_list import SHOT_LIST_FILE
+    from smash_speed.shot_list import SHOT_LIST_FILE, default_tracknet
     from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
 
     d = _shots_dir()
+    model = default_tracknet(S.cfg()) is not None
     if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
-        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS)
+        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS, model=model)
     info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     shots = read_shots(Path(d) / SHOTS_FILE)
     labels = read_labels(out_root() / LABELS_FILE)
     truth = match_labels(labels, info.get("video", ""), shots)
+    fw = _footwork_rows(Path(d), info)
     rows = []
     for k, s in enumerate(shots):
         r = asdict(s)
         r["id"] = k
         r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
         r["truth"] = truth.get(k)
+        r["footwork"] = fw.get(k)
         rows.append(r)
-    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv"), ("report", "report.html"))
+    files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv"), ("report", "report.html"),
+                                              ("overlay", "overlay.mp4"), ("highlights", "highlights/highlights.mp4"),
+                                              ("highlights_dir", "highlights"))
              if (Path(d) / f).exists()}
     # 正しい種類として選べるのは、labels の 8 種類（unknown のほか）と「打球ではない」（not_hit）
     return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,
-              files=files,
+              files=files, model=model,
               label_stats=_label_stats(labels, info.get("video", "")))
+
+
+def _footwork_rows(d: Path, info: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """``footwork.csv`` の行（ショットの番号 → 値）。この解析でフットワークも出したとき（``shot_list.json`` の
+    ``footwork``）だけ。前の解析の ``footwork.csv`` が残っていても使わない。"""
+    from smash_speed.footwork import read_footwork
+
+    if "footwork" not in info or "error" in info.get("footwork", {}):
+        return {}
+    tab = read_footwork(d)
+    if tab is None:
+        return {}
+    out = {}
+    for r in tab.to_dict("records"):
+        out[int(r["shot_index"])] = {k: (None if isinstance(v, float) and not np.isfinite(v) else
+                                         (v.item() if hasattr(v, "item") else v)) for k, v in r.items()}
+    return out
 
 
 @app.post("/api/shot_label")
@@ -1146,7 +1196,18 @@ def shot_view():
     if frame is None and S.meta is not None:
         frame = int(round(s.t_hit_s * S.meta.fps_meta))
     r3 = lambda v: None if v is None else round(float(v), 3)  # noqa: E731
-    return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end,
+    # ダブルス：打った瞬間の 4 人の立ち位置（上から見た図に出す）
+    people = []
+    if s.hitter_id and (Path(d) / "players.csv").exists():
+        from smash_speed.player_ids import player_label
+
+        pl = pd.read_csv(Path(d) / "players.csv")
+        near = pl[(pl.t - s.t_hit_s).abs() <= 0.2]
+        if len(near):
+            near = near.loc[(near.t - s.t_hit_s).abs().groupby([near.side, near.player]).idxmin()]
+            people = [{"id": player_label(r.side, r.player), "x": r3(r.x), "y": r3(r.y)} for r in near.itertuples()
+                      if np.isfinite([r.x, r.y]).all()]
+    return ok(id=k, frame=frame, t_hit_s=s.t_hit_s, t_end_s=t_end, people=people,
               hit=[r3(s.hit_x_m), r3(s.hit_y_m), r3(s.hit_z_m)] if s.hit_point is not None else None,
               land=[r3(s.land_x_m), r3(s.land_y_m)] if s.land_x_m is not None and s.land_y_m is not None else None,
               hitter=[r3(s.hitter_x_m), r3(s.hitter_y_m)] if s.hitter_x_m is not None and s.hitter_y_m is not None else None,

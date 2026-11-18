@@ -13,7 +13,8 @@
 4. ラリーの長さ（本数）の分布（棒）
 5. 着地点の分布図（``rally_stats.landing_svg``）
 6. 選手の動き（選手の位置も出したときだけ。``movement`` の移動距離・速さの表と、いた場所の分布図）
-7. 速いショット 10 本と、ラリーの一覧の表
+7. ダブルス（1 側に 2 人の選手がいたときだけ。``doubles`` の選手ごとの本数・陣形・ローテーション・落とされた所）
+8. 速いショット 10 本と、ラリーの一覧の表
 
 ``python -m smash_speed.rally_report <ショットの一覧の出力先>`` で書き出す（``shot_list.analyze_video`` も最後に書き出す）。
 """
@@ -49,6 +50,7 @@ body { margin: 0; background: var(--page); color: var(--ink);
 main { max-width: 760px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 1.35rem; margin: 0.2rem 0 0.1rem; overflow-wrap: anywhere; }
 h2 { font-size: 1.05rem; margin: 0 0 0.6rem; }
+h3 { font-size: 0.95rem; margin: 1rem 0 0.4rem; }
 .meta, .note { color: var(--ink2); font-size: 0.85rem; margin: 0; }
 section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
   margin: 14px 0; }
@@ -155,10 +157,70 @@ def movement_section(movement: dict[str, Any], svg: str = "") -> str:
               '</section>')
 
 
+def doubles_section(d: dict[str, Any], svg: str = "") -> str:
+    """ダブルスの節（``doubles.json`` の中身と、落とされた所の図）。2 人の側がなければ空文字。"""
+    if not d or not d.get("players"):
+        return ""
+    pct = lambda v: _f(None if v is None else 100 * v)  # noqa: E731
+    rows = [[name, SIDE_NAMES.get(p["side"], p["side"]), str(p["n_shots"]), pct(p.get("share_of_pair")),
+             _f(p.get("max_kmh")), _f(p.get("mean_kmh")), str(p.get("n_front", 0)), str(p.get("n_mid", 0)),
+             str(p.get("n_back", 0)), _f(p.get("distance_m"))] for name, p in d["players"].items()]
+    parts = ['<section><h2>ダブルス</h2>',
+             _table(["選手", "側", "打った本数", "ペアの中の割合 %", "最高 km/h", "平均 km/h", "前で", "中で", "後ろで",
+                     "移動距離 m"], rows, set(range(2, 10))),
+             '<p class="note">選手は P1〜P4 と呼んでいます（P1・P2 が h の側、P3・P4 が o の側）。「前で・中で・後ろで」は、'
+             '打ったときに立っていた所（ネットからの深さを 3 つに分けたもの）ごとの本数です。</p>']
+    form = d.get("formation") or {}
+    if form:
+        frows = []
+        for side, f in form.items():
+            front = "、".join(f"{k} {100 * v:.0f}%" for k, v in (f.get("front_share") or {}).items())
+            frows.append([SIDE_NAMES.get(side, side), pct(f.get("attack")), pct(f.get("defence")),
+                          pct(f.get("transition")), str(f.get("n_changes", 0)), front or "—"])
+        parts += ['<h3>陣形</h3>',
+                  _table(["側", "前後（攻めの形）%", "横並び（守りの形）%", "移っている途中 %", "形が変わった回数",
+                          "前後のとき前にいた割合"], frows, {1, 2, 3, 4}),
+                  '<p class="note">ラリーの間の時間の割合です。2 人がコートの縦に並んでいれば「前後」、横に並んでいれば「横並び」と数えています。</p>']
+    rot = d.get("rotation") or {}
+    rrows = []
+    for side, r in rot.items():
+        for kind, label in (("lift", "上げた後（ロブ・クリア）→ 横並び"), ("attack", "攻めた後（スマッシュ・ドロップなど）→ 前後")):
+            k = r.get(kind) or {}
+            if not k.get("n"):
+                continue
+            rrows.append([SIDE_NAMES.get(side, side), label, str(k["n"]),
+                          f"{k['n_in_time']} / {k['n_judged']}" if k.get("n_judged") else "—",
+                          _f(k.get("median_s"), "{:.1f}")])
+    if rrows:
+        parts += ['<h3>ローテーション</h3>',
+                  _table(["側", "場面", "本数", "相手が打つまでに形になれた", "かかった時間 秒（中央値）"], rrows, {2, 3, 4}),
+                  '<p class="note">「かかった時間」は、打ってからその形になるまで（打ったときにもうその形だったものは除く）。'
+                  '相手が打ち返さなかったショットは「なれた」の数に入れていません。</p>']
+    gaps = d.get("gaps") or {}
+    grows = [[SIDE_NAMES.get(side, side), str(g["n"])] + [str(g["by_kind"][k]["n"]) for k in g["by_kind"]]
+             + [_f(g.get("mean_d_near_m"), "{:.1f}")] for side, g in gaps.items() if g.get("n")]
+    if grows:
+        kinds = [v["label"] for v in next(iter(gaps.values()))["by_kind"].values()]
+        parts += ['<h3>落とされた所</h3>',
+                  _table(["落とされた側", "本数"] + kinds + ["近い方の選手からの距離 m（平均）"], grows,
+                         set(range(1, len(kinds) + 3))),
+                  f'<div>{svg}</div>' if svg else "",
+                  '<p class="note">自分たちのコートに落ちたシャトルが、相手が打った瞬間の 2 人の立ち位置から見てどこだったかです。'
+                  '「2 人の間」が多ければ、どちらが取るかの決めごとを確かめてください。</p>']
+    h = d.get("hitters") or {}
+    if h.get("n"):
+        parts.append(f'<p class="note">誰が打ったかは、打った瞬間のシャトルと 2 人の位置から決めた目安です'
+                     f'（{h["n"]} 本のうち、2 人の差が小さく確かでないもの {h.get("n_low_conf", 0)} 本）。'
+                     '2 人が重なって写る向きのカメラでは間違えやすくなります。</p>')
+    parts.append('</section>')
+    return "".join(parts)
+
+
 def build_report(shots: list[Shot], rallies: list[Rally], info: dict[str, Any] | None = None,
                  court: dict[str, Any] | None = None, title: str | None = None,
-                 movement: dict[str, Any] | None = None, movement_svg: str = "") -> str:
-    """レポートの HTML（1 つのファイルで完結する）。``movement`` があれば選手の動きの節も入れる。"""
+                 movement: dict[str, Any] | None = None, movement_svg: str = "",
+                 doubles: dict[str, Any] | None = None) -> str:
+    """レポートの HTML（1 つのファイルで完結する）。``movement`` があれば選手の動きの節、``doubles`` があればダブルスの節も入れる。"""
     info = info or {}
     st = rally_stats(shots, rallies, court)
     name = title or (Path(info["video"]).name if info.get("video") else "ショットの統計")
@@ -234,6 +296,10 @@ def build_report(shots: list[Shot], rallies: list[Rally], info: dict[str, Any] |
                        '</section>')
     if movement:
         parts.append(movement_section(movement, movement_svg))
+    if doubles:
+        from smash_speed.doubles import gaps_svg
+
+        parts.append(doubles_section(doubles, gaps_svg(doubles, court)))
     if top_rows:
         parts.append('<section><h2>速いショット</h2>'
                      + _table(["時刻 秒", "種類", "初速 km/h", "ラリー・何本目", "打った側"], top_rows, {0, 2})
@@ -263,7 +329,12 @@ def write_report(out_dir: str | Path, court: dict[str, Any] | None = None, shots
     if movement is not None and (out_dir / MOVEMENT_SVG).exists():
         svg = (out_dir / MOVEMENT_SVG).read_text(encoding="utf-8")
     path = out_dir / REPORT_FILE
-    path.write_text(build_report(shots, rallies, info, court, movement=movement, movement_svg=svg), encoding="utf-8")
+    # ダブルスも、この解析で 2 人の側があったときだけ（``shot_list.json`` の ``players.doubles``）
+    from smash_speed.doubles import load_doubles
+
+    doubles = load_doubles(out_dir) if (info.get("players") or {}).get("doubles") else None
+    path.write_text(build_report(shots, rallies, info, court, movement=movement, movement_svg=svg, doubles=doubles),
+                    encoding="utf-8")
     return path
 
 

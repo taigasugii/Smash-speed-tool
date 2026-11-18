@@ -128,3 +128,74 @@ def test_speed_metrics_and_naive_speed_underestimate(cfg, phys, camera):
     # 強い減速のため、30fps のフレーム間差分は初速を大きく過小評価する
     fd = finite_difference_speeds(df.timestamp.values, df[["x_m", "y_m", "z_m"]].values)
     assert fd["first_mps"] < 0.8 * 80.0
+
+
+def test_too_early_hit_time_stops_at_the_speed_ceiling(cfg, phys, camera):
+    """打った時刻が早すぎると合う初速がなくなる（前へ戻すと速さが無限大になる）。上限の目安の所で止まり、迷わない。"""
+    import smash_speed.physics as physics
+
+    rng = np.random.default_rng(8)
+    shot = synth.make_shot(90.0, cfg, phys)
+    df = synth.observe(shot, camera, 30, phys, rng, noise_px=1.0, dropout=0.0)
+    d = df[df.timestamp > shot.t_impact + 0.01]
+    obs = Observations(camera, d.timestamp.values, d[["x_px", "y_px"]].values)
+    calls = []
+    sim = physics.simulate
+    try:
+        physics.simulate = lambda p0, v0, *a: (calls.append(float(np.linalg.norm(v0))), sim(p0, v0, *a))[1]
+        fit = fit_trajectory(obs, shot.t_impact - 0.08, "plane", shot.plane, phys, FitOptions(ci_method="none"))
+        n_ceiling = len(calls)
+        calls.clear()
+        free = fit_trajectory(obs, shot.t_impact - 0.08, "plane", shot.plane, phys,
+                              FitOptions(ci_method="none", max_speed_mps=None, ftol=1e-8, xtol=1e-8,
+                                         max_nfev_per_param=200))
+    finally:
+        physics.simulate = sim
+    assert physics.MAX_FIT_SPEED_MPS < fit.speed0 < physics.MAX_FIT_SPEED_MPS + 15.0
+    assert free.speed0 > 2 * physics.MAX_FIT_SPEED_MPS       # 上限がないと、積分できる限界の近くまで上がる
+    assert n_ceiling < len(calls)
+    # 打った時刻が合っていれば、上限は結果を変えない
+    a = fit_trajectory(obs, shot.t_impact, "plane", shot.plane, phys, FitOptions(ci_method="none"))
+    b = fit_trajectory(obs, shot.t_impact, "plane", shot.plane, phys, FitOptions(ci_method="none", max_speed_mps=None))
+    assert abs(a.speed0 - b.speed0) < 1e-3 * b.speed0
+
+
+def test_start_faster_than_the_ceiling_is_slowed_down(phys):
+    from smash_speed.geometry import FlightPlane
+    from smash_speed.physics import MAX_FIT_SPEED_MPS, _Model
+
+    m = _Model("plane", FlightPlane(np.zeros(3), np.array([1.0, 0.0, 0.0])), False, phys.terminal_velocity,
+               max_speed=MAX_FIT_SPEED_MPS)
+    th = m.clip_speed(np.array([-5.0, 2.5, 900.0, -300.0]))
+    assert np.hypot(th[2], th[3]) == pytest.approx(MAX_FIT_SPEED_MPS)
+    assert th[3] / th[2] == pytest.approx(-300.0 / 900.0)
+    np.testing.assert_array_equal(m.clip_speed(np.array([-5.0, 2.5, 60.0, -10.0])), [-5.0, 2.5, 60.0, -10.0])
+    assert m.speed_residual(np.array([-5.0, 2.5, 60.0, -10.0]))[0] == 0.0
+    assert m.speed_residual(np.array([-5.0, 2.5, 200.0, 0.0]))[0] > 0.0
+
+
+def test_quadratic_priors_are_not_weakened_by_huber_loss(cfg, phys, camera):
+    """打点の位置の目安は、Huber 損失をかけても 2 乗の罰のまま効く（目安から離れた打点を引き戻す）。"""
+    from smash_speed.geometry import FlightPlane
+    from smash_speed.physics import _Model
+
+    m = _Model("plane", FlightPlane(np.zeros(3), np.array([1.0, 0.0, 0.0])), False, phys.terminal_velocity)
+    m.huber_px = 2.0
+    r = np.array([-9.0, -2.0, 0.5, 2.0, 7.0])
+    stretched = np.abs(m._quadratic(r))
+    huber = np.where(stretched <= 2.0, 0.5 * stretched**2, 2.0 * (stretched - 1.0))
+    np.testing.assert_allclose(huber, 0.5 * r**2)
+
+    rng = np.random.default_rng(5)
+    shot = synth.make_shot(70.0, cfg, phys)
+    df = synth.observe(shot, camera, 30, phys, rng, noise_px=1.0, dropout=0.0)
+    d = df[df.visible == 1].iloc[1:7]            # 打った直後を除いた 6 コマ：奥行きが決まりにくい
+    obs = Observations(camera, d.timestamp.values, d[["x_px", "y_px"]].values)
+    prior = shot.p0 + 1.5 * shot.plane.direction      # 目安を飛ぶ向きに 1.5 m ずらす
+    gaps = []
+    for quad in (False, True):
+        f = fit_trajectory(obs, shot.t_impact, "plane", shot.plane, phys,
+                           FitOptions(ci_method="none", p0_prior_m=prior, p0_prior_sigma_m=(0.3, 0.3),
+                                      quadratic_priors=quad))
+        gaps.append(float(np.linalg.norm(f.p0 - prior)))
+    assert gaps[1] <= gaps[0] + 1e-6
