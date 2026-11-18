@@ -763,6 +763,8 @@ def run(kind: str):
             args += ["--roi", ",".join(f"{v:.0f}" for v in st["roi"])]
         if b.get("players"):
             args.append("--players")
+        if b.get("footwork"):
+            args.append("--footwork")
         if not b.get("model"):   # 学習したモデル（設定の detection.shot_list_model）は画面で選んだときだけ使う
             args.append("--baseline-detector")
         t = start_task("すべてのショットを解析", [cli(*args)])
@@ -1013,12 +1015,14 @@ def shots_get():
     shots = read_shots(Path(d) / SHOTS_FILE)
     labels = read_labels(out_root() / LABELS_FILE)
     truth = match_labels(labels, info.get("video", ""), shots)
+    fw = _footwork_rows(Path(d), info)
     rows = []
     for k, s in enumerate(shots):
         r = asdict(s)
         r["id"] = k
         r["label"] = SHOT_TYPE_LABELS.get(s.shot_type, s.shot_type)
         r["truth"] = truth.get(k)
+        r["footwork"] = fw.get(k)
         rows.append(r)
     files = {k: str(Path(d) / f) for k, f in (("shots", SHOTS_FILE), ("rallies", "rallies.csv"), ("report", "report.html"),
                                               ("overlay", "overlay.mp4"), ("highlights", "highlights/highlights.mp4"),
@@ -1028,6 +1032,23 @@ def shots_get():
     return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,
               files=files, model=model,
               label_stats=_label_stats(labels, info.get("video", "")))
+
+
+def _footwork_rows(d: Path, info: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """``footwork.csv`` の行（ショットの番号 → 値）。この解析でフットワークも出したとき（``shot_list.json`` の
+    ``footwork``）だけ。前の解析の ``footwork.csv`` が残っていても使わない。"""
+    from smash_speed.footwork import read_footwork
+
+    if "footwork" not in info or "error" in info.get("footwork", {}):
+        return {}
+    tab = read_footwork(d)
+    if tab is None:
+        return {}
+    out = {}
+    for r in tab.to_dict("records"):
+        out[int(r["shot_index"])] = {k: (None if isinstance(v, float) and not np.isfinite(v) else
+                                         (v.item() if hasattr(v, "item") else v)) for k, v in r.items()}
+    return out
 
 
 @app.post("/api/shot_label")

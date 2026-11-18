@@ -23,6 +23,8 @@ App.views.shots = {
     if (!mine) return;
     this.renderSummary(el, info, shots);
     this.renderExport(el, info, shots, r.files || {});
+
+    if (info.footwork) this.renderFootwork(el, info, shots);
     this.renderTable(el, info, shots, r.files || {});
   },
 
@@ -101,6 +103,7 @@ App.views.shots = {
           <input class="input" id="s1" type="number" step="0.1" min="0" style="width:90px"> 秒まで</span>
         ${App.state.roi ? `<label class="row small"><input type="checkbox" id="useroi" ${info.roi ? "checked" : ""}> 手順 3 の「検出する範囲」の中だけで探す</label>` : ""}
         <label class="row small"><input type="checkbox" id="players" ${info.players ? "checked" : ""}> 選手の立ち位置も記録する（時間が延びます）</label>
+        <label class="row small" title="相手が打つ時の小さなジャンプ（構え）、動き出しまでの時間、打った後に戻るまでの時間などを、ショットごとに出します。選手の立ち位置も記録します"><input type="checkbox" id="footwork" ${info.footwork ? "checked" : ""}> 選手の動き（構え・動き出し・戻り）と、ショットの出来の目安も出す</label>
         ${model ? `<label class="row small" title="この動画のようなバドミントンの動画で練習させたシャトルの見つけ方です。打った瞬間の見落としと、ほかの物をシャトルと間違えることが減ります"><input type="checkbox" id="model" ${info.detector === "baseline" ? "" : "checked"}> 練習させた見つけ方でシャトルを探す（おすすめ）</label>` : ""}
       </div>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="go">${has ? "解析し直す" : "解析を始める"}</button>
@@ -113,17 +116,20 @@ App.views.shots = {
       $("#part", card).classList.toggle("hidden", !part);
       const len = part ? Math.max(0, +$("#s1", card).value - +$("#s0", card).value) : dur;
       // 選手の検出は 4K 30fps で動画の長さの約 0.4 倍（GPU。F3d）
+      if ($("#footwork", card).checked) $("#players", card).checked = true;   // 動きを出すには立ち位置が要る
       const extra = $("#players", card).checked ? len * 0.5 : 0;
       $("#eta", card).textContent = `目安 約 ${minutes(len + extra / 2.5)} 分（動画 ${fmt(len, 0)} 秒）。解析中もほかの画面は使えます。`;
     };
     $$("#rng button", card).forEach((b) => { b.onclick = () => { part = b.dataset.v === "part"; upd(); }; });
     $("#s0", card).oninput = upd;
     $("#s1", card).oninput = upd;
-    $("#players", card).onchange = upd;
+    $("#players", card).onchange = () => { if (!$("#players", card).checked) $("#footwork", card).checked = false; upd(); };
+    $("#footwork", card).onchange = upd;
     upd();
     $("#go", card).onclick = () => {
       if (has && !confirm("解析し直すと、前回の一覧は置き換わります。よろしいですか？")) return;
       const data = { use_roi: !!($("#useroi", card) && $("#useroi", card).checked), players: $("#players", card).checked,
+        footwork: $("#footwork", card).checked,
         model: !!($("#model", card) && $("#model", card).checked) };
       if (part) {
         data.start = +$("#s0", card).value;
@@ -183,6 +189,7 @@ App.views.shots = {
     // 打った側（h は x < 0、o は x > 0）を、カメラから見て手前か奥かで言い直す
     const cx = App.calib && App.calib.camera_center ? App.calib.camera_center[0] : null;
     const sideName = (s) => !s ? "—" : cx == null ? (s === "h" ? "片側" : "反対側") : ((s === "h") === (cx < 0) ? "手前" : "奥");
+    const fwOn = !!info.footwork && !info.footwork.error;
     const card = h(`<div class="card"><div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
         <h2 style="margin:0;flex:1">ショット（${shown.length} 本）</h2>
         <div class="seg" id="flt"><button data-v="all">すべて</button>${types.map((k) => `<button data-v="${k}">${esc(this.labels[k] || k)}</button>`).join("")}</div>
@@ -191,7 +198,7 @@ App.views.shots = {
         打っていない所がショットになっていたら「${esc(this.choiceLabel(this.notHit))}」を選んでください。
         選んだ種類は、解析し直しても残り、決まりの判定を良くするのに使います。<br><span id="lstat" class="muted"></span></p>
       <div style="overflow:auto;max-height:70vh"><table class="tbl"><thead><tr><th>時刻</th><th>ラリー</th><th>打った人</th><th>種類</th>
-        <th class="r">初速 km/h</th><th class="r">95% の範囲</th><th>確かさ</th><th>正しい種類</th></tr></thead><tbody></tbody></table></div>
+        <th class="r">初速 km/h</th><th class="r">95% の範囲</th><th>確かさ</th>${fwOn ? '<th title="相手が打つ時の構え（小さなジャンプ）と、動き出しまでの時間">構え・動き出し</th><th class="r" title="打点の高さ・速さ・落ちた所・打つ前の余裕から出した目安（100 点満点）">出来</th>' : ""}<th>正しい種類</th></tr></thead><tbody></tbody></table></div>
       ${files.shots ? `<p class="small" style="margin:10px 0 0"><a href="${fileUrl(files.shots)}" download="shots.csv">一覧を CSV で保存（Excel で開けます）</a></p>` : ""}</div>`);
     $$("#flt button", card).forEach((b) => { b.classList.toggle("on", b.dataset.v === this.filter); b.onclick = () => { this.filter = b.dataset.v; go("shots"); }; });
     $$("#srt button", card).forEach((b) => { b.classList.toggle("on", b.dataset.v === this.sort); b.onclick = () => { this.sort = b.dataset.v; go("shots"); }; });
@@ -200,7 +207,7 @@ App.views.shots = {
     this.tbody = tb;
     this.lstat = $("#lstat", card);
     this.renderStats();
-    if (!shown.length) tb.appendChild(h(`<tr><td colspan="8" class="muted">ショットがありません。</td></tr>`));
+    if (!shown.length) tb.appendChild(h(`<tr><td colspan="${fwOn ? 10 : 8}" class="muted">ショットがありません。</td></tr>`));
     for (const s of shown) {
       const ci = s.speed_ci_low_kmh != null && s.speed_ci_high_kmh != null ? `${fmt(s.speed_ci_low_kmh, 0)}–${fmt(s.speed_ci_high_kmh, 0)}` : "—";
       const c = s.speed_kmh == null ? null : s.confidence;  // 初速が出なかったショットの確かさは出さない
@@ -209,6 +216,7 @@ App.views.shots = {
       const tr = tb.appendChild(h(`<tr class="click"${s.id === this.sel ? ' style="outline:2px solid var(--primary)"' : ""}><td>${fmt(s.t_hit_s, 2)} s</td><td>${rally}</td><td>${sideName(s.side)}</td>
         <td>${s.shot_type === "unknown" ? `<span class="muted">${esc(s.label)}</span>` : `<span class="badge info">${esc(s.label)}</span>`}</td>
         <td class="r">${s.speed_kmh != null ? `<b>${fmt(s.speed_kmh, 0)}</b>` : `<span class="muted" title="${esc(s.note)}">出せず</span>`}</td><td class="r">${ci}</td><td>${conf}</td>
+        ${fwOn ? this.footworkCells(s.footwork) : ""}
         <td><select class="input truth" style="height:30px;font-size:13px"><option value="">—</option>
           ${this.truthTypes().map((k) => `<option value="${k}">${esc(this.choiceLabel(k))}</option>`).join("")}</select></td></tr>`));
       tr.dataset.id = s.id;
@@ -227,6 +235,63 @@ App.views.shots = {
     const host = el.appendChild(h(`<div></div>`));
     this.host = host;
     if (this.sel != null && shots.some((s) => s.id === this.sel)) this.renderDetail(host, shots.find((s) => s.id === this.sel), false);
+  },
+
+  // ---- 選手の動き（フットワーク）と出来の目安（smash_speed/footwork.py）
+  sec(v) { return v == null ? "—" : `${fmt(v, 2)} 秒`; },
+  footworkCells(f) {
+    if (!f) return '<td class="muted">—</td><td class="r muted">—</td>';
+    const split = f.split_step === true ? "構え ○" : f.split_step === false ? "構え ×" : "";
+    const react = f.reaction_s != null ? `動き出し ${fmt(f.reaction_s, 2)} 秒` : "";
+    const txt = [split, react].filter(Boolean).join("・") || "—";
+    const warn = f.uncertain ? ` <span class="badge warn" title="${esc(f.uncertain_reason || "")}">確かでない</span>` : "";
+    return `<td class="small">${txt}${warn}</td><td class="r">${f.quality != null ? `<b>${fmt(f.quality, 0)}</b>` : '<span class="muted">—</span>'}</td>`;
+  },
+
+  // 選手ごとのまとめ
+  renderFootwork(el, info, shots) {
+    const fw = info.footwork || {};
+    if (fw.error) { el.appendChild(h(`<div class="card"><p class="desc">選手の動きは出せませんでした（${esc(fw.error)}）。</p></div>`)); return; }
+    const cx = App.calib && App.calib.camera_center ? App.calib.camera_center[0] : null;
+    const who = (k) => { const s = k[0]; return cx == null ? (s === "h" ? "片側の選手" : "反対側の選手") : ((s === "h") === (cx < 0) ? "手前の選手" : "奥の選手"); };
+    const pct = (v) => v == null ? "—" : `${fmt(100 * v, 0)}%`;
+    const rows = Object.entries(fw.players || {}).map(([k, p]) => `<tr><td>${who(k)}</td><td class="r">${p.n_shots}（確か ${p.n_certain}）</td>
+      <td class="r">${pct(p.split_rate)}</td><td class="r">${this.sec(p.reaction_median_s)}</td><td class="r">${this.sec(p.prep_median_s)}</td>
+      <td class="r">${this.sec(p.recovery_median_s)}</td><td class="r">${p.n_smash ? `${p.n_jump_smash} / ${p.n_smash}` : "—"}</td>
+      <td class="r">${p.quality_mean != null ? fmt(p.quality_mean, 0) : "—"}</td></tr>`).join("");
+    el.appendChild(h(`<div class="card"><h2>選手の動きと、ショットの出来の目安</h2>
+      <p class="desc">ショットごとに、打った選手が<b>相手に打たれてから自分が打つまで</b>と、<b>打った後</b>にどう動いたかを測りました。
+        数字は「確かでない」としたショット（体が画面の端で切れている・立ち位置が出ていないコマが多いなど）を除いた真ん中の値です。
+        構え（相手が打つ時の小さなジャンプ）や跳んだ高さは数 cm の動きなので、<b>目安</b>として見てください。</p>
+      <div style="overflow:auto"><table class="tbl"><thead><tr><th>選手</th><th class="r">ショット</th>
+        <th class="r" title="相手が打つ少し前〜直後に、小さく跳んで構えた割合">構えた割合</th>
+        <th class="r" title="相手が打ってから、打つ所へ向かって動き出すまで。マイナスは相手が打つ前に動き出した（読んでいた）">動き出しまで</th>
+        <th class="r" title="打つ所に着いてから打つまでの余裕">打つ前の余裕</th>
+        <th class="r" title="打った後、そのラリーでいちばんいた所の近く（60 cm 以内）へ戻るまで">戻るまで</th>
+        <th class="r">跳んで打ったスマッシュ</th><th class="r" title="100 点満点。下の表と、ショットを押した所に中身があります">出来の平均</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="small muted" style="margin:8px 0 0">出来の目安は、種類ごとに決めた項目（打った高さ・速さ・落ちた所の深さ・打つ前の余裕）を 0〜100 点にして平均したものです。
+        学習したものではなく、決まった物差しです（docs/footwork.md）。</p></div>`));
+  },
+
+  // 詳しい所の、このショットの動き
+  footworkDetail(f) {
+    if (!f) return "";
+    const yn = (v, a, b) => v === true ? a : v === false ? b : "決められませんでした";
+    const q = (v) => v == null ? "—" : `${fmt(100 * v, 0)} 点`;
+    const items = [
+      ["相手が打つ時の構え（小さなジャンプ）", f.prev_t_hit_s == null ? "受けた球がありません（サーブ）" : yn(f.split_step,
+        `あり（相手が打つ ${fmt(Math.abs(f.split_dt_s), 2)} 秒${f.split_dt_s < 0 ? "前" : "後"}、${fmt(100 * f.split_height_m, 0)} cm）`, "なし")],
+      ["動き出しまで", f.reaction_s == null ? "—" : `${fmt(f.reaction_s, 2)} 秒${f.reaction_s < 0 ? "（相手が打つ前に動き出した）" : ""}`],
+      ["打つまでに動いた距離・いちばん速い時", `${f.move_distance_m != null ? fmt(f.move_distance_m, 1) + " m" : "—"}・${f.move_peak_mps != null ? fmt(f.move_peak_mps, 1) + " m/秒" : "—"}`],
+      ["打つ所に着いてからの余裕", this.sec(f.prep_s)],
+      ["打った後、いつもの位置へ戻るまで", f.recovery_m == null ? "—" : f.recovery_s == null ? `次に相手が打つまでに戻れませんでした（${fmt(f.recovery_m, 1)} m 離れていた）` : `${this.sec(f.recovery_s)}（${fmt(f.recovery_m, 1)} m 離れていた）`],
+      ["跳んで打ったか", yn(f.jump, `跳んだ${f.jump_height_m != null ? `（${fmt(100 * f.jump_height_m, 0)} cm）` : ""}`, "跳んでいない")],
+    ];
+    return `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)"><b class="small">打った選手の動き</b>
+      ${f.uncertain ? `<span class="badge warn">確かでない：${esc(f.uncertain_reason || "")}</span>` : ""}
+      <table class="tbl small" style="margin-top:6px"><tbody>${items.map(([a, b]) => `<tr><td>${a}</td><td>${b}</td></tr>`).join("")}</tbody></table>
+      <p class="small" style="margin:8px 0 0">出来の目安：<b>${f.quality != null ? fmt(f.quality, 0) + " 点" : "出せません（使える項目が足りない）"}</b>
+        <span class="muted">（打った高さ ${q(f.q_height)}・速さ ${q(f.q_speed)}・落ちた所の深さ ${q(f.q_depth)}・打つ前の余裕 ${q(f.q_prep)}。「—」はこの種類では使わない項目）</span></p></div>`;
   },
 
   // ---- 種類の正解ラベル（ROADMAP B6）
@@ -335,6 +400,7 @@ App.views.shots = {
       <div class="row" style="gap:12px;align-items:flex-start;flex-wrap:wrap">
         <div style="flex:3;min-width:320px"><div id="scene" style="position:relative"></div><div id="step"></div></div>
         <div id="top" style="flex:1;min-width:240px"></div></div>
+      ${this.footworkDetail(s.footwork)}
       <div id="truth" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)"></div></div>`);
     this.sceneKey = null;
     if (v.frame != null && v.image_size) this.renderScene(card, v, s);
