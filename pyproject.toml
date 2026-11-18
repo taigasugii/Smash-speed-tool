@@ -14,7 +14,7 @@ dependencies = [
     "pandas>=2.1",
     "pyyaml>=6.0",
     "matplotlib>=3.8",
-    "opencv-python>=4.9",
+    "opencv-python>=4.9,<5.1",  # 5.1 で実動画のチェック（check_real_videos）の初速が最大 18% 変わる（2026-11-19）
     "flask>=3.0",
 ]
 
