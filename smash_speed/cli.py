@@ -241,7 +241,8 @@ def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
     o = ShotListOptions(video=Path(a.video), calib=Path(a.calib), out_dir=Path(a.out), capture_fps=a.capture_fps,
                         start_s=a.start, end_s=a.end, roi=[float(v) for v in a.roi.split(",")] if a.roi else None,
                         audio=Path(a.audio) if a.audio else None, use_audio=not a.no_audio,
-                        players=a.players, hitter_prior=not a.no_hitter_prior, footwork=a.footwork,
+                        players=a.players, doubles=a.doubles, hitter_prior=not a.no_hitter_prior,
+                        footwork=a.footwork,
                         detections=Path(a.detections) if a.detections else None,
                         tracknet=tracknet, tracknet_threshold=a.tracknet_threshold, tracknet_fallback=fallback,
                         joint_fit=a.joint_fit, joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
@@ -657,6 +658,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--audio", help="音声ファイル（動画の音声の代わりに使う）")
     p.add_argument("--no-audio", action="store_true", help="打球音を使わない（軌道だけで打球を見つける）")
     p.add_argument("--players", action="store_true", help="選手の位置も出す（players.csv。人の検出のモデルを使う）")
+    p.add_argument("--doubles", choices=["auto", "on", "off"], default="auto",
+                   help="--players のとき：auto は両側とも 2 人いればダブルス、on は 2 人いる側を 2 人とも追う、off は 1 側 1 人")
     p.add_argument("--no-hitter-prior", action="store_true",
                    help="--players のとき、打つ人の足元を打点の手がかりにしない（以前の当てはめ）")
     p.add_argument("--footwork", action="store_true",

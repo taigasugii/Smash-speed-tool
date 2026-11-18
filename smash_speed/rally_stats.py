@@ -259,6 +259,15 @@ def write_stats(out_dir: str | Path, shots: list[Shot] | None = None, rallies: l
     movement = load_movement(out_dir)
     if movement is not None:
         st["players"] = movement_stats(movement)
+    # ダブルス（この解析で 1 側に 2 人の選手がいたとき。``doubles.json`` のまとめ）
+    info_path = out_dir / "shot_list.json"
+    info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
+    if (info.get("players") or {}).get("doubles"):
+        from smash_speed.doubles import doubles_brief, load_doubles
+
+        d = load_doubles(out_dir)
+        if d:
+            st["doubles"] = doubles_brief(d)
     (out_dir / STATS_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
     svg = landing_svg(shots, court)
     if svg:
