@@ -475,7 +475,17 @@ def low_rally_camera() -> Camera:
     return look_at(np.array([-1.5, -8.0, 1.2]), np.array([0.0, 0.0, 2.6]), 800.0, 1920, 1080)
 
 
+def oblique_rally_camera() -> Camera:
+    """ネットの近くの横（コートの外・高さ 1.3 m）から、コートの中ほどへ斜めに向けて撮る仮想カメラ（基礎打ちの練習の動画の撮り方）。
+
+    手前（h の側）の選手は画面の左の端・下の端で足元が切れ、奥（o の側）の選手は全身が写る。
+    """
+    return look_at(np.array([-1.0, -4.5, 1.3]), np.array([1.5, 0.5, 2.3]), 700.0, 1920, 1080)
+
+
 RALLY_CAMERAS = ("side", "corner", "low")
+# ``RALLY_CAMERAS`` は既存のテストが全部のカメラで回すので、新しい撮り方はここに分けて足す
+DRILL_CAMERAS = RALLY_CAMERAS + ("oblique",)
 
 
 def named_rally_camera(name: str, cfg: dict[str, Any]) -> Camera:
@@ -486,7 +496,9 @@ def named_rally_camera(name: str, cfg: dict[str, Any]) -> Camera:
         return corner_rally_camera()
     if name == "low":
         return low_rally_camera()
-    raise ValueError(f"知らないカメラの名前です: {name}（{', '.join(RALLY_CAMERAS)} のどれか）")
+    if name == "oblique":
+        return oblique_rally_camera()
+    raise ValueError(f"知らないカメラの名前です: {name}（{', '.join(DRILL_CAMERAS)} のどれか）")
 
 
 def observe_rally(rally: SyntheticRally, camera: Camera, fps: float, phys: PhysicsParams,

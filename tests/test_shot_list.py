@@ -351,8 +351,9 @@ def test_cli_doubles_writes_hitters_and_formations(rally_video, tmp_path, monkey
                 "movement": movement_brief(write_movement(out_dir, players, cfg.get("court")))}
 
     monkeypatch.setattr(shot_list, "analyze_players", fake_players)
+    # 学習したモデルが置いてある PC でも、合成の動画は今の検出で探す
     main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
-          "--players", "--doubles", "on"])
+          "--players", "--doubles", "on", "--baseline-detector"])
     assert seen == [(0, True)]
     saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     assert saved["players"]["doubles_mode"] == "on" and saved["players"]["per_side"] == {"h": 2, "o": 2}
@@ -376,7 +377,7 @@ def test_cli_doubles_writes_hitters_and_formations(rally_video, tmp_path, monkey
         pd.read_csv(Path(out_dir) / "players.csv").query("player == 0").to_csv(Path(out_dir) / "players.csv", index=False),
         {"n_frames": 10, "coverage": {"h": 1.0, "o": 1.0}, "per_side": {"h": 1, "o": 1}, "detect_s": 0.1})[1])
     main([str(d / "rally.mp4"), "--calib", str(d / "calibration.json"), "--out", str(tmp_path), "--no-audio",
-          "--players", "--doubles", "off"])
+          "--players", "--doubles", "off", "--baseline-detector"])
     saved = json.loads((tmp_path / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     assert "doubles" not in saved["players"] and not (tmp_path / DOUBLES_FILE).exists()
     assert all(not s.hitter_id and not s.formation for s in read_shots(tmp_path / SHOTS_FILE))
