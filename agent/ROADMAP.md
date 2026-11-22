@@ -61,8 +61,8 @@ E6 の側方のクリアの動画）になり、進められる課題がなく�
   まねる。手前の人の下半分が画面の外）を `synth_rally` に足す。
   完了の条件：4 種類 × 3 回の合成ができ、正解の打球の間隔の中央値がドライブ 0.5〜0.8 秒・スマッシュ 1.0〜1.6 秒の範囲に入る／
   テスト 3 件以上（再現できる・正解の数が合う・カメラの外の点が検出から消える）。
-- [ ] **G2 練習の動画の検出と打球**（コート合わせなし）
-  - [ ] **G2a 道具と 4 本の全コマ**：`drill.detect`：ショットの一覧と同じ検出（既定の ft1。`shot_list.choose_tracknet`、PR #26 が入っていれば ONNX）と
+- [~] **G2 練習の動画の検出と打球**（コート合わせなし。G2a 済み）
+  - [x] **G2a 道具と 4 本の全コマ**（`smash_speed/drill.py`、`tests/test_drill_detect.py`。2026-11-23 に済み。数字は JOURNAL）：`drill.detect`：ショットの一覧と同じ検出（既定の ft1。`shot_list.choose_tracknet`、PR #26 が入っていれば ONNX）と
     打球音（`shot_list.hit_onsets`）で、動画全体の `detections.csv`・`onsets.csv`、`hits.find_hits(det, fps, onsets)` の `hits.csv` を書く。
     コートの空間を使う絞り込み（`shot_list.court_depth_range`）は使えないので、`TrackFilter` の画像の上の条件だけで絞る（画面の端から
     出入りする短い軌道・止まっている点を外す）。4 本（合わせて約 50 分、約 9 万コマ）を動かし、所要時間・1 分あたりの打球の数を JOURNAL に書く。
