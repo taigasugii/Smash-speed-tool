@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -35,6 +35,10 @@ MAX_SIM_SPEED_MPS = 1000.0  # これより速い初速は積分しない（最�
 # 打った時刻が早すぎる・奥行きが遠すぎると、観測の速さに合う初速がなくなり、最適化は初速をどこまでも上げていく
 MAX_FIT_SPEED_MPS = 170.0
 SPEED_PENALTY_SIGMA_MPS = 2.0   # 上限をこれだけ超えると、すべての観測が 1 px ずつずれたのと同じ罰
+# 数値微分で動かす幅の下限の目安。幅は ``diff_step`` × max(|値|, これ)（``fd_steps``）。scipy の ``least_squares`` に
+# ``diff_step`` を渡すと幅は「値 × diff_step」だけになり、ごく小さい（0 でない）パラメータ（平面の向きの補正が 10⁻¹⁴ rad
+# など）は動かしても残差が変わらず、ヤコビアンの列がちょうど 0 になって二度と動かなくなる（ROADMAP v2 の I3）
+DIFF_STEP_FLOOR = 1.0
 
 
 # =============================================================================
@@ -228,6 +232,8 @@ class FitOptions:
     ci_method: str = "jacobian"      # "jacobian" | "bootstrap" | "none"
     bootstrap_n: int = 200
     diff_step: float = 1e-6
+    # 数値微分の幅の下限の目安（``fd_steps``。None なら scipy の ``least_squares`` のまま「値 × diff_step」）
+    diff_step_floor: float | None = DIFF_STEP_FLOOR
     seed: int = 0
     refine_plane: bool = False       # 飛行平面の向き・位置もデータから補正する（plane モード）
     plane_sigma_deg: float = 5.0     # 平面の向きの事前の不確かさ [deg]
@@ -433,6 +439,47 @@ def _speed_gradient(theta: np.ndarray, model: _Model) -> np.ndarray:
     return g
 
 
+def fd_steps(diff_step: float, x: np.ndarray, floor: float | None = DIFF_STEP_FLOOR) -> np.ndarray:
+    """前進差分の数値微分で x を動かす幅（符号つき）。``diff_step`` × max(|x|, ``floor``)、x ≥ 0 なら正の向き。
+
+    ``floor`` が None なら scipy（``_numdiff._compute_absolute_step``）と同じ「x × diff_step」（動かない所だけ下限つき）。
+    """
+    x = np.asarray(x, float)
+    sign = (x >= 0).astype(float) * 2 - 1
+    if floor is not None:
+        return diff_step * sign * np.maximum(np.abs(x), floor)
+    h = diff_step * sign * np.abs(x)
+    return np.where((x + h) - x == 0, np.sqrt(np.finfo(float).eps) * sign * np.maximum(1.0, np.abs(x)), h)
+
+
+class _FdJacobian:
+    """``least_squares`` の残差の関数と、``fd_steps`` の幅で前進差分をとるヤコビアン（scipy の "2-point" と同じ式）。
+
+    scipy は残差を計算した点でヤコビアンを求めるので、最後に計算した残差を覚えておき、同じ点なら使い回す。
+    """
+
+    def __init__(self, fun: Callable[..., np.ndarray], diff_step: float, floor: float | None):
+        self.fun, self.diff_step, self.floor = fun, diff_step, floor
+        self._x: np.ndarray | None = None
+        self._f: np.ndarray | None = None
+
+    def residuals(self, x: np.ndarray, *args: Any) -> np.ndarray:
+        f = np.atleast_1d(self.fun(x, *args))
+        self._x, self._f = np.array(x, float), f
+        return f
+
+    def jacobian(self, x: np.ndarray, *args: Any) -> np.ndarray:
+        x = np.asarray(x, float)
+        f0 = self._f if self._x is not None and np.array_equal(self._x, x) else np.atleast_1d(self.fun(x, *args))
+        h = fd_steps(self.diff_step, x, self.floor)
+        JT = np.empty((x.size, f0.size))  # scipy と同じく転置で作る（並びが違うと特異値分解の丸めが変わる）
+        for i in range(x.size):
+            x1 = x.copy()
+            x1[i] = x[i] + h[i]
+            JT[i] = (np.atleast_1d(self.fun(x1, *args)) - f0) / ((x[i] + h[i]) - x[i])
+        return JT.T
+
+
 def _speed_rate(p0: np.ndarray, v0: np.ndarray, phys: PhysicsParams) -> float:
     """初速の時間変化率 d|v|/dt [m/s^2]（打点時刻の誤差を信頼区間に加えるため）。"""
     a = _rhs(0.0, np.concatenate([p0, v0]), phys.g, phys.k)[3:]
@@ -455,13 +502,19 @@ class LsqRequest:
     t_ref: float
     x0: np.ndarray
     kwargs: dict[str, Any]
+    # 数値微分の幅の下限の目安（``fd_steps``。None なら ``least_squares`` の数値微分のまま）
+    step_floor: float | None = None
 
     def solve_cpu(self) -> Any:
         if self.kind == "image":
-            return least_squares(_residuals, self.x0, args=(self.model, self.data, self.base, self.t_ref),
-                                 **self.kwargs)
-        t, X = self.data
-        return least_squares(_residuals_3d, self.x0, args=(self.model, t, X, self.base, self.t_ref), **self.kwargs)
+            fun, args = _residuals, (self.model, self.data, self.base, self.t_ref)
+        else:
+            fun, args = _residuals_3d, (self.model, *self.data, self.base, self.t_ref)
+        kw = dict(self.kwargs)
+        if self.step_floor is not None and kw.get("jac", "2-point") == "2-point" and kw.get("diff_step") is not None:
+            fd = _FdJacobian(fun, kw.pop("diff_step"), self.step_floor)
+            return least_squares(fd.residuals, self.x0, jac=fd.jacobian, args=args, **kw)
+        return least_squares(fun, self.x0, args=args, **kw)
 
 
 def fit_trajectory(obs: Observations | list[Observations], t_ref: float, mode: str = "plane",
@@ -536,7 +589,7 @@ def fit_plan(obs: Observations | list[Observations], t_ref: float, mode: str = "
             (stage1,) = yield [LsqRequest("points", m1, (t3, X3), phys, t_ref,
                                           m1.clip_speed(m1.pack(p0, v0, phys.terminal_velocity)),
                                           dict(loss="soft_l1", f_scale=0.1, diff_step=opts.diff_step, x_scale="jac",
-                                               max_nfev=opts.max_nfev_per_param * n_par))]
+                                               max_nfev=opts.max_nfev_per_param * n_par), opts.diff_step_floor)]
             starts.append(np.insert(stage1.x, m1.n_kin, np.zeros(model.n_plane)))
         elif not starts:
             raise ValueError("初期値の計算に使える3次元点が3点未満です")
@@ -546,7 +599,7 @@ def fit_plan(obs: Observations | list[Observations], t_ref: float, mode: str = "
         return LsqRequest("image", model, o, phys, t_ref, model.clip_speed(th0),
                           dict(loss=opts.loss, f_scale=opts.loss_scale_px, diff_step=opts.diff_step,
                                x_scale="jac", max_nfev=opts.max_nfev_per_param * n_par,
-                               ftol=opts.ftol, xtol=opts.xtol))
+                               ftol=opts.ftol, xtol=opts.xtol), opts.diff_step_floor)
 
     # 初期値が複数あれば（探索で選んだ軌道・観測から計算した値）、それぞれから解いてずれの小さい方を使う
     sol = min((yield [solve(obs, th) for th in starts]), key=lambda s_: s_.cost)

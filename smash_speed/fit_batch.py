@@ -5,8 +5,8 @@
 Python の手間になる。ここでは、同じ段階の当てはめをまとめて、
 
 1. 当てはめの手順は ``physics.fit_plan`` をそのまま使う（初期値・事前分布・初速の上限の罰・信頼区間は同じ）。
-2. 最小 2 乗は、scipy の ``least_squares``（``method="trf"``・``x_scale="jac"``・数値微分のヤコビアン）と同じ手順を
-   問題ごとに進める（``_trf``。信頼領域・終わりの判定・頑健な損失は scipy の関数をそのまま呼ぶ）。
+2. 最小 2 乗は、scipy の ``least_squares``（``method="trf"``・``x_scale="jac"``・数値微分のヤコビアン。動かす幅は
+   ``physics.fd_steps`` で、1 つずつ解くときと同じ）と同じ手順を問題ごとに進める（``_trf``。信頼領域・終わりの判定・頑健な損失は scipy の関数をそのまま呼ぶ）。
 3. 残差の計算（運動方程式の積分・投影）だけを、全部の問題の全部の試す点について 1 回の配列の計算にまとめる
    （``_Evaluator``）。
 
@@ -37,14 +37,13 @@ from typing import Any, Generator, Sequence
 import numpy as np
 from numpy.linalg import norm, svd
 
-from smash_speed.physics import MAX_SIM_SPEED_MPS, SPEED_PENALTY_SIGMA_MPS, FitResult, LsqRequest, fit_plan
+from smash_speed.physics import MAX_SIM_SPEED_MPS, SPEED_PENALTY_SIGMA_MPS, FitResult, LsqRequest, fd_steps, fit_plan
 
 try:  # scipy の least_squares（trf）と同じ手順にするため、中の関数をそのまま使う
     from scipy.optimize import OptimizeResult
     from scipy.optimize._lsq.common import (check_termination, compute_grad, compute_jac_scale, evaluate_quadratic,
                                             scale_for_robust_loss_function, solve_lsq_trust_region, update_tr_radius)
     from scipy.optimize._lsq.least_squares import TERMINATION_MESSAGES, construct_loss_function
-    from scipy.optimize._numdiff import _compute_absolute_step
     AVAILABLE = True
 except ImportError:  # scipy の中の名前が変わったら、1 つずつの当てはめ（CPU）に戻す
     AVAILABLE = False
@@ -358,12 +357,15 @@ def _trf(x0: np.ndarray, f0: np.ndarray, J0: np.ndarray, kw: dict[str, Any]
     """
     ftol, xtol, gtol = kw.get("ftol", 1e-8), kw.get("xtol", 1e-8), kw.get("gtol", 1e-8)
     max_nfev = kw.get("max_nfev")
+    stall = bool(STALL_RULES)
+    f_scale = float(kw.get("f_scale", 1.0))
     m, n = J0.shape
     loss_function = construct_loss_function(m, kw.get("loss", "linear"), kw.get("f_scale", 1.0))
     x = x0.copy()
     f = f0
     f_true = f.copy()
     nfev = 1
+    best = [float(np.dot(f0, f0)) if np.all(np.isfinite(f0)) else np.inf]   # 評価ごとの、それまでのずれの 2 乗和の最小
     J = J0
     njev = 1
     if loss_function is not None:
@@ -401,6 +403,8 @@ def _trf(x0: np.ndarray, f0: np.ndarray, J0: np.ndarray, kw: dict[str, Any]
             x_new = x + step
             f_new, J_new = yield x_new
             nfev += 1
+            if stall:
+                best.append(min(best[-1], float(np.dot(f_new, f_new))) if np.all(np.isfinite(f_new)) else best[-1])
             step_h_norm = norm(step_h)
             if not np.all(np.isfinite(f_new)):
                 Delta = 0.25 * step_h_norm
@@ -414,6 +418,8 @@ def _trf(x0: np.ndarray, f0: np.ndarray, J0: np.ndarray, kw: dict[str, Any]
                                                 step_h_norm > 0.95 * Delta)
             step_norm = norm(step)
             termination_status = check_termination(actual_reduction, cost, step_norm, norm(x), ratio, ftol, xtol)
+            if termination_status is None and stall and _stalled(best, m, f_scale):
+                termination_status = 2   # 迷っている：ずれの減り方が小さい（ftol と同じ扱い。下の受け入れの判定はそのまま）
             if termination_status is not None:
                 break
             alpha *= Delta / Delta_new
@@ -435,6 +441,23 @@ def _trf(x0: np.ndarray, f0: np.ndarray, J0: np.ndarray, kw: dict[str, Any]
     return OptimizeResult(x=x, cost=cost, fun=f_true, jac=J, grad=g, optimality=g_norm,
                           active_mask=np.zeros_like(x), nfev=nfev, njev=njev, status=termination_status,
                           message=TERMINATION_MESSAGES[termination_status], success=termination_status > 0)
+
+
+# 迷う当てはめの打ち切り（ROADMAP v2 の I4）。まとめて解くと、段階ごとの時間はいちばん長く迷う数本で決まる
+# （評価の回数の上限まで、ずれが何十〜何百 px のまま少しずつしか減らない当てはめ）。ずれ（RMS）が損失の切り替え点
+# （``f_scale``）の何倍もあるのに、最近の評価でずれの 2 乗和がほとんど減っていなければ、そこで終える（ftol と同じ扱い）。
+# (評価の回数の下限, 見る評価の数, 減り方の割合, RMS ÷ f_scale の下限)。IMG_5109・IMG_4397 で、最後に 5 px 以内になる当てはめは
+# 1 本も打ち切らない所に決めた（docs/speed.md の I4）
+STALL_RULES = ((30, 20, 0.01, 2.5), (20, 10, 0.01, 25.0))
+
+
+def _stalled(best: list[float], m: int, f_scale: float) -> bool:
+    """これまでの評価のずれの 2 乗和の最小（評価ごと）``best`` から、迷っている（打ち切る）か。"""
+    k = len(best) - 1
+    for n0, w, tol, rel in STALL_RULES:
+        if k >= max(n0, w) and best[k] > m * (rel * f_scale) ** 2 and best[k] > (1 - tol) * best[k - w]:
+            return True
+    return False
 
 
 MAX_PAIRS = 1_500_000  # 1 回の残差の計算で扱う（試す点, 観測）の組の数の上限（メモリ。1 組あたり 0.3 kB ほど）
@@ -486,7 +509,7 @@ def solve_batch(reqs: Sequence[LsqRequest]) -> list[Any]:
             thetas, dxs = [], []
             for a in active:
                 x = x_try[a]
-                h = _compute_absolute_step(sub[a].kwargs["diff_step"], x, x, "2-point")
+                h = fd_steps(sub[a].kwargs["diff_step"], x, sub[a].step_floor)
                 X = np.repeat(x[None], len(x) + 1, axis=0)
                 X[1 + np.arange(len(x)), np.arange(len(x))] = x + h
                 thetas.append(X)

@@ -199,3 +199,63 @@ def test_quadratic_priors_are_not_weakened_by_huber_loss(cfg, phys, camera):
                                       quadratic_priors=quad))
         gaps.append(float(np.linalg.norm(f.p0 - prior)))
     assert gaps[1] <= gaps[0] + 1e-6
+
+
+def test_fd_steps_have_a_floor():
+    """数値微分の幅は diff_step × max(|x|, 下限)。下限なしなら scipy の least_squares と同じ幅（ROADMAP v2 の I3）。"""
+    from scipy.optimize._numdiff import _compute_absolute_step
+
+    from smash_speed.physics import fd_steps
+
+    x = np.array([0.0, -0.0, 1e-14, -1e-14, 0.5, -3.0, 2.0e5])
+    np.testing.assert_array_equal(fd_steps(1e-6, x, None), _compute_absolute_step(1e-6, x, x, "2-point"))
+    np.testing.assert_array_equal(fd_steps(1e-6, x, 1.0),
+                                  1e-6 * np.where(x >= 0, 1, -1) * np.maximum(np.abs(x), 1.0))
+
+
+def test_fd_jacobian_without_floor_is_the_same_as_least_squares(cfg, phys, camera):
+    """``_FdJacobian`` は下限なしなら、scipy の数値微分（"2-point"）と 1 ビットも同じ解になる。"""
+    from scipy.optimize import least_squares
+
+    from smash_speed.physics import _FdJacobian, _Model, _residuals
+
+    shot = synth.make_shot(70.0, cfg, phys)
+    df = synth.observe(shot, camera, 60, phys, np.random.default_rng(2), noise_px=1.0, dropout=0.1)
+    d = df[df.visible == 1]
+    obs = [Observations(camera, d.timestamp.values, d[["x_px", "y_px"]].values)]
+    model = _Model("plane", shot.plane, False, phys.terminal_velocity, refine_plane=True)
+    x0 = model.pack(shot.p0 + 0.3, shot.v0 * 0.9, phys.terminal_velocity)
+    args = (model, obs, phys, shot.t_impact)
+    kw = dict(loss="huber", f_scale=2.0, x_scale="jac", max_nfev=300)
+    a = least_squares(_residuals, x0, args=args, diff_step=1e-6, **kw)
+    fd = _FdJacobian(_residuals, 1e-6, None)
+    b = least_squares(fd.residuals, x0, jac=fd.jacobian, args=args, **kw)
+    np.testing.assert_array_equal(a.x, b.x)
+    assert a.nfev == b.nfev
+
+
+def test_tiny_plane_correction_is_not_stuck(cfg, phys, camera):
+    """平面の向きの補正がごく小さい（0 でない）値から始まっても動いて、合う平面が見つかる（ROADMAP v2 の I3）。
+
+    幅が「値 × 1e-6」だけだと、10⁻¹⁴ rad を動かしても残差が変わらず、ヤコビアンの列が 0 になって止まる。
+    """
+    from smash_speed.geometry import FlightPlane
+
+    shot = synth.make_shot(80.0, cfg, phys)
+    df = synth.observe(shot, camera, 60, phys, np.random.default_rng(0), noise_px=0.5, dropout=0.0)
+    d = df[df.visible == 1]
+    obs = Observations(camera, d.timestamp.values, d[["x_px", "y_px"]].values)
+    a, dd = np.deg2rad(4.0), shot.plane.direction
+    wrong = FlightPlane(shot.plane.origin + 0.3 * shot.plane.normal,
+                        np.array([np.cos(a) * dd[0] - np.sin(a) * dd[1], np.sin(a) * dd[0] + np.cos(a) * dd[1], 0.0]))
+    rms, speed = {}, {}
+    for floor in (None, 1.0):
+        f0 = fit_trajectory(obs, shot.t_impact, "plane", wrong, phys,
+                            FitOptions(ci_method="none", diff_step_floor=floor))
+        f = fit_trajectory(obs, shot.t_impact, "plane", wrong, phys,
+                           FitOptions(refine_plane=True, ci_method="none", diff_step_floor=floor),
+                           np.r_[f0.theta[:4], 1e-14, 1e-14])
+        rms[floor], speed[floor] = f.rms_px, f.speed0
+    assert rms[None] > 10.0          # 下限なし：平面が動かず、平面を固定したときと同じずれのまま
+    assert rms[1.0] < 1.0
+    assert abs(speed[1.0] - 80.0) < 2.0
