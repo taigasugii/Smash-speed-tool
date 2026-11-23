@@ -247,6 +247,10 @@ class FitOptions:
     # 初期値にする打点時刻の位置 [m]・速度 [m/s]（打点から出る軌道の探索の結果など）。None なら観測から計算する。
     # カメラが飛行平面に近いと、視線と平面の交点（観測からの初期値）がカメラの後ろに出て計算できないため
     init_state: Any = None
+    # 飛行の終わりの目安（受ける人の床の上の位置）。(時刻 [s], (x, y) [m], 水平の不確かさ [m])。その時刻の軌道の水平の位置を
+    # 目安に寄せる（``true_speeds.fit_smash``・``rally_fit`` と同じ考え方。飛ぶ向きが奥行きに近いカメラで、飛行の長さ＝速さを
+    # 決める。ROADMAP v2 の J2）。None なら使わない
+    end_prior: Any = None
     max_nfev_per_param: int = 60     # 最適化の関数の評価の回数の上限（パラメータ 1 個あたり）
     # 初速の上限の目安 [m/s]（None なら使わない）。これを超えた分に罰を足す（``_Model.speed_residual``）
     max_speed_mps: float | None = MAX_FIT_SPEED_MPS
@@ -277,7 +281,7 @@ class _Model:
     def __init__(self, mode: str, plane: FlightPlane | None, estimate_vt: bool, vt: float,
                  refine_plane: bool = False, plane_sigma_rad: float = 0.1, plane_sigma_m: float = 0.5,
                  p0_prior: Any = None, p0_prior_sigma: tuple[float, float] = (0.6, 0.5),
-                 max_speed: float | None = None, speed_weight: float = 1.0):
+                 max_speed: float | None = None, speed_weight: float = 1.0, end_prior: Any = None):
         if mode == "plane" and plane is None:
             raise ValueError("plane モードには飛行平面が必要です")
         self.mode, self.plane, self.estimate_vt, self.vt = mode, plane, estimate_vt, vt
@@ -290,6 +294,16 @@ class _Model:
         self.prior_px = 1.0  # 打点の位置の事前分布の重み（1σ が何 px の残差に当たるか）
         self.max_speed, self.speed_weight = max_speed, speed_weight
         self.huber_px: float | None = None  # 目安の残差を 2 乗のまま効かせるときの、Huber 損失の切り替え点 [px]
+        # 飛行の終わりの目安 (時刻, (x, y), 不確かさ)
+        self.end_prior = None if end_prior is None else (float(end_prior[0]), np.asarray(end_prior[1], float)[:2],
+                                                         float(end_prior[2]))
+
+    def end_residuals(self, pos_end: np.ndarray) -> np.ndarray:
+        """飛行の終わりの目安の残差（打点の位置の目安と同じ重み。1σ ≈ ``prior_px``）。目安がなければ空。"""
+        if self.end_prior is None:
+            return np.empty(0)
+        r = self.prior_px * (np.asarray(pos_end, float)[:2] - self.end_prior[1]) / self.end_prior[2]
+        return self._quadratic(np.where(np.isfinite(r), r, 1e3))
 
     def _quadratic(self, r: np.ndarray) -> np.ndarray:
         """Huber 損失をかけた後の罰が r の 2 乗の半分になるように、切り替え点より大きい残差を引き伸ばす。
@@ -404,6 +418,8 @@ def _residuals(theta: np.ndarray, model: _Model, obs: list[Observations], base: 
     p0, v0, vt = model.unpack(theta)
     phys = PhysicsParams(base.g, vt, base.method, base.rtol, base.atol)
     t_all = np.concatenate([o.t for o in obs])
+    if model.end_prior is not None:
+        t_all = np.r_[t_all, model.end_prior[0]]
     pos, _ = simulate(p0, v0, t_ref, t_all, phys)
     res, i = [], 0
     for o in obs:
@@ -413,6 +429,8 @@ def _residuals(theta: np.ndarray, model: _Model, obs: list[Observations], base: 
         res.append(np.where(np.isfinite(r), r, 1e3))  # カメラの後ろに出た場合の罰則 [px]
         i += n
     res.append(model.prior_residuals(theta))
+    if model.end_prior is not None:
+        res.append(model.end_residuals(pos[-1]))
     return np.concatenate(res)
 
 
@@ -565,7 +583,7 @@ def fit_plan(obs: Observations | list[Observations], t_ref: float, mode: str = "
         raise ValueError("free モードには2台以上のカメラの観測（または打点の位置の目安と初期値）が必要です")
     model = _Model(mode, plane, opts.estimate_terminal_velocity, phys.terminal_velocity,
                    opts.refine_plane, np.deg2rad(opts.plane_sigma_deg), opts.plane_sigma_m,
-                   opts.p0_prior_m, opts.p0_prior_sigma_m, opts.max_speed_mps)
+                   opts.p0_prior_m, opts.p0_prior_sigma_m, opts.max_speed_mps, end_prior=opts.end_prior)
     n_par = model.n_kin + model.n_plane + int(opts.estimate_terminal_velocity)
     n_res = 2 * sum(len(o.t) for o in obs)
     model.speed_weight = float(np.sqrt(n_res))

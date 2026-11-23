@@ -259,3 +259,31 @@ def test_tiny_plane_correction_is_not_stuck(cfg, phys, camera):
     assert rms[None] > 10.0          # 下限なし：平面が動かず、平面を固定したときと同じずれのまま
     assert rms[1.0] < 1.0
     assert abs(speed[1.0] - 80.0) < 2.0
+
+
+def test_end_prior_pulls_the_flight_length(cfg, phys, camera):
+    """飛行の終わりの目安（``FitOptions.end_prior``）は、その時刻の軌道の水平の位置を目安に寄せる（ROADMAP v2 の J2）。
+
+    本当の終わりの位置なら初速は目安なしとほぼ同じ。観測が打った直後の 6 コマだけで、2 m 先にずらした目安（不確かさ 0.1 m）なら、
+    終わりが目安へ寄り、初速が上がる（全部のコマが見えていれば、観測の方が勝ってほとんど動かない）。
+    """
+    from smash_speed.physics import simulate
+
+    shot = synth.make_shot(60.0, cfg, phys)
+    df = synth.observe(shot, camera, 60, phys, np.random.default_rng(3), noise_px=1.0, dropout=0.1)
+    d = df[df.visible == 1]
+    t_end = float(d.timestamp.values[-1])
+    d = d.iloc[:6]
+    obs = Observations(camera, d.timestamp.values, d[["x_px", "y_px"]].values)
+    true_end = simulate(shot.p0, shot.v0, shot.t_impact, np.array([t_end]), phys)[0][0]
+    base = FitOptions(ci_method="none", p0_prior_m=shot.p0, p0_prior_sigma_m=(0.5, 0.5), quadratic_priors=True)
+    f0 = fit_trajectory(obs, shot.t_impact, "plane", shot.plane, phys, base)
+    f1 = fit_trajectory(obs, shot.t_impact, "plane", shot.plane, phys,
+                        FitOptions(**{**base.__dict__, "end_prior": (t_end, true_end[:2], 0.5)}))
+    assert abs(f1.speed0 - f0.speed0) / f0.speed0 < 0.01
+    far = true_end[:2] + 2.0 * shot.plane.direction[:2]
+    f2 = fit_trajectory(obs, shot.t_impact, "plane", shot.plane, phys,
+                        FitOptions(**{**base.__dict__, "end_prior": (t_end, far, 0.1)}))
+    end2 = simulate(f2.p0, f2.v0, f2.t_ref, np.array([t_end]), phys)[0][0]
+    assert np.linalg.norm(end2[:2] - far) < np.linalg.norm(true_end[:2] - far) - 0.3
+    assert f2.speed0 > f0.speed0 * 1.05

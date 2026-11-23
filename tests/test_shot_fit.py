@@ -276,3 +276,23 @@ def test_foot_hit_times_move_a_late_hit_back_to_the_hitter(rally_fit):
     on_time = [sf.t_hit for sf in fits]
     assert foot_hit_times(fits, feet, none, PHYS, on_time) == on_time
 
+
+
+def test_first_shot_hit_height_ceiling(cam):
+    """ラリーの最初のショットの打点の目安は、高さの上限（``first_max_height_m``）より高くならない（ROADMAP v2 の J1）。
+
+    サーブの打点（本当は 0.9〜1.1 m）より低い上限 0.5 m を与えると、つないだ打点（目安）の高さが 0.5 m になる。
+    横のカメラは打点の高さがよく決まるので、当てはめの打点はほとんど動かない（観測が目安に勝つ）。2 本目からの打点は同じ。
+    """
+    rally = make_rally(np.random.default_rng(5), PHYS, n_shots=3)
+    det = observe_rally(rally, cam, 60.0, PHYS, np.random.default_rng(4))
+    t_hits, sides = [s.t_hit for s in rally.segments], [s.side for s in rally.segments]
+    opts = FitOptions(refine_plane=True, ci_method="none")
+    free = fit_shots(det, t_hits, cam, PHYS, sides, opts)
+    low = fit_shots(det, t_hits, cam, PHYS, sides, opts, first_max_height_m=0.5)
+    assert abs(free[0].hit_point[2] - rally.segments[0].p0[2]) < 0.4
+    assert low[0].hit_point[2] == pytest.approx(0.5)
+    assert low[0].fit.p0[2] <= free[0].fit.p0[2] + 1e-3
+    assert abs(low[0].fit.p0[2] - rally.segments[0].p0[2]) < 0.2
+    for a, b in zip(free[1:], low[1:]):
+        np.testing.assert_allclose(b.hit_point, a.hit_point, atol=0.05)

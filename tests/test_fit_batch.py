@@ -274,3 +274,17 @@ def test_stalled_fit_stops_with_the_same_point_as_before(rally, monkeypatch):
     assert len(a) == len(b)
     for fa, fb in zip(a, b):
         np.testing.assert_array_equal(fa.theta, fb.theta)
+
+
+def test_end_prior_fits_match_in_batch(rally):
+    """飛行の終わりの目安のある当てはめも、まとめて解いた結果が ``fit_trajectory`` とほぼ同じ（積分の誤差の分だけ違う）。"""
+    r, _, obs = rally
+    s, o = r.segments[1], obs[1]
+    end = (float(o.t[-1]), s.p0[:2] + 3.0 * np.r_[np.sign(s.v0[0]), 0.0], 1.0)
+    opts = FitOptions(refine_plane=True, quadratic_priors=True, ci_method="none", p0_prior_m=s.p0,
+                      p0_prior_sigma_m=(0.5, 0.5), end_prior=end)
+    job = (o, s.t_hit, "plane", grid_planes(s.side)[1], PHYS, opts, None)
+    (fb,) = fit_trajectories([job])
+    fc = fit_trajectory(*job)
+    np.testing.assert_allclose(fb.theta, fc.theta, rtol=1e-5, atol=1e-5)
+    assert abs(fb.speed0 - fc.speed0) * 3.6 < 0.01
