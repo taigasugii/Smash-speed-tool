@@ -85,10 +85,11 @@ S = Session()
 # 裏で動かすコマンド
 # =============================================================================
 class Task:
-    def __init__(self, title: str, commands: list[list[str]]):
+    def __init__(self, title: str, commands: list[list[str]], keep_going: bool = False):
         self.id = uuid.uuid4().hex[:10]
         self.title = title
         self.commands = commands
+        self.keep_going = keep_going   # 真なら、失敗したコマンドがあっても次へ進む（まとめて解析。最後は failed）
         self.lines: list[str] = []
         self.status = "running"   # running | done | failed | cancelled
         self.proc: subprocess.Popen | None = None
@@ -98,10 +99,14 @@ class Task:
     def _run(self) -> None:
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        failed = False
         for cmd in self.commands:
             if self.cancelled:
                 break
-            self.lines.append("$ smash-speed " + " ".join(cmd[3:]))
+            if cmd[1:3] == ["-m", "smash_speed.cli"]:
+                self.lines.append("$ smash-speed " + " ".join(cmd[3:]))
+            elif cmd[1:2] == ["-m"]:
+                self.lines.append("$ python -m " + " ".join(cmd[2:]))
             try:
                 self.proc = subprocess.Popen(cmd, cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              env=env, creationflags=flags, text=True, encoding="utf-8", errors="replace")
@@ -112,9 +117,13 @@ class Task:
             for line in self.proc.stdout:
                 self.lines.append(line.rstrip("\n"))
             if self.proc.wait() != 0:
+                if self.keep_going and not self.cancelled:
+                    failed = True
+                    self.lines.append("（失敗しました。次へ進みます）")
+                    continue
                 self.status = "cancelled" if self.cancelled else "failed"
                 return
-        self.status = "cancelled" if self.cancelled else "done"
+        self.status = "cancelled" if self.cancelled else ("failed" if failed else "done")
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -140,8 +149,8 @@ def cli(*args: Any) -> list[str]:
     return cmd + [str(a) for a in args]
 
 
-def start_task(title: str, commands: list[list[str]]) -> Task:
-    t = Task(title, commands)
+def start_task(title: str, commands: list[list[str]], keep_going: bool = False) -> Task:
+    t = Task(title, commands, keep_going)
     TASKS[t.id] = t
     return t
 
@@ -791,6 +800,19 @@ def run(kind: str):
                 args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
             title = "速さを重ねた動画を書き出す"
         t = start_task(title, [cli(*args)])
+    elif kind == "queue":
+        from smash_speed import video_queue as vq
+
+        paths = [str(x) for x in (b.get("paths") or [])]
+        items = [vq.item_for(Path(x), root) for x in paths if Path(x).is_file()]
+        items = [it for it in items if not it.done]
+        if not items:
+            return err("解析する動画がありません（選んだ動画はどれも解析済みです）。")
+        cmds = []
+        for it in items:
+            cmds.append([python_exe(), "-c", f"print({('▶ ' + it.name)!r}, flush=True)"])
+            cmds += vq.commands(it, root, cli, model=bool(b.get("model")), python=python_exe())
+        t = start_task(f"まとめて解析（{len(items)} 本）", cmds, keep_going=True)
     elif kind == "propose_calib":
         if S.meta is None:
             return err("動画を開いてください")
@@ -833,6 +855,29 @@ def run(kind: str):
     else:
         return err("不明な処理です")
     return ok(task=t.id)
+
+
+def videos_dir() -> str:
+    """まとめて解析する動画のフォルダ（画面で選んだもの。なければ ``.agent/config.json`` の ``videos_dir``）。"""
+    if S.state.get("videos_dir"):
+        return str(S.state["videos_dir"])
+    try:
+        return str(json.loads((PROJECT_ROOT / ".agent" / "config.json").read_text(encoding="utf-8-sig"))
+                   .get("videos_dir") or "")
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+@app.get("/api/queue")
+def queue():
+    """動画のフォルダの動画と、解析の状態（まとめて解析。ROADMAP v2 の L3）。"""
+    from smash_speed import video_queue as vq
+
+    d = videos_dir()
+    if not d or not Path(d).is_dir():
+        return ok(videos_dir=d, items=[], error="動画のフォルダを選んでください。" if not d else "フォルダが見つかりません。")
+    items = vq.list_videos(Path(d), out_root())
+    return ok(videos_dir=d, items=[it.to_dict() for it in items], out_root=str(out_root()))
 
 
 @app.get("/api/task/<tid>")
