@@ -85,6 +85,11 @@ class PlayerOptions:
     jump_edge_ratio: float = 1.2      # 芯の前後で、この倍を超えている間（踏み切り・着地）も跳んでいるとみなす
     jump_tail_ratio: float = 1.05     # その外も、この倍より大きく、外へ向かって下がり続ける間は含める
     max_jump_s: float = 1.2           # これより長い区間は跳んでいるとはみなさない [s]
+    # 足元が不確かなコマ（``uncertain_feet``。I5）：枠の下の辺が画面の端に付く・ネットの帯に掛かる・手前の選手の枠に隠れる
+    edge_frac: float = 0.005          # 画面の端とみなす幅（画像の長い辺に対する割合。4K で 19 px）
+    net_band_m: tuple[float, float] = (0.7, 1.6)  # ネットの帯（白帯から網の下の端まで）の高さ [m]
+    net_halfwidth_m: float = 3.6      # ネットの帯とみなす幅（支柱の外まで）[m]
+    fill_s: float = 0.6               # これより短い不確かな間は、前後の確かなコマから直線で補う [s]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -483,6 +488,102 @@ def ground_jumps(players: pd.DataFrame, camera: Camera, o: PlayerOptions | None 
     return out
 
 
+def _feet_flags(players: pd.DataFrame, camera: Camera, o: PlayerOptions) -> tuple[np.ndarray, np.ndarray]:
+    """コマごとの「足元が不確か」と「枠の上の辺が画面の上の端に付く」の印。"""
+    W, H = camera.width, camera.height
+    m = o.edge_frac * max(W, H)
+    x0, y0, x1, y1 = (players[c].to_numpy(float) for c in ("x0", "y0", "x1", "y1"))
+    edge = (y1 >= H - m) | (x0 <= m) | (x1 >= W - m)
+    # 足元の視線が、床に着く前にネットの帯（x = 0 の面）を通る（奥の選手の足がネットに隠れて、枠の下の辺がネットの所で切れる）
+    u = (x0 + x1) / 2
+    c, d = camera.rays(np.column_stack([u, y1]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lam_floor = -c[2] / d[:, 2]
+        lam_net = -c[0] / d[:, 0]
+    P = c + lam_net[:, None] * d
+    net = ((lam_net > 0) & (lam_net < lam_floor) & (np.abs(P[:, 1]) <= o.net_halfwidth_m)
+           & (P[:, 2] >= o.net_band_m[0]) & (P[:, 2] <= o.net_band_m[1]))
+    # 足元が、同じコマのほかの選手の（より手前の）枠の中にある（手前の選手に隠れる）
+    hidden = np.zeros(len(players), bool)
+    keys = list(zip(players["side"], players["player"]))
+    for _, g in players.groupby("frame"):
+        if len(g) < 2:
+            continue
+        ii = players.index.get_indexer(g.index)
+        for a in ii:
+            for b in ii:
+                if a != b and keys[a] != keys[b] and y1[b] > y1[a] and x0[b] <= u[a] <= x1[b] and y0[b] <= y1[a] <= y1[b]:
+                    hidden[a] = True
+    top_cut = y0 <= m
+    return np.nan_to_num(edge | net | hidden).astype(bool), top_cut
+
+
+def foot_noise_m(players: pd.DataFrame, camera: Camera) -> np.ndarray:
+    """足元（枠の下の辺の中央）が枠の高さの 1% だけ縦に動いたときの、床の上の位置の動き [m]。
+
+    人の枠の下の辺は、枠の高さのおよそ 0.5% ずつ揺れる（D2）。低いカメラの奥の選手は、その揺れで床の上の位置が
+    手前の選手の 2〜3 倍動き（IMG_3391・IMG_5096・IMG_5109 で 手前 0.06〜0.11 m・奥 0.17〜0.24 m）、
+    速さの山になる（``movement`` はこの値が大きい選手ほど強くならす）。
+    """
+    u = ((players["x0"] + players["x1"]) / 2).to_numpy(float)
+    v = players["y1"].to_numpy(float)
+    dv = 0.01 * (players["y1"] - players["y0"]).to_numpy(float)
+    a = floor_point(camera, np.column_stack([u, v]))
+    b = floor_point(camera, np.column_stack([u, v + dv]))
+    return np.hypot(a[:, 0] - b[:, 0], a[:, 1] - b[:, 1])
+
+
+def uncertain_feet(players: pd.DataFrame, camera: Camera, o: PlayerOptions | None = None) -> pd.DataFrame:
+    """足元が不確かなコマを見つけて ``foot_uncertain`` を真にし、その ``x, y`` を直す（I5）。
+
+    枠の下の辺が画面の端に付く（手前の選手の足が画面の外）・足元がネットの帯に掛かる（奥の選手の足がネットに隠れる）・
+    ほかの選手のより手前の枠の中にある（隠れる）コマは、枠の下の辺が足元ではないので、床へ投影した位置が 1〜4 m 跳ぶ
+    （IMG_3391 1.2 s・IMG_5096 12.7 s で奥の選手の最高の速さが 8.0・8.6 m/s）。
+    ``fill_s`` より短い不確かな間は、前後の確かなコマ（跳んでいないもの）から直線で補う。長い間は、枠の上の辺が
+    その選手のふだんの枠の高さ（確かなコマの ``body_heights`` の中央値）にあるとして、上の辺の視線とその高さの面の
+    交点を足元にする（枠の上の辺も画面の端に付くコマは、補えなければそのまま）。``u, v`` と枠は検出のまま残す。
+    """
+    o = o or PlayerOptions()
+    out = players.copy()
+    out["foot_uncertain"] = False
+    if out.empty or not {"x0", "y0", "x1", "y1"} <= set(out.columns):
+        return out
+    out["foot_noise_m"] = foot_noise_m(out, camera)
+    flag, top_cut = _feet_flags(out, camera, o)
+    out["foot_uncertain"] = flag
+    height = body_heights(out, camera)
+    air = out["airborne"].to_numpy(bool) if "airborne" in out else np.zeros(len(out), bool)
+    for _, g in out.groupby(["side", "player"]):
+        g = g.sort_values("t")
+        ii = out.index.get_indexer(g.index)
+        bad = flag[ii]
+        if not bad.any():
+            continue
+        good = ~bad & ~air[ii]
+        t = g["t"].to_numpy(float)
+        h_med = float(np.nanmedian(height[ii][good])) if good.sum() >= 3 else np.nan
+        start = np.flatnonzero(bad & ~np.r_[False, bad[:-1]])
+        stop = np.flatnonzero(bad & ~np.r_[bad[1:], False]) + 1
+        for a, b in zip(start, stop):
+            idx = g.index[a:b]
+            before, after = np.flatnonzero(good[:a]), a + np.flatnonzero(good[a:])
+            short = t[b - 1] - t[a] <= o.fill_s
+            if short and len(before) and len(after):
+                k = np.r_[before[-1], after[0]]
+                for col in ("x", "y"):
+                    out.loc[idx, col] = np.interp(t[a:b], t[k], g[col].to_numpy(float)[k])
+                continue
+            if not np.isfinite(h_med):
+                continue
+            ok = ~top_cut[ii][a:b]
+            uv = np.column_stack([(g["x0"].to_numpy(float)[a:b] + g["x1"].to_numpy(float)[a:b]) / 2,
+                                  g["y0"].to_numpy(float)[a:b]])
+            X = floor_point(camera, uv, z=h_med)
+            ok &= np.isfinite(X[:, 0])
+            out.loc[idx[ok], "x"], out.loc[idx[ok], "y"] = X[ok, 0], X[ok, 1]
+    return out
+
+
 def coverage(players: pd.DataFrame, n_frames: int, per_side: int | dict[str, int] = 1) -> dict[str, float]:
     """側ごとの、選手の位置が出たコマの割合（補ったコマも含む）。``per_side`` は 1 側の人数（側ごとに違えば {側: 人数}）。"""
     per = per_side if isinstance(per_side, dict) else {side: per_side for side in SIDES}
@@ -554,7 +655,7 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
         tracked, doubles_info = track_sides(people, frame_t, cfg, o)
     else:
         tracked = track_players(people, frame_t, cfg, o)
-    players = ground_jumps(tracked, camera, o)
+    players = uncertain_feet(ground_jumps(tracked, camera, o), camera, o)
     per_side = players_per_side(players)
     players.to_csv(out_dir / PLAYERS_FILE, index=False, float_format="%.4f")
     info = {
@@ -565,6 +666,9 @@ def analyze_players(video: str | Path, calib: str | Path, out_dir: str | Path, c
         "doubles": doubles_info,     # ダブルスの追跡の確かめ用の数（``per_side`` が 1 のときは None）
         "airborne": {s: round(float(players["airborne"][players["side"] == s].mean()), 4) if (players["side"] == s).any()
                      else 0.0 for s in SIDES},
+        # 足元が不確かなコマ（画面の端・ネットの帯・ほかの選手の枠。``uncertain_feet``）の割合
+        "foot_uncertain": {s: round(float(players["foot_uncertain"][players["side"] == s].mean()), 4)
+                           if (players["side"] == s).any() else 0.0 for s in SIDES},
         "provider": detector.provider,
         "detect_s": round(elapsed, 1), "options": o.to_dict(),
     }
@@ -609,7 +713,8 @@ def track_between(people: pd.DataFrame, frame_t: pd.Series, start_s: float, end_
                   cfg: dict[str, Any], o: PlayerOptions | None = None) -> pd.DataFrame:
     """``detect_in_windows`` の結果のうち、区間 [start_s, end_s] のコマだけで選手を追跡する（跳んだコマは床に直す）。"""
     ft = frame_t[(frame_t >= start_s) & (frame_t <= end_s)]
-    return ground_jumps(track_players(people[people["frame"].isin(ft.index)], ft, cfg, o), camera, o)
+    return uncertain_feet(ground_jumps(track_players(people[people["frame"].isin(ft.index)], ft, cfg, o), camera, o),
+                          camera, o)
 
 
 def write_preview(meta: Any, players: pd.DataFrame, people: pd.DataFrame, frame: int, path: Path,
