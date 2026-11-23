@@ -14,11 +14,54 @@ async function openVideo(path, captureFps) {
 // =====================================================================
 App.views.home = {
   title: "ホーム",
+
+  // ---- 開いている動画の状態と、次にすること（ROADMAP v2 の L2）
+  // 順番は「動画を選ぶ → コートを合わせる（基礎打ちの解析は合わせなしで先にできる）→ 解析する → 見る」
+  async renderStatus(el) {
+    const r = await api.get("/api/home");
+    if (!r.ok || !r.video) return;
+    const D = r.drill || {}, S = r.shots || {};
+    const next = r.next;
+    const row = (key, done, title, desc, btn) => `<div class="hs-row ${done ? "done" : ""} ${next === key ? "next" : ""}" data-k="${key}">
+        <span class="hs-mark">${done ? "✓" : next === key ? "→" : "・"}</span>
+        <div class="hs-body"><b>${title}</b><div class="muted small">${desc}</div></div>${btn}</div>`;
+    const nextText = { calib: "次にすること：コートを合わせる", shots: "次にすること：ショットの一覧を作る",
+      view: "次にすること：結果を見る" }[next] || "";
+    const drillDesc = D.done
+      ? `打った数 <b>${D.n_hits ?? "—"} 本</b>（1 分あたり ${fmt(D.hits_per_min, 1)} 本）。詳しい画面は準備中です。`
+      : "打った数と時刻を数えます。コート合わせがなくてもできます（練習の動画はここから）。";
+    const shotsDesc = S.done
+      ? `ショット <b>${S.n_shots ?? "—"} 本</b>（ラリー ${S.n_rallies ?? "—"}）を、種類と初速つきで並べました。`
+      : r.calibrated ? "すべての球を、種類と初速つきで並べます。" : "コートを合わせると作れます。";
+    const card = h(`<div class="card home-status"><div class="row" style="margin-bottom:6px">
+        <h2 style="margin:0;flex:1">この動画の進み具合</h2><span class="badge info">${esc(nextText)}</span></div>
+      ${row("video", true, "動画を開く", esc(r.video), "")}
+      ${row("drill", D.done, "基礎打ちの解析", drillDesc,
+        `<button class="btn sm ${!D.done && next === "calib" ? "" : "ghost"}" id="hs-drill">${D.done ? "解析し直す" : "基礎打ちを解析する"}</button>`)}
+      ${row("calib", r.calibrated, "コートを合わせる", r.calibrated ? "このカメラ位置のコート合わせは済んでいます。" :
+        "画面の位置を実際の距離にするために、コートのラインに合わせます（カメラを動かさなければ 1 回だけ）。",
+        `<button class="btn sm ${next === "calib" ? "primary" : "ghost"}" id="hs-calib">${r.calibrated ? "確かめる" : "コートを合わせる →"}</button>`)}
+      ${row("shots", S.done, "ショットの一覧を作る", shotsDesc,
+        `<button class="btn sm ${next === "shots" ? "primary" : "ghost"}" id="hs-shots" ${r.calibrated ? "" : "disabled"}>${S.done ? "一覧を見る" : "ショットの一覧へ →"}</button>`)}
+      ${row("view", next === "view", "結果を見る", S.done ? "1 枚のレポート（印刷して PDF にもできます）と、日ごとの記録。" : "ショットの一覧ができると見られます。",
+        `<button class="btn sm ${next === "view" ? "primary" : "ghost"}" id="hs-report" ${S.done ? "" : "disabled"}>レポートを開く</button>`)}
+      </div>`);
+    el.appendChild(card);
+    $("#hs-drill", card).onclick = () => Task.start("drill", {}, (okk) => {
+      toast(okk ? "基礎打ちの解析が終わりました" : "解析できませんでした（ログを見てください）", okk ? "ok" : "bad");
+      if (App.current === "home") go("home");
+    }, "基礎打ちの解析");
+    $("#hs-calib", card).onclick = () => go("calib");
+    $("#hs-shots", card).onclick = () => go("shots");
+    $("#hs-report", card).onclick = () => window.open("/report/shots", "_blank");
+  },
+
   async render(el) {
     const m = App.meta;
+    if (m) await this.renderStatus(el);
     el.appendChild(h(`<div class="hero">
       <div class="card">
-        <h2>スマッシュの初速を、動画から測ります</h2>
+        <h2>${m ? "スマッシュ 1 本を詳しく測るとき" : "スマッシュの初速を、動画から測ります"}</h2>
         <p class="desc">左のメニューの 1〜5 を順に進めるだけです。各画面に、何をすればよいかを書いてあります。</p>
         <div class="steps-intro">
           <div class="s"><span class="n">手順 1</span><b>スマッシュを選ぶ</b><span class="muted small">動画の中の 1 本を、時間の範囲で選びます</span></div>
@@ -36,7 +79,7 @@ App.views.home = {
           <span class="badge">${m.width}×${m.height}</span><span class="badge">${fmt(m.fps, 2)} fps${m.vfr ? "（可変）" : ""}</span>
           <span class="badge">${fmt(m.duration, 1)} 秒</span><span class="badge ${m.has_audio ? "ok" : "warn"}">音声${m.has_audio ? "あり" : "なし"}</span>
           ${m.slow ? `<span class="badge info">撮影 ${m.capture_fps} fps として換算</span>` : ""}</div>
-        <div class="row"><button class="btn primary" id="go1">手順 1 へ進む →</button><button class="btn" id="other">別の動画を開く</button></div></div>`));
+        <div class="row"><button class="btn" id="go1">手順 1 へ進む →</button><button class="btn" id="other">別の動画を開く</button></div></div>`));
       $("#go1", box).onclick = () => go("clip");
       $("#other", box).onclick = () => chooseVideo();
     } else {

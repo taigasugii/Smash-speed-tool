@@ -800,6 +800,20 @@ def run(kind: str):
                 args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
             title = "速さを重ねた動画を書き出す"
         t = start_task(title, [cli(*args)])
+    elif kind == "drill":
+        # 開いている動画の基礎打ちの解析（コート合わせはいらない。ホームの「基礎打ちを解析する」）
+        from smash_speed import video_queue as vq
+
+        if not st.get("video") or not Path(st["video"]).exists():
+            return err("先に動画を開いてください。")
+        item = vq.item_for(Path(st["video"]), root)
+        item.todo = ["drill"]          # 済んでいても、押したら解析し直す
+        args = vq.commands(item, root, cli, model=bool(b.get("model")), python=python_exe())[0]
+        if st.get("capture_fps"):
+            args += ["--capture-fps", str(st["capture_fps"])]
+        if st.get("audio"):
+            args += ["--audio", st["audio"]]
+        t = start_task("基礎打ちの解析", [args])
     elif kind == "queue":
         from smash_speed import video_queue as vq
 
@@ -866,6 +880,54 @@ def videos_dir() -> str:
                    .get("videos_dir") or "")
     except (OSError, json.JSONDecodeError):
         return ""
+
+
+def home_status() -> dict[str, Any]:
+    """開いている動画の状態と、次にすること（ホーム。ROADMAP v2 の L2）。
+
+    順番は「動画を選ぶ → コートを合わせる（基礎打ちの解析は合わせなしで先にできる）→ 解析する → 見る」。
+    ``next`` は、その順でまだの最初のもの：video・calib・shots・view。
+    """
+    from smash_speed import video_queue as vq
+    from smash_speed.shot_list import SHOT_LIST_FILE
+
+    out: dict[str, Any] = {"video": None, "calibrated": False, "drill": {"done": False}, "shots": {"done": False},
+                           "next": "video"}
+    v = S.state.get("video")
+    if S.meta is None or not v:
+        return out
+    stem = Path(v).stem
+    out["video"] = Path(v).name
+    cam = load_camera()
+    out["calibrated"] = bool(cam and not cam.get("error"))
+    dd = vq.drill_dir(out_root(), stem)
+    if (dd / vq.DRILL_DONE).exists():
+        try:
+            info = json.loads((dd / vq.DRILL_DONE).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = {}
+        out["drill"] = {"done": True, "dir": str(dd), "n_hits": info.get("n_hits"),
+                        "hits_per_min": info.get("hits_per_min"), "n_onsets": info.get("n_onsets"),
+                        "duration_s": info.get("duration_s") or (float(S.meta.timestamps[-1]) if S.meta else None)}
+    sd = Path(_shots_dir_for_video())
+    if (sd / SHOT_LIST_FILE).exists():
+        try:
+            info = json.loads((sd / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = {}
+        same = Path(str(info.get("video") or "")).name.lower() == Path(v).name.lower()
+        out["shots"] = {"done": same, "dir": str(sd), "n_shots": info.get("n_hits"), "n_rallies": info.get("n_rallies")}
+    out["next"] = "calib" if not out["calibrated"] else ("shots" if not out["shots"]["done"] else "view")
+    return out
+
+
+def _shots_dir_for_video() -> str:
+    return S.state.get("shots_dir") or str(out_root() / f"{Path(S.state['video']).stem}_shots")
+
+
+@app.get("/api/home")
+def home():
+    return ok(**home_status())
 
 
 @app.get("/api/queue")
