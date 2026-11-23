@@ -5,8 +5,8 @@
 Python の手間になる。ここでは、同じ段階の当てはめをまとめて、
 
 1. 当てはめの手順は ``physics.fit_plan`` をそのまま使う（初期値・事前分布・初速の上限の罰・信頼区間は同じ）。
-2. 最小 2 乗は、scipy の ``least_squares``（``method="trf"``・``x_scale="jac"``・数値微分のヤコビアン）と同じ手順を
-   問題ごとに進める（``_trf``。信頼領域・終わりの判定・頑健な損失は scipy の関数をそのまま呼ぶ）。
+2. 最小 2 乗は、scipy の ``least_squares``（``method="trf"``・``x_scale="jac"``・数値微分のヤコビアン。動かす幅は
+   ``physics.fd_steps`` で、1 つずつ解くときと同じ）と同じ手順を問題ごとに進める（``_trf``。信頼領域・終わりの判定・頑健な損失は scipy の関数をそのまま呼ぶ）。
 3. 残差の計算（運動方程式の積分・投影）だけを、全部の問題の全部の試す点について 1 回の配列の計算にまとめる
    （``_Evaluator``）。
 
@@ -37,14 +37,13 @@ from typing import Any, Generator, Sequence
 import numpy as np
 from numpy.linalg import norm, svd
 
-from smash_speed.physics import MAX_SIM_SPEED_MPS, SPEED_PENALTY_SIGMA_MPS, FitResult, LsqRequest, fit_plan
+from smash_speed.physics import MAX_SIM_SPEED_MPS, SPEED_PENALTY_SIGMA_MPS, FitResult, LsqRequest, fd_steps, fit_plan
 
 try:  # scipy の least_squares（trf）と同じ手順にするため、中の関数をそのまま使う
     from scipy.optimize import OptimizeResult
     from scipy.optimize._lsq.common import (check_termination, compute_grad, compute_jac_scale, evaluate_quadratic,
                                             scale_for_robust_loss_function, solve_lsq_trust_region, update_tr_radius)
     from scipy.optimize._lsq.least_squares import TERMINATION_MESSAGES, construct_loss_function
-    from scipy.optimize._numdiff import _compute_absolute_step
     AVAILABLE = True
 except ImportError:  # scipy の中の名前が変わったら、1 つずつの当てはめ（CPU）に戻す
     AVAILABLE = False
@@ -486,7 +485,7 @@ def solve_batch(reqs: Sequence[LsqRequest]) -> list[Any]:
             thetas, dxs = [], []
             for a in active:
                 x = x_try[a]
-                h = _compute_absolute_step(sub[a].kwargs["diff_step"], x, x, "2-point")
+                h = fd_steps(sub[a].kwargs["diff_step"], x, sub[a].step_floor)
                 X = np.repeat(x[None], len(x) + 1, axis=0)
                 X[1 + np.arange(len(x)), np.arange(len(x))] = x + h
                 thetas.append(X)
