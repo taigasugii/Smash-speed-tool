@@ -428,25 +428,41 @@ def predict(data_dir: Path, ckpt: Path, out: Path | None = None, batch: int = 2,
 # =============================================================================
 # 答え合わせ（.venv）
 # =============================================================================
-def heatmap_point(hm: np.ndarray, threshold: float = 0.5) -> tuple[float, float] | None:
+POINT_CENTERS = ("box", "weighted")
+# 塊の中心の取り方。"box" は TrackNetV3 の predict.py と同じ外枠の中心、"weighted" は熱の重み付きの中心（I8、2026-11-24）。
+# weighted は答え合わせ用のコマの位置のずれの中央値を 4.48 → 4.00 px（4K）・3.06 → 2.72 px に下げるが、ショットの一覧の
+# 初速の正しい初速との |差|/σ の合計（A4 の 11 本）が 6.44 → 7.29 に悪くなったので、既定は box のまま（docs/gpu.md）
+POINT_CENTER = "box"
+
+
+def heatmap_point(hm: np.ndarray, threshold: float = 0.5, center: str | None = None) -> tuple[float, float] | None:
     """熱の地図（0〜1 か 0〜255）から、閾値を超えたいちばん大きな塊の中心（288×512 の px）。なければ None。
 
-    TrackNetV3 の ``predict.py`` と同じく、塊の外枠の中心を使う。
+    ``center``（None なら ``POINT_CENTER``）が ``"box"``（既定）なら塊の外枠の中心（TrackNetV3 の ``predict.py`` と同じ。
+    熱の地図の格子の半分（4K で 3.75 px）に丸まる）、``"weighted"`` なら塊の画素の熱の重み付きの中心。座標は画素の左上が 0
+    （画素の中心は +0.5。外枠の中心と同じ取り方）。
     """
     import cv2
 
+    center = center or POINT_CENTER
+    if center not in POINT_CENTERS:
+        raise ValueError(f"塊の中心の取り方は {', '.join(POINT_CENTERS)} のどれかにしてください: {center!r}")
     scale = 255.0 if hm.dtype == np.uint8 else 1.0
     binary = (hm >= threshold * scale).astype(np.uint8)
-    n, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if n <= 1:
         return None
     i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     x, y, w, h = stats[i, :4]
-    return x + w / 2.0, y + h / 2.0
+    if center == "box":
+        return x + w / 2.0, y + h / 2.0
+    ys, xs = np.nonzero(labels[y:y + h, x:x + w] == i)
+    v = np.asarray(hm[y:y + h, x:x + w], float)[ys, xs]
+    return float(x + (xs + 0.5) @ v / v.sum()), float(y + (ys + 0.5) @ v / v.sum())
 
 
-def predictions_table(data_dir: Path, heat: np.ndarray, threshold: float = 0.5):
-    """熱の地図を、フォルダーごとの元の解像度の予測（frame, x_px, y_px, visible）にする。"""
+def predictions_table(data_dir: Path, heat: np.ndarray, threshold: float = 0.5, center: str | None = None):
+    """熱の地図を、フォルダーごとの元の解像度の予測（frame, x_px, y_px, visible）にする（点は ``heatmap_point``）。"""
     import pandas as pd
 
     meta = json.loads((Path(data_dir) / "meta.json").read_text(encoding="utf-8"))
@@ -458,7 +474,7 @@ def predictions_table(data_dir: Path, heat: np.ndarray, threshold: float = 0.5):
         sx, sy = dm["width"] / WIDTH, dm["height"] / HEIGHT
         for j in range(n):
             hm = np.asarray(heat[k, j])
-            pt = heatmap_point(hm, threshold)
+            pt = heatmap_point(hm, threshold, center)
             rows.append({"dir": int(di), "frame": int(s) + j, "visible": int(pt is not None),
                          "x_px": pt[0] * sx if pt else np.nan, "y_px": pt[1] * sy if pt else np.nan,
                          "peak": float(hm.max()) / (255.0 if hm.dtype == np.uint8 else 1.0)})
@@ -550,7 +566,7 @@ def split_tracks(frames: np.ndarray, x: np.ndarray, y: np.ndarray, width: float,
 
 
 def detections_from_heat(data_dir: Path, heat_path: Path, threshold: float = 0.5, out: Path | None = None,
-                         max_jump: float = MAX_JUMP, max_gap: int = MAX_GAP):
+                         max_jump: float = MAX_JUMP, max_gap: int = MAX_GAP, center: str | None = None):
     """``build_video`` で書き出した区間の熱の地図を、今の検出と同じ形の表（``frame, timestamp, x_px, y_px,
     visible, confidence, track_id, heat``。座標は元の解像度）にする。``out`` があれば CSV に書く。
 
@@ -563,7 +579,7 @@ def detections_from_heat(data_dir: Path, heat_path: Path, threshold: float = 0.5
     data_dir = Path(data_dir)
     meta = json.loads((data_dir / "meta.json").read_text(encoding="utf-8"))
     ft = np.load(data_dir / "frame_times.npy")
-    pred = predictions_table(data_dir, np.load(heat_path, mmap_mode="r"), threshold).set_index("frame")
+    pred = predictions_table(data_dir, np.load(heat_path, mmap_mode="r"), threshold, center).set_index("frame")
     frames = ft[:, 0].astype(int)
     pred = pred.reindex(frames)   # 埋めたコマ（区間の外）を落とす
     det = pd.DataFrame({"frame": frames, "timestamp": ft[:, 1], "x_px": pred.x_px.to_numpy(float),
