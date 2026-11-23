@@ -46,6 +46,10 @@ N_SHIFT = 2
 SHIFT_MARGIN = 5.0
 # 取り違えを直した候補で、動かさなかったラインが画像の上で動いてよい量 [px]（横 1920 px に換算）
 SHIFT_KEEP_PX = 6.0
+# 消失点からの向きの候補のうち、世界の上向きが画像の上からこれより傾くもの（縦の消失点を床の向きに取った、壁を床と
+# みなす向き）は使わない [°]。体育館の壁・客席の手すりの線分が床のラインより多い動画（練習の動画 IMG_5288）では、
+# 壁を床とみなした向きの方が線分の点数が高くなり、正しい向きの候補が残らない（H1）
+MAX_TILT_DEG = 60.0
 
 
 @dataclass
@@ -277,6 +281,11 @@ def _joint_score(L: dict[str, np.ndarray], lines, z: float, Cn: np.ndarray, Ca: 
     return out
 
 
+def _tilt_deg(R: np.ndarray) -> float:
+    """向き ``R``（列 = 世界の軸のカメラでの向き）で、世界の上向きが画像の上（カメラの −y）からどれだけ傾くか [°]。"""
+    return float(np.degrees(np.arccos(np.clip(-R[1, 2], -1.0, 1.0))))
+
+
 def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_candidates: int = 6,
                          cam_sigma_m: float = 3.0, heights_m: np.ndarray | None = None,
                          n_peaks: int = 6, n_check: int = 40,
@@ -301,7 +310,7 @@ def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_can
     segs, wts, vps = _floor_segments(frame)
     if len(vps) < 2:
         return []
-    hyps = rotation_hypotheses(vps, (h, w))
+    hyps = [hy for hy in rotation_hypotheses(vps, (h, w)) if _tilt_deg(hy.R) < MAX_TILT_DEG]
     z = np.arange(0.3, 4.01, 0.05) if heights_m is None else np.asarray(heights_m, float)
     span = 2.0 * cam_sigma_m
     step = 0.03
@@ -411,6 +420,46 @@ def camera_from_homography(Hm: np.ndarray, shape: tuple[int, int]) -> tuple[np.n
     return None if C is None else (K, C)
 
 
+def floor_depths(Hm: np.ndarray, K: np.ndarray, XY: np.ndarray) -> np.ndarray | None:
+    """内部パラメータ ``K`` のカメラで床のホモグラフィ ``Hm`` に写る床の点 ``XY`` の、カメラからの奥行きの符号つきの大きさ。
+
+    負ならカメラの後ろ（ホモグラフィでは画像の中に写ってしまう）。カメラが床より上にある向きに符号を決める。
+    """
+    B = np.linalg.inv(K) @ Hm
+    n = float(np.linalg.norm(B[:, 0]))
+    if not np.isfinite(B).all() or n < 1e-12:
+        return None
+    B = B / n
+    R = np.c_[B[:, 0], B[:, 1], np.cross(B[:, 0], B[:, 1])]
+    if float(-(R.T @ B[:, 2])[2]) < 0:                     # カメラの高さが負なら符号を逆にする
+        B = -B
+    return np.c_[XY, np.ones(len(XY))] @ B[2]
+
+
+def _support_points(Hm: np.ndarray, K: np.ndarray | None, shape: tuple[int, int],
+                    table: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """吸い付けの手がかりの点（実寸、画像）。ふつうはコートの四隅。
+
+    四隅のどれかがカメラの後ろにある（ネットの近くの横・コートの中から撮った）ときは、四隅の代わりに、カメラの前にあって
+    画像に写る床のランドマークを使う。``refine`` は 1 点目をカメラの前の点とみなすので、後ろの角が 1 点目だと、
+    写っているラインを全部「後ろ」として測らなくなる（H1）。
+    """
+    P = _apply_h(Hm, _CORNERS)
+    if K is None:
+        cam = camera_from_homography(Hm, shape)
+        if cam is None:
+            return _CORNERS, P
+        K = cam[0]
+    dep = floor_depths(Hm, K, _CORNERS)
+    if dep is None or (dep > 0).all():
+        return _CORNERS, P
+    h, w = shape
+    L = np.array([v[:2] for v in table.values() if abs(float(v[2])) < 1e-6], float)
+    uv = _apply_h(Hm, L)
+    ok = (floor_depths(Hm, K, L) > 0) & np.isfinite(uv).all(axis=1) & (uv[:, 0] >= 0) & (uv[:, 0] < w) &         (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    return (L[ok], uv[ok]) if ok.sum() >= 4 else (_CORNERS, P)
+
+
 def _orient_by_camera(Hm: np.ndarray, shape: tuple[int, int], cam_xy: tuple[float, float]) -> np.ndarray:
     """コートを 180° 回した方が、カメラの位置が手順 ① の位置に近くなるなら回す。"""
     d = []
@@ -461,11 +510,11 @@ def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int
         starts += vanishing_candidates(frame, cam_xy, max_candidates,
                                        progress=lambda f, m: report(0.1 + 0.25 * f, m))
     def snap_one(H0: np.ndarray, K: np.ndarray | None) -> Proposal | None:
-        P = _apply_h(H0, _CORNERS)
+        W, P = _support_points(H0, K, (h, w), table)
         if not np.isfinite(P).all():
             return None
         try:
-            res = snapper.refine(frame, H0, _CORNERS, P, table, sigma=np.full(4, 4.0), lab=lab)
+            res = snapper.refine(frame, H0, W, P, table, sigma=np.full(len(W), 4.0), lab=lab)
         except (ValueError, np.linalg.LinAlgError):
             return None
         if res.color is None:
