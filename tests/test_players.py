@@ -200,3 +200,51 @@ def test_ground_jumps_fills_the_floor_position_while_airborne():
     assert not air[(t < 0.9) | (t > 1.6)].any()
     np.testing.assert_allclose(p["u"], raw["u"])            # 画像の上の足元は検出のまま
     assert ground_jumps(raw.iloc[:0], cam).empty
+
+
+def _box_track(camera, t, feet, height_m=1.7):
+    """足元の位置（n, 2）に立つ人の枠（足元と頭の上を写した縦の線の幅 0.5 m）を ``players.csv`` の形にする。"""
+    import pandas as pd
+
+    feet = np.asarray(feet, float)
+    n = len(t)
+    foot = camera.project(np.column_stack([feet, np.zeros(n)]))
+    head = camera.project(np.column_stack([feet, np.full(n, height_m)]))
+    half = 0.15 * (foot[:, 1] - head[:, 1])
+    return pd.DataFrame({"frame": np.arange(n), "t": t, "side": "h", "player": 0, "x": feet[:, 0], "y": feet[:, 1],
+                         "u": foot[:, 0], "v": foot[:, 1], "x0": foot[:, 0] - half, "y0": head[:, 1],
+                         "x1": foot[:, 0] + half, "y1": foot[:, 1], "score": 0.9, "interpolated": False,
+                         "airborne": False})
+
+
+def test_uncertain_feet_marks_the_bottom_edge_and_fills_short_gaps():
+    from smash_speed.config import load_config
+    from smash_speed.players import uncertain_feet
+    from smash_speed.synth_rally import rally_camera
+
+    cam = rally_camera(load_config())
+    t = np.arange(0, 3, 1 / 30)
+    feet = np.column_stack([np.linspace(-6.0, -3.0, len(t)), np.zeros(len(t))])
+    pl = _box_track(cam, t, feet)
+    # 1.0〜1.3 秒は足が画面の下の外：枠の下の辺が画面の下の端で切れ、床へ投影した位置が奥へ跳ぶ
+    cut = (t >= 1.0) & (t < 1.3)
+    pl.loc[cut, "y1"] = cam.height - 1
+    pl.loc[cut, "x"] += 2.0
+    out = uncertain_feet(pl, cam)
+    assert out["foot_uncertain"].to_numpy().tolist() == cut.tolist()
+    assert np.allclose(out.loc[cut, "x"], feet[cut, 0], atol=0.05)
+    assert "foot_noise_m" in out and np.all(out["foot_noise_m"] > 0)
+
+
+def test_foot_noise_is_larger_for_the_far_player():
+    from smash_speed.config import load_config
+    from smash_speed.players import foot_noise_m
+    from smash_speed.synth_rally import rally_camera
+
+    cam = rally_camera(load_config())
+    t = np.zeros(1)
+    pts = sorted(([-1.0, 2.5], [-1.0, -2.5], [-5.0, 0.0], [5.0, 0.0]),
+                 key=lambda p: float(np.hypot(p[0] - cam.center[0], p[1] - cam.center[1])))
+    near = foot_noise_m(_box_track(cam, t, [pts[0]]), cam)[0]
+    far = foot_noise_m(_box_track(cam, t, [pts[-1]]), cam)[0]
+    assert far > near
