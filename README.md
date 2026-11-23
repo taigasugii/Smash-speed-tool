@@ -237,6 +237,11 @@ smash-speed calibrate --video smash01.mp4 --time 12.0 --out calib.json
 - クリックの座標を JSON（`{"ランドマーク名": [u, v], ...}`）で渡して GUI なしでも推定できる（`--points pts.json --no-gui`）。
 - クリックなしの候補は `smash-speed propose-calib --video smash02.mp4 --time 3.0 --cam=-8,-7 --out props.json`
   （`--cam` はカメラのおおよその位置 x,y [m]。候補ごとの点と、ラインで測れたかどうか（`snapped`）を書く。1 コマ 1〜1.5 分）。
+  ラインに吸い付けるときはレンズの樽型のゆがみも一緒に求め（ラインが両方の向きに 2 本以上ずつ・6 本以上測れたとき）、
+  上位で点数の近い候補は「ラインを 1 本取り違えた形」も吸い付けて比べる（測れたランドマークの多い方を上に）。
+- 床の点だけだと高さの向き（焦点距離・カメラの傾き）の誤差が残ることがある。ネットの上の白い帯の上の点を、横方向の位置が
+  分からないまま高さの手がかりに足せる（`smash_speed.calibration.solve.calibrate(..., net_band=画像の点)`。帯の高さは支柱で
+  1.55 m・中央で 1.524 m。GUI で置けるようにするのは今後）。
 - レンズの歪みが大きい（超広角など）場合は `--k1`、またはチェッカーボードで内部パラメータを求めて `--intrinsics` で渡す
   （`smash_speed.calibration.solve.intrinsics_from_checkerboard`）。
 
