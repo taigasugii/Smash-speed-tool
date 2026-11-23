@@ -518,3 +518,20 @@ def test_track_table_drops_a_slow_track_that_hardly_moves():
     assert not tab.loc[0, "keep"] and tab.loc[1, "keep"]
     flt.min_image_speed = 0.0
     assert track_table(det, CAM, CFG, flt).keep.all()
+
+
+def test_tracknet_hint_tells_how_to_export_the_onnx_model(tmp_path, monkeypatch):
+    """既定のモデルのファイルはあるのに動かせない PC だけ、ONNX に書き出す手順を出す（K1）。"""
+    import smash_speed.train.tracknet_train as tt
+    from smash_speed.shot_list import tracknet_hint
+
+    model = tmp_path / "model_ft1.pt"
+    cfg = {"detection": {"shot_list_model": str(model)}}
+    monkeypatch.setattr(tt, "can_predict", lambda *a, **k: False)
+    assert tracknet_hint(cfg) is None                          # モデルがなければ何も言わない
+    model.write_bytes(b"")
+    hint = tracknet_hint(cfg)
+    assert "model_ft1.onnx" in hint and "smash_speed.train.onnx_export" in hint and str(model) in hint
+    monkeypatch.setattr(tt, "can_predict", lambda *a, **k: True)
+    assert tracknet_hint(cfg) is None                          # 動かせるなら要らない
+    assert tracknet_hint({}) is None
