@@ -108,6 +108,8 @@ class ShotListOptions:
                                       # となりのショットと合わせ、長いショットからシャトルの終端速度も求める）
     joint_options: JointOptions | None = None
     footwork: bool = False            # ショットごとのフットワークと出来の目安も出す（``footwork``。選手の位置も出す）
+    priors: ShotPriors | None = None  # 打点・飛行の目安の選び方（``shot_fit.ShotPriors``。None なら既定：サーブの打点の高さの
+                                      # 上限だけ。サーブの深さ・次の打つ人の足元は選べる機能）
     fit_backend: str = "auto"         # 当てはめの計算の仕方（``shot_fit.run_fits``）："cpu"（1 つずつプロセスで並べる）、
                                       # "batch"（段階ごとにまとめて解く。ROADMAP F3e）、"auto"（batch が使えれば batch）
 
@@ -719,7 +721,7 @@ def analyze_video(o: ShotListOptions, cfg: dict[str, Any], progress: Callable[[s
     shots = analyze_hits(det, hits, camera, phys, cfg, o.rally_gap_s, workers=workers, progress=progress,
                          players=players if o.hitter_prior else None,
                          joint=(o.joint_options or JointOptions()) if o.joint_fit else None, joint_info=joint_info,
-                         fit_backend=o.fit_backend)
+                         fit_backend=o.fit_backend, priors=o.priors)
     lap("fit")
     rallies = split_rallies(shots, det, RallyOptions(max_gap_s=o.rally_gap_s), cfg.get("court"))
     write_shots(out / SHOTS_FILE, shots)
@@ -885,6 +887,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--joint-fit", action="store_true",
                     help="ラリーの中のショットをつないでまとめて当てはめ直す（終端速度も長いショットから求める）")
     ap.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit で、終端速度は設定の値のままにする")
+    ap.add_argument("--serve-depth", type=float, nargs=2, default=None, metavar=("MEAN", "SD"),
+                    help="ラリーの最初の打球をサーブとみなし、打点のネットからの深さの目安（平均・標準偏差 [m]）にする"
+                         "（打つ人の足元が分かるショットは足元を使う）")
+    ap.add_argument("--receiver-end", type=float, nargs="?", const=1.0, default=None, metavar="SIGMA",
+                    help="次に打つ人の足元を、飛行の終わりの目安にする（--players と一緒に。水平の不確かさ [m]、既定 1.0）")
     ap.add_argument("--fit-backend", default="auto", choices=["auto", "cpu", "batch"],
                     help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く、auto：batch が使えれば batch）")
     ap.add_argument("--config", type=Path, default=None)
@@ -898,7 +905,10 @@ def main(argv: list[str] | None = None) -> None:
                                          tracknet=tracknet, tracknet_threshold=a.tracknet_threshold,
                                          tracknet_fallback=fallback, joint_fit=a.joint_fit,
                                          joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
-                                         fit_backend=a.fit_backend), cfg)
+                                         fit_backend=a.fit_backend,
+                                         priors=ShotPriors(serve_depth_m=None if a.serve_depth is None
+                                                           else tuple(a.serve_depth), receiver_sigma_m=a.receiver_end)),
+                cfg)
     print("、".join(f"{v['label']} {v['n']} 本" + (f"（最高 {v['max_kmh']:.0f} km/h）" if v["max_kmh"] else "")
                    for v in info["by_type"].values()))
 

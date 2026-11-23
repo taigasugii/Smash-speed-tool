@@ -186,7 +186,11 @@ class _Evaluator:
         self.uv = np.vstack(tgt_img) if tgt_img else np.zeros((0, 2))
         self.X = np.vstack(tgt_pts) if tgt_pts else np.zeros((0, 3))
         self.cam = np.concatenate(cam_list) if cam_list else np.zeros(0, int)
-        self.s_max = np.array([max(float(self.s[self.obs_off[r]:self.obs_off[r + 1]].max(initial=0.0)), 0.0)
+        # 飛行の終わりの目安（``physics._Model.end_prior``）の、打った時刻からの時間 [s]（なければ NaN）
+        self.s_end = np.array([q.model.end_prior[0] - q.t_ref if q.kind == "image" and q.model.end_prior is not None
+                               else np.nan for q in self.reqs], float)
+        self.s_max = np.array([max(float(self.s[self.obs_off[r]:self.obs_off[r + 1]].max(initial=0.0)), 0.0,
+                                   float(np.nan_to_num(self.s_end[r], nan=0.0)))
                                for r in range(R)])
         # 問題ごとの、パラメータから位置・速度への変換の値
         self.n_kin = np.array([q.model.n_kin for q in self.reqs])
@@ -208,7 +212,8 @@ class _Evaluator:
         md = q.model
         if q.kind == "points":
             return int(md.max_speed is not None)
-        return 2 * (md.n_plane > 0) + 3 * (md.p0_prior is not None) + int(md.max_speed is not None)
+        return (2 * (md.n_plane > 0) + 3 * (md.p0_prior is not None) + int(md.max_speed is not None)
+                + 2 * (md.end_prior is not None))
 
     def evaluate(self, rid: np.ndarray, theta: list[np.ndarray]) -> list[np.ndarray]:
         """問題 ``rid[i]`` の試す点 ``theta[i]``（(n_i, パラメータの数)）の残差（(n_i, 残差の数)）のリスト。"""
@@ -278,6 +283,12 @@ class _Evaluator:
         pos = p0[pv] + H[:, None] * np.stack([ex, ey, np.zeros(V)], axis=1)[pv]
         pos[:, 2] += Z
         pos[~good] = np.nan
+        # 飛行の終わりの目安の時刻の水平の位置（目安のある問題の点だけ）
+        pos_end = np.full((V, 2), np.nan)
+        has_end = np.isfinite(self.s_end[vr]) & (tcol >= 0)
+        if has_end.any():
+            He, _ = interpolate(grid, hist, tcol[has_end], self.s_end[vr][has_end])
+            pos_end[has_end] = p0[has_end, :2] + He[:, None] * np.stack([ex, ey], axis=1)[has_end]
         # ---- 残差（画像の上 [px] または 3 次元 [m]。計算できない所は 1e3 の罰）
         img = self.kind_img[vr][pv]
         res_img = np.full((P, 2), np.nan)
@@ -313,6 +324,10 @@ class _Evaluator:
                 if md.max_speed is not None:
                     F[:, col_] = _quadratic(md.speed_weight * np.maximum(speed[sl] - md.max_speed, 0.0)
                                             / SPEED_PENALTY_SIGMA_MPS, md.huber_px)
+                    col_ += 1
+                if md.end_prior is not None:   # ``physics._Model.end_residuals``
+                    re = md.prior_px * (pos_end[sl] - md.end_prior[1]) / md.end_prior[2]
+                    F[:, col_:col_ + 2] = _quadratic(np.where(np.isfinite(re), re, 1e3), md.huber_px)
             elif md.max_speed is not None:
                 F[:, col_] = md.speed_weight * np.maximum(speed[sl] - md.max_speed, 0.0) / SPEED_PENALTY_SIGMA_MPS
             out.append(F)
@@ -478,8 +493,10 @@ def _chunks(sizes: list[int], limit: int) -> list[tuple[int, int]]:
 
 def _batchable(q: LsqRequest) -> bool:
     kw = q.kwargs
+    end = getattr(q.model, "end_prior", None)   # 飛行の終わりの目安は、打った時刻より後のときだけまとめて解く
     return (kw.get("x_scale") == "jac" and kw.get("method", "trf") == "trf" and kw.get("jac", "2-point") == "2-point"
-            and kw.get("bounds") is None and kw.get("diff_step") is not None)
+            and kw.get("bounds") is None and kw.get("diff_step") is not None
+            and (end is None or (q.kind == "image" and end[0] >= q.t_ref)))
 
 
 def solve_batch(reqs: Sequence[LsqRequest]) -> list[Any]:
