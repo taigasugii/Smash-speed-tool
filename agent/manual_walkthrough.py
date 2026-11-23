@@ -34,7 +34,7 @@ BROWSERS = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Google\Chrome\Application\chrome.exe"]
 # 左のメニューの項目（``static/core.js`` の NAV）。手引きにすべて出てくることも確かめる
 MENU = ["ホーム", "スマッシュを選ぶ", "コートを合わせる", "打つ人と着地点", "解析する", "結果", "いちばん速いスマッシュ",
-        "ショットの一覧", "フォームを比べる", "関節・打点を付ける", "結果の一覧", "記録の推移", "研究ツール",
+        "ショットの一覧", "まとめて解析", "フォームを比べる", "関節・打点を付ける", "結果の一覧", "記録の推移", "研究ツール",
         "開発エージェント", "設定"]
 
 
@@ -147,15 +147,22 @@ class Walk:
           bs.sort((a, b) => a.textContent.length - b.textContent.length);
           if (!bs.length) return false; bs[0].click(); return true; }})()"""))
 
-    def wait_task(self, timeout: float = 900.0) -> str:
-        """画面の下の処理が終わるまで待ち、終わり方（done / failed / cancelled）を返す。"""
-        self.wait("!document.querySelector('#taskbar').classList.contains('hidden')", 20)
+    def task_id(self) -> str | None:
+        return self.c.js("Task.id")
+
+    def wait_task(self, prev: str | None, timeout: float = 900.0) -> str:
+        """``prev`` の後に始まった処理（画面の下）が終わるまで待ち、終わり方（done / failed / cancelled）を返す。
+        ``prev`` が今の処理なら、その処理を待つ。"""
+        if not self.wait(f"Task.id && Task.id !== {json.dumps(prev)}", 30):
+            if prev is None:
+                return "not started"
+        tid = self.task_id() or prev
         t0 = time.time()
         while time.time() - t0 < timeout:
-            st = self.c.js("(document.querySelector('#task-status') || {}).textContent || ''")
-            hidden = self.c.js("document.querySelector('#taskbar').classList.contains('hidden')")
-            if hidden or any(w in st for w in ("完了", "終わり", "失敗", "中止", "できませんでした")):
-                return st or "done"
+            r = json.loads(urllib.request.urlopen(f"{self.base}/api/task/{tid}?since=999999", timeout=10).read())
+            if r.get("status") != "running":
+                time.sleep(1.5)       # 画面が終わりを受け取って次の画面へ移るまで
+                return r.get("status", "")
             time.sleep(1.0)
         return "timeout"
 
@@ -175,7 +182,21 @@ class Walk:
         if img.shape[1] > width:
             img = cv2.resize(img, (width, int(img.shape[0] * width / img.shape[1])), interpolation=cv2.INTER_AREA)
         self.shots_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(self.shots_dir / f"{name}.png"), img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+        try:   # 画面の写真は色が少ないので、256 色にして小さくする
+            from PIL import Image
+
+            Image.fromarray(img[..., ::-1]).quantize(256).save(self.shots_dir / f"{name}.png", optimize=True)
+        except ImportError:
+            cv2.imwrite(str(self.shots_dir / f"{name}.png"), img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+
+
+def _wait_file(p: Path, timeout: float) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if p.exists():
+            return True
+        time.sleep(1.0)
+    return False
 
 
 STATE_FILE = ROOT / "outputs" / "web_state.json"   # GUI の状態（``webapp.server.STATE_FILE``）
@@ -237,7 +258,7 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
 
         # ---- スマッシュの初速：お試し用の動画で手順 1〜5
         w.step("「お試し用の動画を作って開く」", w.click("お試し用の動画を作って開く"))
-        w.wait_task(300)
+        w.wait_task(None, 300)
         w.step("手順 4「解析する」の画面になる", w.wait("App.current === 'analyze' && App.meta", 60))
         for v in ("clip", "calib", "plane"):
             c.js(f"go('{v}')")
@@ -248,8 +269,9 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
         c.js("go('analyze')")
         time.sleep(1.0)
         w.shot("analyze")
+        prev = w.task_id()
         w.step("「▶ 解析する」", w.click("▶ 解析する"))
-        st = w.wait_task(600)
+        st = w.wait_task(prev, 600)
         w.step("解析が終わる", w.wait("App.current === 'result'", 60), st)
         time.sleep(2.0)
         speed = c.js("(document.querySelector('#content').innerText.match(/([0-9.]+)\\s*km\\/h/) || [])[1] || ''")
@@ -271,8 +293,9 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
         w.menu("ショットの一覧")
         w.step("ショットの一覧の画面", w.wait("App.current === 'shots'", 10))
         w.shot("shots_start")
+        prev = w.task_id()
         w.step("「解析を始める」", w.click("解析を始める"))
-        st = w.wait_task(900)
+        st = w.wait_task(prev, 900)
         w.step("ショットの一覧ができる", w.wait("document.querySelector('#content table')", 60), st)
         time.sleep(1.5)
         n = c.js("document.querySelectorAll('#content table tbody tr').length")
@@ -280,6 +303,51 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
         w.shot("shots")
         rep = urllib.request.urlopen(base + "/report/shots", timeout=120).status
         w.step("「レポートを開く」のページ", rep == 200)
+
+        # ---- まとめて解析：合成の動画 3 本（1 本はコート合わせつき）を順に解析・途中で止める・続きから（L3）
+        vdir = work / "videos"
+        vdir.mkdir(exist_ok=True)
+        now = time.time()
+        for i in range(3):
+            d = work / f"q{i}"
+            if not (d / "rally.mp4").exists():
+                subprocess.run([sys.executable, "-m", "smash_speed.synth_rally", str(d), "--shots", "6", "--fps", "60",
+                                "--seed", str(10 + i)], cwd=ROOT, env=env, check=True, stdout=subprocess.DEVNULL)
+            v = vdir / f"drill_{i + 1}.mp4"
+            shutil.copy(d / "rally.mp4", v)
+            os.utime(v, (now - 100 + i, now - 100 + i))
+        shutil.copy(work / "q0" / "calibration.json", work / "drill_1_calibration.json")
+        c.js(f"App.save({{videos_dir: {json.dumps(str(vdir))}}})")
+        w.menu("まとめて解析")
+        w.step("まとめて解析の画面に 3 本", w.wait("App.current === 'queue' && "
+                                                 "document.querySelectorAll('#content tbody tr').length === 3", 15))
+        w.shot("queue")
+        t0 = time.time()
+        prev = w.task_id()
+        w.step("「選んだ動画を順に解析する」", w.click("選んだ動画を順に解析する"))
+        w.wait(f"Task.id && Task.id !== {json.dumps(prev)}", 30)
+        qid = w.task_id()
+        w.step("1 本目の基礎打ちの解析が終わる", _wait_file(work / "drills" / "drill_1" / "drill_detect.json", 600))
+        w.click("中止", "document.querySelector('#taskbar')")
+        st = w.wait_task(qid, 180)
+        w.step("「中止」で止まる", st == "cancelled", st)
+        time.sleep(2.0)
+        c.js("go('queue')")
+        time.sleep(2.0)
+        todo = c.js("[...document.querySelectorAll('#content tbody input')].map(x => !x.disabled)")
+        drills = [(work / "drills" / f"drill_{i + 1}" / "drill_detect.json").exists() for i in range(3)]
+        w.step("止めた所までが済み・残りはまだ", drills[0] and not drills[2] and bool(todo) and todo[2],
+               f"基礎打ちの解析 済み {drills}、選べる（まだ）{todo}")
+        w.step("もう一度押して続きから", w.click("選んだ動画を順に解析する"))
+        st = w.wait_task(qid, 1800)
+        time.sleep(2.0)
+        c.js("go('queue')")
+        time.sleep(2.0)
+        todo = c.js("[...document.querySelectorAll('#content tbody input')].filter(x => !x.disabled).length")
+        w.step("3 本とも済み（ショットの一覧はコート合わせのある 1 本だけ）",
+               todo == 0 and (work / "drill_1_shots" / "shot_list.json").exists() and not (work / "drill_2_shots").exists(),
+               f"{st}、合わせて {time.time() - t0:.0f} 秒")
+        w.shot("queue_done")
 
         # ---- 記録の推移・結果の一覧・そのほかの画面
         w.menu("記録の推移")
