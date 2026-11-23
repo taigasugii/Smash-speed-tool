@@ -4,7 +4,9 @@
    （全自動はいちばんよい 1 つだけを使うが、ラインの取り違えで 2 番目以降が正しいことがある）
 2. 候補ごとに、四隅の予想位置を「おおよそのクリック」として半自動と同じ方法（``CourtSnapper.refine``）で
    ラインに吸い付けて詰める
-3. 詰めたあとのラインらしさで並べ、同じコートになったものをまとめて、上から ``n`` 個を返す
+3. 詰めたあとのラインらしさ（＋測れたランドマークの数）で並べ、同じコートになったものをまとめて、上から ``n`` 個を返す。
+   上位の候補は、ラインを 1 本取り違えた形（いちばん遠いラインを隣のラインに付け替えたもの）も吸い付けて比べる
+   （ゆがみのある広角の動画では、正しいコートと 1 本取り違えたコートの点数がほぼ同じになる。ROADMAP v2 の J3）
 
 手順 ① のカメラのおおよその位置が分かるときは、消失点から決めたカメラの向きと、その位置の近くで
 線分がコートのラインに重なる高さ・位置からも候補を作る（``vanishing_candidates``。全自動のラインの組の
@@ -35,6 +37,15 @@ _TO_AUTO = np.array([[1.0, 0, NET_X_M], [0, 1.0, COURT_WIDTH_M / 2], [0, 0, 1.0]
 # コートを 180° 回す（打つ人の側を入れ替える）
 _ROT180 = np.diag([-1.0, -1.0, 1.0])
 _CORNERS = np.array([[-HALF_L, -HALF_W], [-HALF_L, HALF_W], [HALF_L, -HALF_W], [HALF_L, HALF_W]])
+# 並べるときの、2 本のラインとも測れたランドマーク 1 点あたりの点数の上乗せ。1 本取り違えたコートは、ほかの競技の
+# ラインや継ぎ目に乗る分でラインらしさの合計が正しいコートとほぼ同じになるが、測れるランドマークが少なくなる
+POINT_BONUS = 1.0
+# ラインの取り違えを試す上位の候補の数と、試す候補の点数（``rank_score``）がいちばんよい候補からこれ以内のときだけ試す
+# （点数の差が大きいときは迷っていない）
+N_SHIFT = 2
+SHIFT_MARGIN = 5.0
+# 取り違えを直した候補で、動かさなかったラインが画像の上で動いてよい量 [px]（横 1920 px に換算）
+SHIFT_KEEP_PX = 6.0
 
 
 @dataclass
@@ -50,6 +61,51 @@ class Proposal:
     result: SnapResult
     score: float
     n_snapped: int
+
+    @property
+    def rank_score(self) -> float:
+        """並べる点数（ラインらしさ + 測れたランドマークの数 × ``POINT_BONUS``）。"""
+        return self.score + POINT_BONUS * self.n_snapped
+
+
+def _line_moved_px(a: SnapResult, b: SnapResult, line: tuple[str, float]) -> float:
+    """ライン ``line`` = (向き, 位置) の、2 つの吸い付けの結果での画像の上の位置の違い（ラインに沿った点の中央値）[px]。"""
+    ax, c = line
+    s = np.linspace(-HALF_W, HALF_W, 21) if ax == "x" else np.linspace(-HALF_L, HALF_L, 41)
+    XY = np.c_[np.full(len(s), c), s] if ax == "x" else np.c_[s, np.full(len(s), c)]
+    d = np.linalg.norm(a.project(XY) - b.project(XY), axis=1)
+    d = d[np.isfinite(d)]
+    return float(np.median(d)) if len(d) else float("inf")
+
+
+def line_shift_alternatives(res: SnapResult) -> list[tuple[np.ndarray, tuple[str, float]]]:
+    """ラインを 1 本取り違えたかもしれない所を直した、はじめのホモグラフィ（吸い付ける前）と、動かさなかったライン
+    (向き, 位置) の組のリスト。
+
+    x・y の向きごとに、測れたラインのうち点のいちばん多いラインを動かさず、そこからいちばん遠い測れたラインを、
+    隣のライン（コートの同じ向きのラインの並びで 1 つ内側・外側）に付け替える（床の座標をその向きに伸び縮みさせる）。
+    """
+    out = []
+    for ax in ("x", "y"):
+        names = [n for n in res.lines_found if LINES[n][0] == ax]
+        if len(names) < 2:
+            continue
+        allc = sorted({float(LINES[n][1]) for n in LINES if LINES[n][0] == ax})
+        c0 = float(LINES[max(names, key=lambda n: res.lines_found[n])][1])
+        c1 = float(LINES[max(names, key=lambda n: abs(float(LINES[n][1]) - c0))][1])
+        if c1 == c0:
+            continue
+        i = allc.index(c1)
+        for j in (i - 1, i + 1):
+            if not 0 <= j < len(allc) or allc[j] == c0:
+                continue
+            # 付け替えた床の座標（c1 にあったラインが allc[j]）→ 今の床の座標：old = a·new + b（c0 は動かさない）
+            a = (c1 - c0) / (allc[j] - c0)
+            T = np.eye(3)
+            r = 0 if ax == "x" else 1
+            T[r, r], T[r, 2] = a, c0 - a * c0
+            out.append((res.homography @ T, (ax, c0)))
+    return out
 
 
 def _orient(Hm: np.ndarray, shape: tuple[int, int], cam_xy: tuple[float, float] | None) -> np.ndarray:
@@ -404,35 +460,58 @@ def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int
         report(0.1, "線の向きからカメラの向きを求めています")
         starts += vanishing_candidates(frame, cam_xy, max_candidates,
                                        progress=lambda f, m: report(0.1 + 0.25 * f, m))
-    # かかる時間の大半は吸い付け（1 つ約 5 秒）なので、残りの割合はその数で配る
-    for i, (H0, K) in enumerate(starts):
-        report(0.35 + 0.65 * i / max(len(starts), 1), f"候補をコートのラインに合わせています（{i + 1} / {len(starts)}）")
+    def snap_one(H0: np.ndarray, K: np.ndarray | None) -> Proposal | None:
         P = _apply_h(H0, _CORNERS)
         if not np.isfinite(P).all():
-            continue
+            return None
         try:
             res = snapper.refine(frame, H0, _CORNERS, P, table, sigma=np.full(4, 4.0), lab=lab)
         except (ValueError, np.linalg.LinAlgError):
-            continue
+            return None
         if res.color is None:
-            continue
+            return None
         # 消失点からの候補は、詰めた後もカメラ K で撮った床として正しいものだけ（コートを細い帯につぶした解などを除く）
         if K is not None and OneClickCalibrator._metric_error(res.homography, K) > 0.3:
-            continue
+            return None
         # 手順 ① のカメラの位置が分かれば、そこから離れたカメラになる候補（他の競技のラインに合ったものなど）を除く
         if cam_xy is not None:
             cam = camera_from_homography(res.homography, (h, w))
-            if cam is None or not (0.25 * w < cam[0][0, 0] < 3.0 * w) or                     np.hypot(*(cam[1] - np.asarray(cam_xy))) > max_cam_dist_m:
-                continue
+            if cam is None or not (0.25 * w < cam[0][0, 0] < 3.0 * w) or \
+                    np.hypot(*(cam[1] - np.asarray(cam_xy))) > max_cam_dist_m:
+                return None
+        # 点数は、その候補の κ（レンズのゆがみ）で描いたライン（``refine`` の後の ``snapper.kappa``）で測る
         score = snapper._court_score(img1, res.homography, full, res.color, k)
-        found.append(Proposal(res, float(score), sum(s == "snapped" for s in res.status.values())))
+        return Proposal(res, float(score), sum(s == "snapped" for s in res.status.values()))
+
+    def distinct(props: list[Proposal]) -> list[Proposal]:
+        # 詰めたら同じコートになったものは、よい方だけ残す
+        inv = np.linalg.inv(_TO_AUTO)
+        out: list[Proposal] = []
+        for p in sorted(props, key=lambda p: -p.rank_score):
+            if not any(AutoCourtCalibrator._same_court(p.result.homography @ inv, q.result.homography @ inv, (h, w))
+                       for q in out):
+                out.append(p)
+        return out
+
+    # かかる時間の大半は吸い付け（1 つ約 5 秒）なので、残りの割合はその数で配る
+    n_steps = len(starts) + 4 * N_SHIFT
+    for i, (H0, K) in enumerate(starts):
+        report(0.35 + 0.65 * i / n_steps, f"候補をコートのラインに合わせています（{i + 1} / {len(starts)}）")
+        p = snap_one(H0, K)
+        if p is not None:
+            found.append(p)
+    # 上位の候補は、ラインを 1 本取り違えた形も吸い付けて比べる
+    top = distinct(found)[:N_SHIFT]
+    alts = [(Ha, c0, p) for p in top if p.rank_score >= top[0].rank_score - SHIFT_MARGIN
+            for Ha, c0 in line_shift_alternatives(p.result)]
+    for i, (Ha, c0, orig) in enumerate(alts):
+        report(0.35 + 0.65 * (len(starts) + i) / n_steps, f"ラインの取り違えを確かめています（{i + 1} / {len(alts)}）")
+        p = snap_one(Ha, None)
+        # 動かさなかったライン（点のいちばん多いライン）が、画像の上で元の候補と同じ所にあるものだけ（ほかの組の線へ
+        # 滑った吸い付けを除く）
+        # また、測れたランドマークが元の候補より少ないものは使わない（付け替えた形の方がよく合うときだけ）
+        if p is not None and _line_moved_px(orig.result, p.result, c0) <= SHIFT_KEEP_PX * k and \
+                p.n_snapped >= orig.n_snapped:
+            found.append(p)
     report(1.0, f"候補を {len(found)} 個見つけました")
-    # 詰めたら同じコートになったものは、よい方だけ残す
-    found.sort(key=lambda p: -p.score)
-    inv = np.linalg.inv(_TO_AUTO)
-    out: list[Proposal] = []
-    for p in found:
-        if not any(AutoCourtCalibrator._same_court(p.result.homography @ inv, q.result.homography @ inv, (h, w))
-                   for q in out):
-            out.append(p)
-    return out[:n]
+    return distinct(found)[:n]

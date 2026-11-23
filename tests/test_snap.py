@@ -142,7 +142,7 @@ def test_propose_finds_court_without_clicks():
     err = [np.linalg.norm(np.array(props[0].result.points[n]) - _apply_h(Hm, table[n][None, :2])[0])
            for n in props[0].result.points]
     assert np.median(err) < 1.5
-    assert [p.score for p in props] == sorted((p.score for p in props), reverse=True)
+    assert [p.rank_score for p in props] == sorted((p.rank_score for p in props), reverse=True)
 
 
 def test_propose_puts_hitter_on_the_camera_end():
@@ -195,3 +195,49 @@ def test_propose_uses_camera_position_for_vanishing_candidates():
     fr = [f for f, _ in steps]
     assert fr[0] == 0.0 and fr[-1] == 1.0 and fr == sorted(fr) and 5 <= len(steps) <= 60
     assert all(isinstance(m, str) and m for _, m in steps)
+
+
+def _distorted(img: np.ndarray, kappa: float) -> np.ndarray:
+    """ゆがみのない画像を、``snap.undistort_points`` の κ でゆがめた画像（広角のレンズの樽型のゆがみ）。"""
+    from smash_speed.calibration.snap import undistort_points
+
+    h, w = img.shape[:2]
+    g = np.stack(np.meshgrid(np.arange(w, dtype=float), np.arange(h, dtype=float)), -1).reshape(-1, 2)
+    src = undistort_points(g, kappa, np.array([w / 2, h / 2]), max(h, w)).reshape(h, w, 2).astype(np.float32)
+    return cv2.remap(img, src[..., 0], src[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def test_snap_estimates_lens_distortion():
+    """ゆがんだ画像では、ラインに吸い付けるときにゆがみ κ も求め、ランドマークがゆがみなしより合う（ROADMAP v2 の J3）。"""
+    from smash_speed.calibration.snap import distort_points
+
+    table = landmark_table(load_config())
+    Hm = _side_view_h()
+    kappa = 0.25
+    frame = _distorted(_court_image(Hm), kappa)
+    h, w = frame.shape[:2]
+    c, s = np.array([w / 2, h / 2]), max(h, w)
+    names = ["back_corner_h_n", "back_corner_h_p", "short_service_side_h_n", "short_service_side_h_p"]
+    clicks = {n: tuple(distort_points(_apply_h(Hm, table[n][None, :2]), kappa, c, s)[0]) for n in names}
+    errs = {}
+    for est in (False, True):
+        res = CourtSnapper(estimate_kappa=est).snap(frame, clicks, table)
+        snapped = [n for n, st in res.status.items() if st == "snapped"]
+        truth = {n: distort_points(_apply_h(Hm, table[n][None, :2]), kappa, c, s)[0] for n in snapped}
+        errs[est] = float(np.median([np.linalg.norm(np.array(res.points[n]) - truth[n]) for n in snapped]))
+        if est:
+            assert abs(res.kappa - kappa) < 0.05
+            np.testing.assert_allclose(res.project(table[snapped[0]][None, :2])[0], res.points[snapped[0]], atol=0.1)
+    assert errs[True] < 1.0
+    assert errs[True] < errs[False]
+
+
+def test_distortion_round_trip():
+    """``distort_points`` は ``undistort_points`` の逆。"""
+    from smash_speed.calibration.snap import distort_points, undistort_points
+
+    rng = np.random.default_rng(0)
+    p = rng.uniform(0, 1920, (50, 2))
+    c = np.array([960.0, 540.0])
+    for kappa in (-0.2, 0.0, 0.3):
+        np.testing.assert_allclose(undistort_points(distort_points(p, kappa, c, 1920.0), kappa, c, 1920.0), p, atol=1e-6)
