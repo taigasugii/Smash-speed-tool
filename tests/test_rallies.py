@@ -6,7 +6,7 @@ import pytest
 
 from smash_speed.config import load_config
 from smash_speed.physics import PhysicsParams
-from smash_speed.rallies import (REASON_END, REASON_GAP, REASON_LANDED, RallyOptions, rally_outcome, rally_scores,
+from smash_speed.rallies import (REASON_END, REASON_GAP, REASON_LANDED, REASON_PICKUP, RallyOptions, rally_outcome, rally_scores,
                                  split_rallies, synthetic_benchmark, visible_fraction)
 from smash_speed.shots import Rally, Shot
 from smash_speed.synth_rally import make_session, observe_session, rally_camera
@@ -64,6 +64,28 @@ def test_long_gap_splits_only_when_the_shuttle_is_not_flying():
     # とても長い間は、シャトルが見えていても区切る
     far = [_shot(0.0), _shot(9.0, "o")]
     assert len(split_rallies(far, _det(-0.5, 10.0, visible=lambda t: True))) == 2
+
+
+def test_pickups_after_the_rally_are_trimmed():
+    # 1.0 s にスマッシュ（2.0 s に着地）、1.6 s に打ち返せなかった「打球」（当てはめに失敗。シャトルはまだ飛んでいる）、
+    # 2.6・3.0 s に拾って渡すときの「打球」（当てはめに失敗。シャトルは見えない）、6.5 s に次のサーブ
+    shots = [_shot(0.0, "h", t_land=1.5), _shot(1.0, "o", t_land=2.0), _shot(1.6, "h", ok=False),
+             _shot(2.6, "o", ok=False), _shot(3.0, "h", ok=False), _shot(6.5, "o")]
+    det = _det(-0.5, 7.5, visible=lambda t: t < 2.0 or t > 6.5)
+    rallies = split_rallies([Shot(**vars(s)) for s in shots], det, RallyOptions(trim_pickups=False))
+    assert [r.n_shots for r in rallies] == [5, 1] and rallies[0].t_end_s == 3.0   # 前：終わりが拾う打球の時刻
+    out = [Shot(**vars(s)) for s in shots]
+    rallies = split_rallies(out, det)
+    assert [r.n_shots for r in rallies] == [3, 1]
+    assert [s.rally_id for s in out] == [1, 1, 1, None, None, 2]
+    assert out[3].note.startswith(f"ラリーの外：{REASON_PICKUP}")
+    # 終わりは、打ち返せなかった打球の前のスマッシュの着地（終わり方は分からない）
+    assert rallies[0].t_end_s == 2.0 and rallies[0].end_reason == ""
+    # 打った後シャトルが飛んでいる、当てはめに失敗した打球は外さない
+    flying = [Shot(**vars(s)) for s in shots]
+    assert [r.n_shots for r in split_rallies(flying, _det(-0.5, 7.5, visible=lambda t: True))] == [6]
+    # シャトルの検出がなければ外さない
+    assert [r.n_shots for r in split_rallies([Shot(**vars(s)) for s in shots])] == [5, 1]
 
 
 def test_visible_fraction():
