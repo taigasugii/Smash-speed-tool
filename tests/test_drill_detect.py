@@ -95,3 +95,25 @@ def test_detect_writes_outputs_from_a_detections_file(tmp_path, monkeypatch):
     assert (tmp_path / "out" / HITS_FILE).exists()
     saved = json.loads((tmp_path / "out" / DETECT_INFO_FILE).read_text(encoding="utf-8"))
     assert saved["n_hits"] == info["n_hits"] >= 1 and saved["detector"] == "detections"
+
+
+def test_detect_tells_how_to_export_the_model_when_it_cannot_run(tmp_path, monkeypatch):
+    """既定のモデルを動かせない PC で今の検出を使うときは、ONNX に書き出す手順を出して記録する（K1）。"""
+    import smash_speed.drill as d
+    from smash_speed.video_io import VideoMeta
+
+    ts = np.arange(300) / 30.0
+    meta = VideoMeta(path=str(tmp_path / "v.mp4"), width=3840, height=2160, fps_meta=30.0, capture_fps=30.0,
+                     time_scale=1.0, n_frames=300, duration_s=10.0, rotation_deg=0, is_vfr=False, has_audio=False,
+                     timestamps=ts)
+    monkeypatch.setattr(d, "probe", lambda *a, **k: meta)
+    det = pd.concat([_track(0, 0.0, 30, 500.0, 1500.0), _track(1, 1.1, 30, 2000.0, -1500.0)])
+    monkeypatch.setattr(d, "detect_all", lambda *a, **k: det)
+    monkeypatch.setattr(d, "tracknet_hint", lambda cfg: "model_ft1.onnx を作ってください")
+    lines = []
+    info = detect(DrillDetectOptions(tmp_path / "v.mp4", tmp_path / "out", use_audio=False), CFG, progress=lines.append)
+    assert info["detector"] == "baseline" and info["detector_hint"] == "model_ft1.onnx を作ってください"
+    assert any("model_ft1.onnx" in m for m in lines)
+    monkeypatch.setattr(d, "tracknet_hint", lambda cfg: None)
+    assert detect(DrillDetectOptions(tmp_path / "v.mp4", tmp_path / "out2", use_audio=False), CFG,
+                  progress=lambda m: None)["detector_hint"] is None

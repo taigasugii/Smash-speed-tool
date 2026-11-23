@@ -1002,17 +1002,19 @@ def shots_get():
 
     種類の正解ラベル（ROADMAP B6）は出力の場所の ``shot_labels.csv`` から付け直し、各ショットの ``truth`` に入れる。
     ``model`` は、学習したシャトルの検出（設定の ``detection.shot_list_model``。F1c）を使えるか（画面の選択肢を出すか）。
+    使えないがモデルのファイルはあるときは、``model_hint`` に ONNX に書き出す手順（``shot_list.tracknet_hint``。K1）。
     """
     from dataclasses import asdict
 
     from smash_speed.shot_labels import LABELS_FILE, NOT_A_HIT, NOT_A_HIT_LABEL, match_labels, read_labels
-    from smash_speed.shot_list import SHOT_LIST_FILE, default_tracknet
+    from smash_speed.shot_list import SHOT_LIST_FILE, default_tracknet, tracknet_hint
     from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
 
     d = _shots_dir()
     model = default_tracknet(S.cfg()) is not None
+    hint = None if model else tracknet_hint(S.cfg())
     if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
-        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS, model=model)
+        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS, model=model, model_hint=hint)
     info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     shots = read_shots(Path(d) / SHOTS_FILE)
     labels = read_labels(out_root() / LABELS_FILE)
@@ -1032,7 +1034,7 @@ def shots_get():
              if (Path(d) / f).exists()}
     # 正しい種類として選べるのは、labels の 8 種類（unknown のほか）と「打球ではない」（not_hit）
     return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,
-              files=files, model=model,
+              files=files, model=model, model_hint=hint,
               label_stats=_label_stats(labels, info.get("video", "")))
 
 

@@ -194,6 +194,28 @@ def default_tracknet(cfg: dict[str, Any]) -> Path | None:
     return p if p.exists() and can_predict(p) else None
 
 
+def tracknet_hint(cfg: dict[str, Any]) -> str | None:
+    """設定の既定のモデル（``detection.shot_list_model``）のファイルはあるのに、この PC では熱の地図を作れないとき
+    （torch も ``.venv-train`` も隣の ``.onnx`` もない。K1）、ONNX に書き出して使えるようにする手順の文。ほかは None。"""
+    from smash_speed.config import PROJECT_ROOT
+    from smash_speed.train.tracknet_train import can_predict, onnx_for
+
+    p = (cfg.get("detection") or {}).get("shot_list_model")
+    if not p:
+        return None
+    p = Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p
+    if not p.exists() or can_predict(p):
+        return None
+    try:
+        rel = p.relative_to(PROJECT_ROOT)
+    except ValueError:
+        rel = p
+    onnx = onnx_for(rel)
+    return (f"練習させた見つけ方（{p.name}）は、この PC ではまだ使えません。{onnx.name} を作ると使えるようになります："
+            f"torch の入った .venv-train で「.venv-train\\Scripts\\python.exe -m smash_speed.train.onnx_export {rel}」を"
+            f"一度だけ動かすか、ほかの PC で作った {onnx.name} を {onnx.parent} に置いてください（docs/gpu.md）。")
+
+
 def choose_tracknet(tracknet: Path | None, detections: Path | None, baseline: bool, cfg: dict[str, Any]
                     ) -> tuple[Path | None, bool]:
     """コマンドの引数から、使う学習したモデルと、失敗したら今の検出に戻すか（``tracknet_fallback``）を決める。
