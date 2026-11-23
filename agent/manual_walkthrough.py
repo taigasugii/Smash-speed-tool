@@ -141,11 +141,15 @@ class Walk:
 
     def click(self, text: str, within: str = "document") -> bool:
         """``text`` を含むボタン（いちばん短い文字のもの）を押す。"""
-        return bool(self.c.js(f"""(() => {{
+        ok = bool(self.c.js(f"""(() => {{
           const bs = [...({within}).querySelectorAll('button')].filter(b => b.offsetParent !== null &&
             b.textContent.includes({json.dumps(text)}));
           bs.sort((a, b) => a.textContent.length - b.textContent.length);
           if (!bs.length) return false; bs[0].click(); return true; }})()"""))
+        if not ok:
+            print("  （押せませんでした。画面：" + (self.c.js("document.querySelector('#content').innerText.slice(0, 300)") or "")
+                  .replace(chr(10), " / ") + "）", flush=True)
+        return ok
 
     def task_id(self) -> str | None:
         return self.c.js("Task.id")
@@ -278,20 +282,43 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
         w.step("手順 5「結果」に初速が出る", bool(speed), f"{speed} km/h（正解 288 km/h）")
         w.shot("result")
 
-        # ---- ショットの一覧：合成のラリーの動画（打球音の WAV・仮想カメラのコート合わせつき）
+        # ---- ホームの「この動画の進み具合」から：動画 → 基礎打ちの解析 → コート合わせ → ショットの一覧 → レポート（L2）
+        #      合成のラリーの動画（打球音の WAV・仮想カメラのコート合わせつき）
         rally = work / "manual_rally"
         if not (rally / "rally.mp4").exists():
             subprocess.run([sys.executable, "-m", "smash_speed.synth_rally", str(rally), "--shots", "8", "--fps", "60"],
                            cwd=ROOT, env=env, check=True, stdout=subprocess.DEVNULL)
         video, wav, cal = (str(rally / n) for n in ("rally.mp4", "rally.wav", "calibration.json"))
-        w.step("ラリーの動画を開く（openVideo）", c.js(f"openVideo({json.dumps(video)}, null).then(r => !!r)"))
+        w.step("ラリーの動画を開く（openVideo。「動画を選ぶ…」の後と同じ）",
+               c.js(f"openVideo({json.dumps(video)}, null).then(r => !!r)"))
         c.js(f"App.save({{audio: {json.dumps(wav)}}})")
-        c.js("go('calib')")
+        w.menu("ホーム")
+
+        def home_next() -> str:
+            w.wait("document.querySelector('.home-status')", 15)
+            return c.js("(document.querySelector('.hs-row.next') || {dataset: {}}).dataset.k || ''")
+
+        w.step("ホームに進み具合が出て、次は「コートを合わせる」", home_next() == "calib")
+        prev = w.task_id()
+        w.step("「基礎打ちを解析する」（コート合わせの前にできる）", w.click("基礎打ちを解析する"))
+        st = w.wait_task(prev, 900)
+        w.wait("App.current === 'home' && document.querySelector('.home-status')", 30)
+        time.sleep(1.5)
+        txt = c.js("document.querySelector('.hs-row[data-k=drill]').innerText")
+        w.step("基礎打ちのまとめ（打った数）がホームに出る", "打った数" in (txt or "") and "✓" in (txt or ""),
+               f"{st}：{(txt or '').splitlines()[-2:] if txt else ''}")
+        w.step("次も「コートを合わせる」", home_next() == "calib")
+        w.shot("home_status")
+        w.step("「コートを合わせる →」", w.click("コートを合わせる →", "document.querySelector('.home-status')"))
+        w.wait("App.current === 'calib'", 10)
         time.sleep(1.5)
         r = c.js(f"api.post('/api/calib/load', {{path: {json.dumps(cal)}}}).then(r => {{ App.calib = r.calib; return r.ok; }})")
         w.step("コート合わせを読み込む（「別のファイルを読み込む…」と同じ）", r)
-        w.menu("ショットの一覧")
-        w.step("ショットの一覧の画面", w.wait("App.current === 'shots'", 10))
+        w.menu("ホーム")
+        w.step("次は「ショットの一覧を作る」", home_next() == "shots")
+        w.step("「ショットの一覧へ →」", w.click("ショットの一覧へ →", "document.querySelector('.home-status')"))
+        w.step("ショットの一覧の画面", w.wait("App.current === 'shots' && [...document.querySelectorAll('#content button')]"
+                                          ".some(b => b.textContent.includes('解析を始める'))", 30))
         w.shot("shots_start")
         prev = w.task_id()
         w.step("「解析を始める」", w.click("解析を始める"))
@@ -301,8 +328,14 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
         n = c.js("document.querySelectorAll('#content table tbody tr').length")
         w.step("表にショットが並ぶ", (n or 0) > 0, f"{n} 本（正解 8 本）")
         w.shot("shots")
-        rep = urllib.request.urlopen(base + "/report/shots", timeout=120).status
-        w.step("「レポートを開く」のページ", rep == 200)
+        w.menu("ホーム")
+        w.step("次は「結果を見る」", home_next() == "view")
+        w.shot("home_status_done")
+        c.js("window.__opened = null; window.open = (u) => { window.__opened = u; return null; }")
+        w.click("レポートを開く", "document.querySelector('.home-status')")
+        opened = c.js("window.__opened")
+        rep = urllib.request.urlopen(base + (opened or "/report/shots"), timeout=120).status
+        w.step("「レポートを開く」でショットの一覧のレポートが開く", opened == "/report/shots" and rep == 200, str(opened))
 
         # ---- まとめて解析：合成の動画 3 本（1 本はコート合わせつき）を順に解析・途中で止める・続きから（L3）
         vdir = work / "videos"
@@ -379,7 +412,7 @@ def main() -> int:
     if (sys.stdout.encoding or "").lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--port", type=int, default=8771)
+    ap.add_argument("--port", type=int, default=8772)
     ap.add_argument("--shots-dir", type=Path, default=ROOT / "docs" / "manual_img")
     ap.add_argument("--no-shots", action="store_true", help="写真を撮らない")
     a = ap.parse_args()

@@ -120,6 +120,16 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 
 /* ---------------- ホーム ---------------- */
 .hero { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
+/* ホームの「この動画の進み具合」 */
+.home-status { margin-bottom: 16px; }
+.hs-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid transparent; }
+.hs-row + .hs-row { margin-top: 4px; }
+.hs-row .hs-mark { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: #eef1f4;
+  color: var(--muted); font-weight: 700; flex: none; }
+.hs-row.done .hs-mark { background: #e3f6ea; color: #1a7f45; }
+.hs-row.next { border-color: var(--primary); background: #f3f7ff; }
+.hs-row.next .hs-mark { background: var(--primary); color: #fff; }
+.hs-row .hs-body { flex: 1; min-width: 0; }
 .steps-intro { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
 .steps-intro .s { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: #fbfcfd; }
 .steps-intro .s b { display: block; margin-bottom: 2px; }
