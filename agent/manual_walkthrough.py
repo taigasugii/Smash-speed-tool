@@ -320,6 +320,9 @@ def _run(port: int, shots_dir: Path | None, work: Path) -> list[dict[str, Any]]:
         w.step("ショットの一覧の画面", w.wait("App.current === 'shots' && [...document.querySelectorAll('#content button')]"
                                           ".some(b => b.textContent.includes('解析を始める'))", 30))
         w.shot("shots_start")
+        # 学習したモデル（ckpts/shuttle）がある PC では「練習させた見つけ方」が最初から入っているが、合成の動画（白い背景）では
+        # シャトルを見つけないので外す（実動画のための見つけ方）
+        c.js("(() => { const m = document.querySelector('#model'); if (m) m.checked = false; })()")
         prev = w.task_id()
         w.step("「解析を始める」", w.click("解析を始める"))
         st = w.wait_task(prev, 900)
