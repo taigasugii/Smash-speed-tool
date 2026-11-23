@@ -60,7 +60,7 @@ from smash_speed.rally_stats import write_stats
 from smash_speed.repro import run_metadata
 from smash_speed.rally_fit import JointOptions, fit_rallies
 from smash_speed.fit_batch import gate_session
-from smash_speed.shot_fit import (ShotFit, _parallel_map, fit_shots, joint_job, pool_active, pool_executor,
+from smash_speed.shot_fit import (ShotFit, ShotPriors, _parallel_map, fit_shots, joint_job, pool_active, pool_executor,
                                   resolve_backend, shot_fits_to_shots, worker_env, worker_pool)
 from smash_speed.shot_types import classify_shots
 from smash_speed.shots import (RALLIES_FILE, SHOT_TYPE_LABELS, SHOT_TYPES, SHOTS_FILE, Rally, Shot, write_rallies,
@@ -402,7 +402,7 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
                  max_rms_frac: float = 0.01, workers: int = 1, progress: Callable[[str], None] = print,
                  players: pd.DataFrame | None = None, rally_threads: int | None = None, joint: JointOptions | None = None,
                  joint_info: dict[str, Any] | None = None, fit_backend: str = "cpu",
-                 batch_processes: int | None = None) -> list[Shot]:
+                 batch_processes: int | None = None, priors: ShotPriors | None = None) -> list[Shot]:
     """打球ごとに軌道と初速を当てはめ、種類を決めた ``Shot`` の列（時刻の順。ラリーの番号つき）。
 
     Args:
@@ -425,6 +425,7 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
             同時に進めて、段階ごとの当てはめをほかのラリーの分とまとめて解く（``_fit_groups``・``fit_batch.BatchGate``）。
             結果はラリーの組み方・プロセスの数によらない
         batch_processes: "batch" で使うプロセスの数（None なら ``BATCH_PROCESSES``。``workers`` まで）
+        priors: 打点・飛行の目安の選び方（``shot_fit.ShotPriors``。None なら既定）
     """
     opts = FitOptions.from_config(cfg, **({} if ci else {"ci_method": "none"}))
     backend = resolve_backend(fit_backend)
@@ -434,11 +435,13 @@ def analyze_hits(det: pd.DataFrame, hits: list[Hit], camera: Camera, phys: Physi
 
     if rally_threads is None:
         rally_threads = BATCH_RALLIES if backend == "batch" else 4
-    fit_args = (det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players)
+    priors = priors or ShotPriors()
+    fit_args = (det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players,
+                priors)
 
     def one(g: int) -> tuple[list[ShotFit], dict[str, Any]]:
         return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac,
-                          workers, players, backend)
+                          workers, players, backend, priors)
 
     def to_shots(g: int, fits: list[ShotFit]) -> list[Shot]:
         return _rally_shots([hits[i] for i in groups[g]], fits, camera, phys, max_kmh, max_rms_frac)
@@ -539,7 +542,7 @@ def _fit_groups(fit_args: tuple, gids: list[int], rally_threads: int
                 ) -> dict[int, tuple[list[ShotFit], dict[str, Any]]]:
     """ラリー ``gids`` を、``rally_threads`` 個ずつ同時に進め、当てはめをまとめて解く（``fit_backend="batch"``。
     ``analyze_hits`` の中の 1 組。別のプロセスでも動かす）。結果はラリーの組み方・スレッドの数によらない。"""
-    det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players = fit_args
+    det, hits, groups, vis_t, camera, phys, opts, cfg, tail_s, max_kmh, max_rms_frac, workers, players, priors = fit_args
     n_threads = max(1, min(rally_threads, len(gids)))
     out: dict[int, tuple[list[ShotFit], dict[str, Any]]] = {}
     with gate_session(n_threads, len(gids)) as gate:
@@ -547,7 +550,7 @@ def _fit_groups(fit_args: tuple, gids: list[int], rally_threads: int
             gate.enter()        # 同時に進めているほかのラリーの当てはめとまとめて解く（``fit_batch.BatchGate``）
             try:
                 return _fit_rally(det, hits, groups, g, vis_t, camera, phys, opts, cfg, tail_s, max_kmh,
-                                  max_rms_frac, workers, players, "batch")
+                                  max_rms_frac, workers, players, "batch", priors)
             finally:
                 gate.leave()
 
@@ -566,7 +569,7 @@ def _fit_groups(fit_args: tuple, gids: list[int], rally_threads: int
 def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: int, vis_t: np.ndarray,
                camera: Camera, phys: PhysicsParams, opts: FitOptions, cfg: dict[str, Any], tail_s: float,
                max_kmh: float, max_rms_frac: float, workers: int, players: pd.DataFrame | None,
-               backend: str = "cpu") -> tuple[list[ShotFit], dict[str, Any]]:
+               backend: str = "cpu", priors: ShotPriors | None = None) -> tuple[list[ShotFit], dict[str, Any]]:
     """``analyze_hits`` の 1 ラリー分（打球の組 ``groups[g]``）のショットごとの当てはめと、まとめて当てはめ直すときの
     引数（``shot_fit.joint_job``）。"""
     hs = [hits[i] for i in groups[g]]
@@ -587,7 +590,7 @@ def _fit_rally(det: pd.DataFrame, hits: list[Hit], groups: list[list[int]], g: i
     sound = cfg.get("events", {}).get("speed_of_sound_mps", 343.0)
     fits = fit_shots(part, [h.t for h in hs], camera, phys, [h.side for h in hs], opts, workers=workers,
                      max_rms_px=max_rms_frac * camera.width, max_kmh=max_kmh, t_audio=[h.t_audio for h in hs],
-                     speed_of_sound_mps=sound, hitter_xy=feet, backend=backend)
+                     speed_of_sound_mps=sound, hitter_xy=feet, backend=backend, **(priors or ShotPriors()).fit_kwargs())
     return fits, joint_job(fits, part, camera, feet, [h.t_audio for h in hs], speed_of_sound_mps=sound,
                            max_rms_px=max_rms_frac * camera.width)
 

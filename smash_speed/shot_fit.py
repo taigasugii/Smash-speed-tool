@@ -47,6 +47,19 @@ GRID_Y_M = (-2.0, 0.0, 2.0)
 GRID_YAW_DEG = (-20.0, 0.0, 20.0)
 # 最初の当てはめが打った側から見てありえないときに試す、広い向きの格子 [deg]
 WIDE_YAW_DEG = (-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0)
+# サーブの打点の高さの上限 [m]（競技規則。球出しも打点は低い）。ラリーの最初のショットの打点の目安にする（``fit_shots``）
+SERVE_MAX_HEIGHT_M = 1.15
+
+
+@dataclass
+class ShotPriors:
+    """ショットの一覧（``shot_list.analyze_hits``）が ``fit_shots`` に渡す、打点・飛行の目安の選び方。"""
+
+    first_max_height_m: float | None = SERVE_MAX_HEIGHT_M  # ラリーの最初のショットの打点の高さの上限（J1）
+
+    def fit_kwargs(self) -> dict[str, Any]:
+        """``fit_shots`` の引数。"""
+        return {"first_max_height_m": self.first_max_height_m}
 
 
 @dataclass
@@ -665,6 +678,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
               bad_max_nfev_per_param: int = 30, hitter_xy: list[Any] | None = None,
               hitter_sigma_m: tuple[float, float] = (0.5, 2.0), max_hitter_gap_m: float = 2.5,
               serve_depth_m: tuple[float, float] | None = None, hitter_reach_m: float | None = 1.5,
+              first_max_height_m: float | None = None, first_height_sigma_m: float = 0.3,
               joint: Any = None, backend: str = "cpu") -> list[ShotFit]:
     """打球の時刻 ``t_hits`` [s] で分けた飛行ごとに、軌道と初速を当てはめる。
 
@@ -697,6 +711,11 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         max_hitter_gap_m: 足元からこれより離れた打点は外れとみなす [m]
         hitter_reach_m: 足元から打点まで水平に届く距離 [m]。打球音のないショットの打点がこれより離れていたら、
             打った時刻を、当てはめた軌道が足元にいちばん近づく時刻へ戻す（``foot_hit_times``。None なら直さない）
+        first_max_height_m: 最初のショット（サーブ・球出し）の打点の高さの上限の目安 [m]（``SERVE_MAX_HEIGHT_M``）。
+            打点の候補がこれより高ければこの高さにし、高さの不確かさを ``first_height_sigma_m`` まで狭くする
+            （低いカメラでは、ロングサーブが打った直後に画面の上へ出て落ちてくる所しか見えず、打点の高さが決まらない。
+            ROADMAP v2 の J1）。None なら使わない
+        first_height_sigma_m: そのときの高さの不確かさ [m]
         serve_depth_m: 最初のショットをサーブとみなすときの、打点のネットからの深さの目安（平均, 標準偏差）[m]。
             サーブは前の軌道がないので、角・後ろのカメラでは打点の奥行きが決まらず、初速が 15〜40% ずれる。
             最初の当てはめの打点を、飛行平面に沿ってこの目安と重みつきで平均する（``serve_hit_point``）。
@@ -722,6 +741,13 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
     fits = [ShotFit(t, sides[i], t) for i, t in enumerate(t_hits)]
     feet = [None if h is None or not np.isfinite(np.asarray(h, float)[:2]).all() else np.asarray(h, float)[:2]
             for h in (hitter_xy if hitter_xy is not None else [None] * len(t_hits))]
+
+    def prior_sigma(i: int, on_foot: bool) -> tuple[float, float]:
+        """ショット ``i`` の打点の目安の不確かさ（水平, 高さ）[m]。最初のショットは、高さの上限の目安があれば高さを狭くする。"""
+        sh, sz = hitter_sigma_m if on_foot else hit_sigma_m
+        if i == 0 and first_max_height_m is not None:
+            sz = min(sz, first_height_sigma_m)
+        return sh, sz
 
     def split(times: list[float]) -> None:
         for i, o in enumerate(split_observations(det, camera, times, margin_s, t_last)):
@@ -773,6 +799,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         if serve_depth_m is not None and _ == 0 and fits and fits[0].fit is not None and feet[0] is None:
             # 1 回目だけ（2 回目からは、目安に寄せた打点を事前分布にして当てはめ直した始まりなので、重ねて寄せない）
             pts[0] = [serve_hit_point(a, fits[0].fit, fits[0].side, serve_depth_m) for a in pts[0]]
+        if first_max_height_m is not None and pts:
+            pts[0] = [np.r_[a[:2], min(float(a[2]), first_max_height_m)] for a in pts[0]]
         jobs, args = [], []
         for i, sf in enumerate(fits):
             if sf.fit is None or sf.n_obs < min_obs:
@@ -794,7 +822,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
                     jobs.append((i, ka, kb))
                     args.append((sf.obs, sf.t_hit, "plane", FlightPlane.from_points(a, b), phys,
                                  FitOptions(**{**fo.__dict__, "p0_prior_m": a,
-                                               "p0_prior_sigma_m": hitter_sigma_m if on_foot else hit_sigma_m}),
+                                               "p0_prior_sigma_m": prior_sigma(i, on_foot)}),
                                  None))
         res = {job: f for job, f in zip(jobs, run_fits(args, workers, backend))
                if f is not None and f.success and np.isfinite(f.speed0)}
@@ -817,7 +845,7 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
         on_foot = (feet[i] is not None and sf.hit_point is not None
                    and np.hypot(*(sf.hit_point[:2] - feet[i])) < 1e-9)
         fo = FitOptions(**{**opts.__dict__, "p0_prior_m": sf.hit_point,
-                           "p0_prior_sigma_m": hitter_sigma_m if on_foot else hit_sigma_m,
+                           "p0_prior_sigma_m": prior_sigma(i, on_foot),
                            "refine_plane": False, "init_state": None})
         jobs.append(i)
         args.append((sf.obs, sf.t_hit, "plane", sf.fit.plane, phys, fo,
@@ -874,7 +902,8 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
                         cfg: dict[str, Any] | None = None, verbose: bool = False,
                         keep_shots: bool = False, feet_noise_m: float | None = None,
                         serve_depth_m: tuple[float, float] | None = None, joint: Any = None,
-                        true_vt: float | None = None, workers: int = 1, backend: str = "cpu") -> dict[str, Any]:
+                        true_vt: float | None = None, workers: int = 1, backend: str = "cpu",
+                        first_max_height_m: float | None = SERVE_MAX_HEIGHT_M) -> dict[str, Any]:
     """合成ラリーで、ショットの種類ごとの初速の誤差を測る。
 
     Args:
@@ -890,6 +919,8 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
         true_vt: 合成ラリーを作る・観測するときの本当の終端速度 [m/s]（省略時は設定の値と同じ。当てはめは設定の値から）
         workers: ショットごとの当てはめを並べるプロセスの数（``fit_shots``）
         backend: 当てはめの計算の仕方（``fit_shots`` の ``backend``）
+        first_max_height_m: ラリーの最初のショットの打点の高さの上限の目安（``fit_shots``。ショットの一覧と同じに、
+            見つけた最初の打球がサーブでなくても使う）
 
     Returns:
         ``rows``（1 ショット 1 行の DataFrame：種類・正解と推定の初速・誤差 [%]）と、
@@ -933,7 +964,8 @@ def synthetic_benchmark(n_rallies: int = 10, fps: float = 120.0, seed: int = 0, 
             foot_rng = np.random.default_rng([seed, 3, r])
             feet = [None if j is None else segs[j].p0[:2] + foot_rng.normal(0.0, feet_noise_m, 2) for j in pairs]
         fits = fit_shots(det, t_hits, camera, phys, sides, opts, t_audio=t_audio, hitter_xy=feet, workers=workers,
-                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None, backend=backend)
+                         serve_depth_m=serve_depth_m if pairs and pairs[0] == 0 else None, backend=backend,
+                         first_max_height_m=first_max_height_m)
         done.append((segs, pairs, fits, joint_job(fits, det, camera, feet, t_audio)))
     vt_rec, joined = None, [None] * len(done)
     if joint is not None:
@@ -1004,6 +1036,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="合成のカメラの位置（side：横・遠く、corner：角の後ろ・低い、low：横・低い）")
     ap.add_argument("--fit-backend", default="cpu", choices=["auto", "cpu", "batch"],
                     help="当てはめの計算の仕方（cpu：1 本ずつ、batch：まとめて解く）")
+    ap.add_argument("--no-first-height", action="store_true",
+                    help="ラリーの最初のショットの打点の高さの上限の目安（1.15 m）を使わない")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     from smash_speed.config import load_config
@@ -1015,7 +1049,8 @@ def main(argv: list[str] | None = None) -> None:
         for h in a.hits:
             t0 = time.time()
             r = synthetic_benchmark(a.rallies, fps, a.seed, h, camera=camera, cfg=cfg, verbose=a.verbose,
-                                    feet_noise_m=a.feet_noise, backend=resolve_backend(a.fit_backend))
+                                    feet_noise_m=a.feet_noise, backend=resolve_backend(a.fit_backend),
+                                    first_max_height_m=None if a.no_first_height else SERVE_MAX_HEIGHT_M)
             parts = [f"{SHOT_TYPE_LABELS[k]} {v['mape']:.1f}%（{v['n']} 本"
                      + (f"・失敗 {v['n_failed']}" if v["n_failed"] else "") + "）"
                      for k, v in r["by_type"].items() if v["mape"] is not None]
