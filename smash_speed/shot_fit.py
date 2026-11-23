@@ -478,16 +478,20 @@ def crossing_time(prev: FitResult, nxt: FitResult, camera: Camera, phys: Physics
 
 
 def refine_hit_times(fits: list[ShotFit], camera: Camera, phys: PhysicsParams, max_shift_s: float = 0.03,
-                     max_gap_px: float = 6.0) -> list[float]:
+                     max_gap_px: float = 6.0, max_rms_px: float = np.inf) -> list[float]:
     """打点の時刻を、前のショットと次のショットの軌道が画像上で交わる時刻に直す。
 
     初速は打点の時刻の速さなので、速いショットは時刻の数 ms のずれが大きく効く。
     交わる所が ``max_gap_px``（と当てはめのずれ）より離れていたら直さない。
+    どちらかの当てはめのずれが ``max_rms_px``（失敗として捨てる境目）を超えていても直さない
+    （別の物の検出が混ざった軌道に引きずられて、打った時刻が 20〜60 ms 動き、初速が大きく変わっていた。ROADMAP v2 の I2）。
     """
     out = [sf.t_hit for sf in fits]
     for i in range(1, len(fits)):
         prev, sf = fits[i - 1], fits[i]
         if prev.fit is None or sf.fit is None or prev.t_end < sf.t_hit - 1e-9:
+            continue
+        if not (prev.fit.rms_px <= max_rms_px and sf.fit.rms_px <= max_rms_px):
             continue
         lo, hi = sf.t_hit - max_shift_s, sf.t_hit + max_shift_s
         if prev.obs is not None and len(prev.obs.t):
@@ -754,7 +758,8 @@ def fit_shots(det: pd.DataFrame, t_hits: list[float], camera: Camera, phys: Phys
 
     t_audio = list(t_audio) if t_audio is not None else [None] * len(t_hits)
     for _ in range(n_rounds):
-        times = refine_hit_times(fits, camera, phys) if refine_times else [sf.t_hit for sf in fits]
+        times = (refine_hit_times(fits, camera, phys, max_rms_px=max_rms_px) if refine_times
+                 else [sf.t_hit for sf in fits])
         if any(t is not None for t in t_audio):
             times = audio_hit_times(fits, t_audio, camera, phys, times, speed_of_sound_mps)
         moved = False

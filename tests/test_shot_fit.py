@@ -89,6 +89,23 @@ def test_refine_hit_times_moves_toward_crossing(rally_fit, cam):
         assert abs(t - s.t_hit) < 0.003
 
 
+def test_refine_hit_times_skips_discarded_fits(rally_fit, cam):
+    """ずれが捨てる境目（``max_rms_px``）を超える当てはめは、となりの打った時刻の手がかりにしない（ROADMAP v2 の I2）。"""
+    import dataclasses
+
+    rally, _, fits = rally_fit
+    shifted = [dataclasses.replace(sf, t_hit=sf.t_hit + 0.01, t_end=sf.t_end + 0.01) for sf in fits]
+    moved = refine_hit_times(shifted, cam, PHYS, max_rms_px=50.0)
+    assert moved == refine_hit_times(shifted, cam, PHYS)
+    k = next(i for i, s in enumerate(rally.segments[1:], 1) if s.speed0 > 10 and abs(moved[i] - shifted[i].t_hit) > 1e-4)
+    bad = dataclasses.replace(shifted[k], fit=dataclasses.replace(shifted[k].fit, rms_px=60.0))
+    out = refine_hit_times(shifted[:k] + [bad] + shifted[k + 1:], cam, PHYS, max_rms_px=50.0)
+    assert out[k] == shifted[k].t_hit                 # 捨てるショットの打った時刻は、前の軌道から直さない
+    if k + 1 < len(fits):
+        assert out[k + 1] == shifted[k + 1].t_hit     # 次のショットの打った時刻も、捨てるショットの軌道から直さない
+    assert all(out[i] == moved[i] for i in range(len(fits)) if i not in (k, k + 1))
+
+
 def test_audio_hit_times_subtract_the_sound_delay(rally_fit, cam):
     """打球音の時刻から、打点からカメラまでの音の遅れを引いた時刻にする。交わる時刻と近ければそのまま。"""
     rally, _, fits = rally_fit
