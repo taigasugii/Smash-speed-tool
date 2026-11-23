@@ -6,6 +6,8 @@
 2. 主点を画像中心に固定し、(log f, rvec, tvec[, k1]) を ``least_squares`` で精緻化する。
 
 床面の点だけでも f を推定できるが、ネットポスト上端など **高さのある点** を加えると安定する。
+ネットの上の帯（白いテープ）の上の点は、コートの横方向のどこかが分からなくてもよい（``net_band``。帯の高さの線
+``net_top_curve`` との画像上の距離を残差にする。ROADMAP v2 の J4）。
 チェッカーボードで内部パラメータを事前に求めた場合は、f・主点・歪みを固定して外部パラメータだけを解く。
 """
 
@@ -19,6 +21,30 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from smash_speed.camera import Camera
+
+# ネットの上の端の高さ：支柱（コートの横方向 ±3.05 m）で 1.55 m、中央で 1.524 m（競技規則）。間は放物線で近似する
+NET_POST_HEIGHT_M = 1.55
+NET_CENTER_HEIGHT_M = 1.524
+NET_HALF_WIDTH_M = 3.05
+
+
+def net_top_curve(n: int = 61) -> np.ndarray:
+    """ネットの上の端の 3 次元の点 (n, 3) [m]（x = 0、y = −3.05〜3.05）。"""
+    y = np.linspace(-NET_HALF_WIDTH_M, NET_HALF_WIDTH_M, n)
+    z = NET_CENTER_HEIGHT_M + (NET_POST_HEIGHT_M - NET_CENTER_HEIGHT_M) * (y / NET_HALF_WIDTH_M) ** 2
+    return np.c_[np.zeros(n), y, z]
+
+
+def distance_to_polyline(pts: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """画像の点 (M, 2) から、折れ線 (K, 2) までの距離 (M,) [px]（線分ごとの最短距離の最小）。"""
+    a, b = poly[:-1], poly[1:]
+    ab = b - a
+    L2 = np.maximum(np.sum(ab * ab, axis=1), 1e-12)
+    t = np.clip(np.einsum("mkd,kd->mk", pts[:, None] - a[None], ab) / L2[None], 0.0, 1.0)
+    q = a[None] + t[..., None] * ab[None]
+    d = np.linalg.norm(pts[:, None] - q, axis=2)
+    d = np.where(np.isfinite(d), d, np.inf)
+    return d.min(axis=1)
 
 
 @dataclass
@@ -53,6 +79,7 @@ class CalibrationResult:
     method: str
     warnings: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)  # クリックの間違いとみなして推定から外した点
+    net_band_px: np.ndarray | None = None   # ネットの上の帯の点の、帯の線からの距離 (M,) [px]（``net_band`` を渡したとき）
 
     @property
     def used(self) -> np.ndarray:
@@ -131,13 +158,19 @@ def _pnp(world: np.ndarray, image: np.ndarray, f: float, cx: float, cy: float,
 
 def calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: int, height: int,
               intrinsics: Intrinsics | None = None, estimate_k1: bool = False,
-              warn_px: float = 5.0, reject_outliers: bool = True) -> CalibrationResult:
+              warn_px: float = 5.0, reject_outliers: bool = True,
+              net_band: np.ndarray | None = None) -> CalibrationResult:
     """ランドマークの対応からカメラを推定する。
 
     ``reject_outliers`` が真なら、ほかの点と明らかに合わない点（別の場所をクリックした点）を
     1 点ずつ外して推定し直す。外した点は ``excluded`` に入り、誤差は最終的なカメラで計算する。
+
+    ``net_band``（選べる高さの手がかり）：ネットの上の帯の上の画像の点 (M, 2) [px]。横方向のどこかは分からなくてよい。
+    帯の高さの線（``net_top_curve``）との画像上の距離を、ランドマークと同じ重みで残差に足す（床の点だけでは、
+    高さの向き（焦点距離とカメラの傾き）の誤差が残る）。内部パラメータを渡したときは使わない。
     """
-    res = _calibrate(names, world, image, width, height, intrinsics, estimate_k1, warn_px)
+    band = None if net_band is None or len(net_band) == 0 else np.asarray(net_band, float).reshape(-1, 2)
+    res = _calibrate(names, world, image, width, height, intrinsics, estimate_k1, warn_px, band)
     if not reject_outliers:
         return res
     world, image, names = np.asarray(world, float), np.asarray(image, float), list(names)
@@ -155,19 +188,20 @@ def calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: int
         excluded.append(names[j])
         keep[j] = False
         res = _calibrate([n for n, k in zip(names, keep) if k], world[keep], image[keep], width, height,
-                         intrinsics, estimate_k1, warn_px)
+                         intrinsics, estimate_k1, warn_px, band)
     if not excluded:
         return res
     errors = np.linalg.norm(res.camera.project(world) - image, axis=1)
     errors = np.where(np.isfinite(errors), errors, 1e4)
     warns = [f"{n}: 再投影誤差 {errors[names.index(n)]:.0f} px。ほかの点と合わないため、推定から外しました"
              "（別の場所をクリックした可能性があります）。" for n in excluded]
-    return CalibrationResult(res.camera, names, world, image, errors, res.method, warns + res.warnings, excluded)
+    return CalibrationResult(res.camera, names, world, image, errors, res.method, warns + res.warnings, excluded,
+                             res.net_band_px)
 
 
 def _calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: int, height: int,
                intrinsics: Intrinsics | None = None, estimate_k1: bool = False,
-               warn_px: float = 5.0) -> CalibrationResult:
+               warn_px: float = 5.0, band: np.ndarray | None = None) -> CalibrationResult:
     """すべての点を使ってカメラを推定する（``calibrate`` の本体）。
 
     Args:
@@ -178,6 +212,7 @@ def _calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: in
         intrinsics: 既知の内部パラメータ（あれば外部パラメータだけ推定）
         estimate_k1: 放射歪み k1 も推定するか（点が多い場合のみ推奨）
         warn_px: 再投影誤差の警告閾値 [px]
+        band: ネットの上の帯の上の画像の点 (M, 2) [px]（``calibrate`` の ``net_band``）
     """
     world = np.asarray(world, float)
     image = np.asarray(image, float)
@@ -186,7 +221,7 @@ def _calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: in
     if n < 4:
         raise ValueError(f"キャリブレーションには4点以上が必要です（現在 {n} 点）")
     coplanar = is_coplanar(world)
-    if coplanar:
+    if coplanar and band is None:
         warnings.append("全点が同一平面上にあります。高さのある点（ネットポスト上端など）を加えると焦点距離が安定します。")
 
     if intrinsics is not None:
@@ -227,15 +262,20 @@ def _calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: in
             return Camera(np.exp(p[0]), cx, cy, width, height, p[1:4], p[4:7],
                           p[7] if estimate_k1 else 0.0)
 
+        curve = net_top_curve()
+
         def resid(p: np.ndarray) -> np.ndarray:
-            uv = unpack(p).project(world)
+            cam_p = unpack(p)
+            uv = cam_p.project(world)
             r = (uv - image).ravel()
+            if band is not None:
+                r = np.r_[r, distance_to_polyline(band, cam_p.project(curve))]
             return np.where(np.isfinite(r), r, 1e4)
 
         p0 = np.r_[np.log(f0), rvec0, tvec0, [0.0] if estimate_k1 else []]
         sol = least_squares(resid, p0, loss="soft_l1", f_scale=warn_px, x_scale="jac")
         cam = unpack(sol.x)
-        method = "pnp_focal_search+lm" + ("+k1" if estimate_k1 else "")
+        method = "pnp_focal_search+lm" + ("+k1" if estimate_k1 else "") + ("+net" if band is not None else "")
 
     errors = np.linalg.norm(cam.project(world) - image, axis=1)
     for name, e in zip(names, errors):
@@ -243,7 +283,12 @@ def _calibrate(names: list[str], world: np.ndarray, image: np.ndarray, width: in
             warnings.append(f"{name}: 再投影誤差 {e:.1f} px（閾値 {warn_px} px）。クリック位置を確認してください。")
     if n <= 5 and intrinsics is None:
         warnings.append("点が5点以下です。誤差が小さく見えても過適合の可能性があります。")
-    return CalibrationResult(cam, list(names), world, image, errors, method, warnings)
+    band_px = None
+    if band is not None:
+        band_px = distance_to_polyline(band, cam.project(net_top_curve()))
+        if intrinsics is not None:
+            warnings.append("内部パラメータを固定したので、ネットの上の帯の点は使っていません。")
+    return CalibrationResult(cam, list(names), world, image, errors, method, warnings, net_band_px=band_px)
 
 
 def intrinsics_from_checkerboard(images: list[np.ndarray], pattern: tuple[int, int],
