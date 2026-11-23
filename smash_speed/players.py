@@ -539,9 +539,9 @@ def uncertain_feet(players: pd.DataFrame, camera: Camera, o: PlayerOptions | Non
     枠の下の辺が画面の端に付く（手前の選手の足が画面の外）・足元がネットの帯に掛かる（奥の選手の足がネットに隠れる）・
     ほかの選手のより手前の枠の中にある（隠れる）コマは、枠の下の辺が足元ではないので、床へ投影した位置が 1〜4 m 跳ぶ
     （IMG_3391 1.2 s・IMG_5096 12.7 s で奥の選手の最高の速さが 8.0・8.6 m/s）。
-    ``fill_s`` より短い不確かな間は、前後の確かなコマ（跳んでいないもの）から直線で補う。長い間は、枠の上の辺が
-    その選手のふだんの枠の高さ（確かなコマの ``body_heights`` の中央値）にあるとして、上の辺の視線とその高さの面の
-    交点を足元にする（枠の上の辺も画面の端に付くコマは、補えなければそのまま）。``u, v`` と枠は検出のまま残す。
+    ``fill_s`` より短い不確かな間は、前後の確かなコマ（跳んでいないもの）から直線で補う。長い間（低いカメラの手前の
+    選手は 20〜54% のコマで足が画面の下の外）は印だけ付けて位置はそのまま（枠の上の辺とふだんの高さから足元を出す形も
+    試したが、かがむ・腕を上げるだけで 1〜3 m 跳んだ）。``u, v`` と枠は検出のまま残す。
     """
     o = o or PlayerOptions()
     out = players.copy()
@@ -549,9 +549,8 @@ def uncertain_feet(players: pd.DataFrame, camera: Camera, o: PlayerOptions | Non
     if out.empty or not {"x0", "y0", "x1", "y1"} <= set(out.columns):
         return out
     out["foot_noise_m"] = foot_noise_m(out, camera)
-    flag, top_cut = _feet_flags(out, camera, o)
+    flag, _ = _feet_flags(out, camera, o)
     out["foot_uncertain"] = flag
-    height = body_heights(out, camera)
     air = out["airborne"].to_numpy(bool) if "airborne" in out else np.zeros(len(out), bool)
     for _, g in out.groupby(["side", "player"]):
         g = g.sort_values("t")
@@ -561,7 +560,6 @@ def uncertain_feet(players: pd.DataFrame, camera: Camera, o: PlayerOptions | Non
             continue
         good = ~bad & ~air[ii]
         t = g["t"].to_numpy(float)
-        h_med = float(np.nanmedian(height[ii][good])) if good.sum() >= 3 else np.nan
         start = np.flatnonzero(bad & ~np.r_[False, bad[:-1]])
         stop = np.flatnonzero(bad & ~np.r_[bad[1:], False]) + 1
         for a, b in zip(start, stop):
@@ -573,14 +571,8 @@ def uncertain_feet(players: pd.DataFrame, camera: Camera, o: PlayerOptions | Non
                 for col in ("x", "y"):
                     out.loc[idx, col] = np.interp(t[a:b], t[k], g[col].to_numpy(float)[k])
                 continue
-            if not np.isfinite(h_med):
-                continue
-            ok = ~top_cut[ii][a:b]
-            uv = np.column_stack([(g["x0"].to_numpy(float)[a:b] + g["x1"].to_numpy(float)[a:b]) / 2,
-                                  g["y0"].to_numpy(float)[a:b]])
-            X = floor_point(camera, uv, z=h_med)
-            ok &= np.isfinite(X[:, 0])
-            out.loc[idx[ok], "x"], out.loc[idx[ok], "y"] = X[ok, 0], X[ok, 1]
+            # 長い間はそのまま（印だけ）。枠の上の辺から足元を出すと、かがむ・腕を上げるだけで 1〜3 m 跳ぶ
+            # （IMG_5109 19.5 s、手前の選手がシャトルを拾うとき 6.3 m/s）。画面の下で切れた足元は手前に寄るが、跳ばない
     return out
 
 
