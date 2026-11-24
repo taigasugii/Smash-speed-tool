@@ -2,6 +2,7 @@
 
 import cv2
 import numpy as np
+import pytest
 
 from smash_speed.calibration import landmark_table
 from smash_speed.calibration.auto_court_calibrator import LINE_WIDTH_M, _apply_h
@@ -241,3 +242,85 @@ def test_distortion_round_trip():
     c = np.array([960.0, 540.0])
     for kappa in (-0.2, 0.0, 0.3):
         np.testing.assert_allclose(undistort_points(distort_points(p, kappa, c, 1920.0), kappa, c, 1920.0), p, atol=1e-6)
+
+
+def _floor_render(C, target, f, size=(1080, 1920), seed=0, ss=2) -> tuple[np.ndarray, np.ndarray]:
+    """カメラから床へ光線を飛ばして描いた画像（地平線より上は壁、カメラの後ろの床は描かない）と、床のホモグラフィ。
+
+    ``_court_image`` はホモグラフィで描くので、カメラの後ろの床も地平線の上に写ってしまう（低い・横のカメラで使えない）。
+    """
+    C, T = np.asarray(C, float), np.asarray(target, float)
+    zc = (T - C) / np.linalg.norm(T - C)
+    xc = np.cross(zc, [0, 0, 1.0]); xc /= np.linalg.norm(xc)
+    yc = np.cross(zc, xc)
+    R = np.vstack([xc, yc, zc])
+    h, w = size
+    K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]])
+    Hm = K @ np.c_[R[:, 0], R[:, 1], -R @ C]
+    U, V = np.meshgrid((np.arange(w * ss) + 0.5) / ss, (np.arange(h * ss) + 0.5) / ss)
+    d = np.stack([(U - w / 2) / f, (V - h / 2) / f, np.ones_like(U)], -1) @ R
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lam = -C[2] / d[..., 2]
+    floor = (d[..., 2] < 0) & (lam > 0) & (lam < 60)
+    X, Y = C[0] + lam * d[..., 0], C[1] + lam * d[..., 1]
+    line = np.zeros(U.shape, bool)
+    for ax, c, spans in LINES.values():
+        a, b = (X, Y) if ax == "x" else (Y, X)
+        line |= (np.abs(a - c) <= LINE_WIDTH_M / 2) & np.any([(b >= lo) & (b <= hi) for lo, hi in spans], axis=0)
+    seam = (np.abs(((X + 0.065) % 0.13) - 0.065) < 0.004) | (np.abs(((Y + 0.45) % 0.9) - 0.45) < 0.004)
+    img = np.empty(U.shape + (3,), np.float32)
+    img[:] = (150, 190, 215)
+    img[seam & floor] *= 0.65
+    img[line & floor] = (60, 110, 70)
+    img[~floor] = (170, 170, 165)
+    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA) + np.random.default_rng(seed).normal(0, 3, (h, w, 3))
+    return np.clip(img, 0, 255).astype(np.uint8), Hm / Hm[2, 2]
+
+
+def test_floor_depths_and_tilt():
+    from smash_speed.calibration.propose import _CORNERS, _tilt_deg, floor_depths
+
+    # ネットの近くの横（コートの外、1.3 m）から斜めに撮るカメラでは、手前の角がカメラの後ろにある
+    _, Hm = _floor_render((-1.0, -4.5, 1.3), (1.5, 0.5, 0.0), 700.0, size=(54, 96), ss=1)
+    K = np.array([[700.0, 0, 48], [0, 700.0, 27], [0, 0, 1]])
+    d = floor_depths(Hm, K, _CORNERS)
+    assert d[0] < 0 < min(d[1:])
+    # 符号はホモグラフィの倍率によらない
+    assert np.array_equal(np.sign(floor_depths(-3.0 * Hm, K, _CORNERS)), np.sign(d))
+    # 世界の上向きが画像の上：傾き 0°、横倒し：90°
+    assert _tilt_deg(np.c_[[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]]) == pytest.approx(0.0)
+    assert _tilt_deg(np.eye(3)) == pytest.approx(90.0)
+
+
+def test_propose_finds_court_from_net_side_oblique_camera():
+    from smash_speed.calibration.propose import propose_calibrations
+
+    table = landmark_table(load_config())
+    # G1 の練習の動画の撮り方（ネットの近くの横・1.3 m から斜め上へ）。手前の角はカメラの後ろ。手順 ① は 1.5 m ずれている
+    frame, Hm = _floor_render((-1.0, -4.5, 1.3), (1.5, 0.5, 2.3), 700.0)
+    props = propose_calibrations(frame, table, n=3, cam_xy=(0.5, -6.0))
+    assert props
+    W = np.array([v[:2] for v in table.values() if abs(v[2]) < 1e-6])
+    ref = _apply_h(Hm, W)
+    q = np.c_[W, np.ones(len(W))] @ Hm.T
+    m = (q[:, 2] > 0) & (ref[:, 0] >= 0) & (ref[:, 0] < 1920) & (ref[:, 1] >= 0) & (ref[:, 1] < 1080)
+    err = min(float(np.median(np.linalg.norm(_apply_h(H, W[m]) - ref[m], axis=1)))
+              for H in (props[0].result.homography, props[0].result.homography @ np.diag([-1.0, -1, 1])))
+    assert err < 3.0
+
+
+def test_vanishing_candidates_without_camera_position():
+    from smash_speed.calibration.propose import vanishing_candidates
+
+    table = landmark_table(load_config())
+    # 練習の動画の撮り方（手前の半面の横、外側の線から 0.9 m 外・高さ 1.5 m からネットの向こうへ）。手順 ① の位置はない
+    frame, Hm = _floor_render((-6.1, 3.9, 1.5), (4.0, -1.0, 1.2), 900.0, size=(540, 960))
+    cands = vanishing_candidates(frame, None)
+    assert cands
+    W = np.array([v[:2] for v in table.values() if abs(v[2]) < 1e-6])
+    ref = _apply_h(Hm, W)
+    q = np.c_[W, np.ones(len(W))] @ Hm.T
+    m = (q[:, 2] > 0) & (ref[:, 0] >= 0) & (ref[:, 0] < 960) & (ref[:, 1] >= 0) & (ref[:, 1] < 540)
+    errs = [min(float(np.median(np.linalg.norm(_apply_h(H @ s, W[m]) - ref[m], axis=1)))
+                for s in (np.eye(3), np.diag([-1.0, -1, 1]))) for H, _ in cands]
+    assert min(errs) < 5.0
