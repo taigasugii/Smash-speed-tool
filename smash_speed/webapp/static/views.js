@@ -37,7 +37,9 @@ App.views.home = {
         <h2 style="margin:0;flex:1">この動画の進み具合</h2><span class="badge info">${esc(nextText)}</span></div>
       ${row("video", true, "動画を開く", esc(r.video), "")}
       ${row("drill", D.done, "基礎打ちの解析", drillDesc,
-        `<button class="btn sm ${!D.done && next === "calib" ? "" : "ghost"}" id="hs-drill">${D.done ? "解析し直す" : "基礎打ちを解析する"}</button>`)}
+        `${D.done ? `<button class="btn sm" id="hs-hl">見どころの動画を作る</button>` : ""}
+         ${D.highlights ? `<button class="btn sm" id="hs-hlopen">見どころを開く</button>` : ""}
+         <button class="btn sm ${!D.done && next === "calib" ? "" : "ghost"}" id="hs-drill">${D.done ? "解析し直す" : "基礎打ちを解析する"}</button>`)}
       ${row("calib", r.calibrated, "コートを合わせる", r.calibrated ? "このカメラ位置のコート合わせは済んでいます。" :
         "画面の位置を実際の距離にするために、コートのラインに合わせます（カメラを動かさなければ 1 回だけ）。",
         `<button class="btn sm ${next === "calib" ? "primary" : "ghost"}" id="hs-calib">${r.calibrated ? "確かめる" : "コートを合わせる →"}</button>`)}
@@ -51,6 +53,13 @@ App.views.home = {
       toast(okk ? "基礎打ちの解析が終わりました" : "解析できませんでした（ログを見てください）", okk ? "ok" : "bad");
       if (App.current === "home") go("home");
     }, "基礎打ちの解析");
+    // 基礎打ちの見どころ：長く続いた打ち合いの上位 3 本（シャトルの通り道・打球の印・続いた本数を重ねる）
+    if ($("#hs-hl", card)) $("#hs-hl", card).onclick = () => Task.start("drill_highlights", { n: 3 }, (okk) => {
+      toast(okk ? "見どころを書き出しました" : "書き出せませんでした（ログを見てください）", okk ? "ok" : "bad");
+      if (App.current === "home") go("home");
+    }, "基礎打ちの見どころを書き出しています");
+    if ($("#hs-hlopen", card)) $("#hs-hlopen", card).onclick = () =>
+      api.post("/api/open", { path: D.highlights }).then((r) => r.ok || toast(r.error, "bad"));
     $("#hs-calib", card).onclick = () => go("calib");
     $("#hs-shots", card).onclick = () => go("shots");
     $("#hs-report", card).onclick = () => window.open("/report/shots", "_blank");

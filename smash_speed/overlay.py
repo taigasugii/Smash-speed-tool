@@ -518,6 +518,205 @@ def write_highlights(o: HighlightOptions, cfg: dict[str, Any] | None = None, pro
     return info
 
 
+# =============================================================================
+# 基礎打ちの見どころ（コート合わせなし。ROADMAP v2 の K2）
+# =============================================================================
+STREAK_GAP_S = 2.5       # 打球の間がこれより空いたら、別の続いた打ち合い（G4 の区切りがまだないときの目安）
+HIT_MARK_S = 0.35        # 打球の印を出しておく長さ [s]
+HIT_COLOR = (60, 60, 255)   # 打球の印（赤）
+DRILL_SEGMENTS_FILE = "drill_segments.csv"   # G4 の続いた打ち合いの区切り（あれば使う）
+
+
+def is_drill_dir(d: Path) -> bool:
+    """基礎打ちの解析の出力先（``drill.py``。``drill_detect.json``・``hits.csv`` があり、ショットの一覧ではない）か。"""
+    from smash_speed.shot_list import SHOT_LIST_FILE
+
+    d = Path(d)
+    return (d / "drill_detect.json").exists() and (d / "hits.csv").exists() and not (d / SHOT_LIST_FILE).exists()
+
+
+def drill_streaks(t_hits: np.ndarray, max_gap_s: float = STREAK_GAP_S) -> list[tuple[int, int]]:
+    """打球の時刻（並べたもの）を、間が ``max_gap_s`` より空いた所で区切った続いた打ち合い（打球の番号の [始め, 終わり)）。"""
+    t = np.asarray(t_hits, float)
+    if not len(t):
+        return []
+    cut = np.flatnonzero(np.diff(t) > max_gap_s) + 1
+    edges = np.r_[0, cut, len(t)]
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:])]
+
+
+class DrillOverlayData:
+    """基礎打ちの解析の結果（シャトルの検出・打球）と動画を、書き出す大きさに合わせて読む（コート合わせはいらない）。"""
+
+    def __init__(self, drill_dir: Path, video: Path | None = None, height: int | None = None,
+                 cfg: dict[str, Any] | None = None, max_gap_s: float = STREAK_GAP_S):
+        from smash_speed.shot_list import DETECTIONS_FILE
+
+        d = Path(drill_dir)
+        if not is_drill_dir(d):
+            raise AnalysisError(f"{d} に基礎打ちの解析の結果がありません。", ["先に「基礎打ちを解析する」を押してください。"])
+        self.dir = d
+        self.info = json.loads((d / "drill_detect.json").read_text(encoding="utf-8"))
+        video = Path(video or self.info.get("video") or "")
+        if not video.is_file():
+            raise AnalysisError(f"元の動画 {video} が見つかりません。", ["動画を動かしていないか確かめてください。"])
+        self.meta: VideoMeta = probe(video, self.info.get("capture_fps"), cfg)
+        h = int(height or min(DEFAULT_HEIGHT, self.meta.height))
+        self.scale = min(1.0, h / self.meta.height)
+        self.size = (_even(self.meta.width * self.scale), _even(self.meta.height * self.scale))
+        k = self.size[0] / self.meta.width
+        det = pd.read_csv(d / DETECTIONS_FILE) if (d / DETECTIONS_FILE).exists() else pd.DataFrame()
+        if len(det):
+            det = det[(det.visible > 0) & det.x_px.notna()].sort_values("timestamp")
+            self.det_t = det.timestamp.to_numpy(float)
+            self.det_uv = det[["x_px", "y_px"]].to_numpy(float) * k
+            self.det_frame = det.frame.to_numpy(int)
+        else:
+            self.det_t, self.det_uv, self.det_frame = np.zeros(0), np.zeros((0, 2)), np.zeros(0, int)
+        self.hit_t = np.sort(pd.read_csv(d / "hits.csv").t.to_numpy(float))
+        # 打球の印の場所：打球の時刻にいちばん近い（0.2 秒以内の）シャトルの点
+        self.hit_uv: list[tuple[int, int] | None] = []
+        for t in self.hit_t:
+            j = int(np.argmin(np.abs(self.det_t - t))) if len(self.det_t) else -1
+            ok = j >= 0 and abs(self.det_t[j] - t) < 0.2
+            self.hit_uv.append((int(self.det_uv[j, 0]), int(self.det_uv[j, 1])) if ok else None)
+        self.streaks = self._segments(d, max_gap_s)
+
+    def _segments(self, d: Path, max_gap_s: float) -> list[tuple[int, int]]:
+        """続いた打ち合い。G4 の区切り（``drill_segments.csv``、列 ``t_start_s``・``t_end_s``）があればそれ、なければ間で区切る。"""
+        f = d / DRILL_SEGMENTS_FILE
+        if f.exists():
+            seg = pd.read_csv(f)
+            if {"t_start_s", "t_end_s"} <= set(seg.columns):
+                out = []
+                for a, b in zip(seg.t_start_s, seg.t_end_s):
+                    i0 = int(np.searchsorted(self.hit_t, float(a) - 1e-6))
+                    i1 = int(np.searchsorted(self.hit_t, float(b) + 1e-6, side="right"))
+                    if i1 > i0:
+                        out.append((i0, i1))
+                return out
+        return drill_streaks(self.hit_t, max_gap_s)
+
+    def count_at(self, t: float) -> tuple[int, int] | None:
+        """時刻 ``t`` の続いた打ち合い（の番号）と、そこまでに打った本数。打ち合いの外なら None。"""
+        k = int(np.searchsorted(self.hit_t, t + 1e-6, side="right"))   # t までの打球の数
+        for i, (a, b) in enumerate(self.streaks):
+            if a < k <= b and t <= self.hit_t[b - 1] + 1.0:
+                return i, k - a
+        return None
+
+
+class DrillPainter:
+    """基礎打ちの見どころの 1 枚：シャトルの通り道・打球の印・続いた本数（コート合わせなしで描けるものだけ）。"""
+
+    def __init__(self, data: DrillOverlayData, draw: DrawOptions | None = None):
+        self.d = data
+        self.o = draw or DrawOptions(trajectory=False, labels=False)
+        h = data.size[1]
+        self.thick = max(1, int(round(h / 360)))
+        self.count = TextStamp(int(h / 14))
+        self.caption = TextStamp(int(h / 28))
+
+    def paint(self, frame: np.ndarray, t: float, caption: str | None = None) -> np.ndarray:
+        d, o = self.d, self.o
+        if o.trail and len(d.det_t):
+            i0 = int(np.searchsorted(d.det_t, t - o.trail_s))
+            i1 = int(np.searchsorted(d.det_t, t + 1e-6, side="right"))
+            n = i1 - i0
+            for k in range(i0, i1):
+                p = (int(d.det_uv[k, 0]), int(d.det_uv[k, 1]))
+                age = (k - i0 + 1) / max(n, 1)
+                if k > i0 and d.det_frame[k] - d.det_frame[k - 1] <= 3:
+                    q = (int(d.det_uv[k - 1, 0]), int(d.det_uv[k - 1, 1]))
+                    cv2.line(frame, q, p, TRAIL_COLOR, max(1, int(self.thick * (0.5 + age))), cv2.LINE_AA)
+                cv2.circle(frame, p, max(2, int(self.thick * (1 + 2 * age))), TRAIL_COLOR, -1, cv2.LINE_AA)
+        # 打球の印：打った所に広がる赤い輪
+        j0 = int(np.searchsorted(d.hit_t, t - HIT_MARK_S))
+        j1 = int(np.searchsorted(d.hit_t, t + 1e-6, side="right"))
+        for j in range(j0, j1):
+            if d.hit_uv[j] is None:
+                continue
+            a = (t - d.hit_t[j]) / HIT_MARK_S
+            r = int(self.thick * (6 + 14 * a))
+            cv2.circle(frame, d.hit_uv[j], r, HIT_COLOR, max(2, 2 * self.thick), cv2.LINE_AA)
+        if caption:
+            m = self.caption.size // 2
+            self.caption.paste(frame, caption, (m, m), (255, 255, 255), anchor="topleft")
+        c = d.count_at(t)
+        if c is not None:
+            # 続いた本数は右上に大きく
+            img = self.count.image(f"{c[1]} 本", (255, 255, 255))
+            m = self.count.size // 3
+            self.count.paste(frame, f"{c[1]} 本", (frame.shape[1] - img.shape[1] - m, m), (255, 255, 255),
+                             anchor="topleft")
+        return frame
+
+
+def pick_longest_streaks(data: DrillOverlayData, n: int = 3, before_s: float = 1.0, after_s: float = 1.5,
+                         max_s: float = 60.0) -> list[Highlight]:
+    """打球の数の多い順に N 本の続いた打ち合い（同じ数なら長い方）。長すぎるものは最初の ``max_s`` 秒だけ。"""
+    rows = []
+    for i, (a, b) in enumerate(data.streaks):
+        t0, t1 = float(data.hit_t[a]), float(data.hit_t[b - 1])
+        rows.append((b - a, t1 - t0, i, t0, t1))
+    rows.sort(key=lambda r: (-r[0], -r[1]))
+    out = []
+    for r, (n_hits, _, i, t0, t1) in enumerate(rows[:n], 1):
+        s0 = max(0.0, t0 - before_s)
+        out.append(Highlight(r, "streak", s0, min(t1 + after_s, s0 + max_s),
+                             f"長く続いた打ち合い {r} 位：{n_hits} 本", t_hit_s=t0, rally_id=i + 1, n_shots=n_hits))
+    return out
+
+
+@dataclass
+class DrillHighlightOptions:
+    drill_dir: Path
+    out_dir: Path | None = None              # 省略時は <出力先>/highlights
+    video: Path | None = None
+    n: int = 3                               # 長く続いた打ち合いを何本
+    before_s: float = 1.0
+    after_s: float = 1.5
+    max_gap_s: float = STREAK_GAP_S
+    height: int | None = None
+    draw: DrawOptions = field(default_factory=lambda: DrawOptions(trajectory=False, labels=False))
+    audio: bool = True
+    crf: int = 20
+    join: bool = True
+
+
+def write_drill_highlights(o: DrillHighlightOptions, cfg: dict[str, Any] | None = None,
+                           progress: Callable[[str], None] = print, use_ffmpeg: bool = True) -> dict[str, Any]:
+    """基礎打ちの見どころ（長く続いた打ち合い上位 N 本）を書き、``highlights.json`` の中身を返す。"""
+    data = DrillOverlayData(o.drill_dir, o.video, o.height, cfg, o.max_gap_s)
+    out = Path(o.out_dir) if o.out_dir else Path(o.drill_dir) / HIGHLIGHTS_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    hl = pick_longest_streaks(data, o.n, o.before_s, o.after_s)
+    if not hl:
+        raise AnalysisError("見どころにできる打ち合いがありません。", ["打球が見つかった動画を選んでください。"])
+    end = float(data.meta.timestamps[-1])
+    painter = DrillPainter(data, o.draw)
+    files: list[Path] = []
+    for k, h in enumerate(hl, 1):
+        h.end_s = min(h.end_s, end)
+        name = f"{k:02d}_{h.kind}_{h.rank}.mp4"
+        w = FrameWriter(out / name, data.size, data.meta.fps_meta, cfg,
+                        _audio_window(data, h.start_s, h.end_s, o.audio), o.crf, use_ffmpeg)  # type: ignore[arg-type]
+        try:
+            render_range(data, painter, w, h.start_s, h.end_s, h.title,  # type: ignore[arg-type]
+                         progress=_progress_printer(progress, f"見どころ {k} / {len(hl)} を書き出し中"))
+        finally:
+            w.close()
+        h.file = name
+        files.append(out / name)
+    joined = join_videos(files, out / "highlights.mp4", cfg, use_ffmpeg) if o.join else None
+    info = {"drill_dir": str(Path(o.drill_dir).resolve()), "video": data.meta.path,
+            "joined": joined.name if joined else None, "size": list(data.size), "n_streaks": len(data.streaks),
+            "clips": [h.__dict__ for h in hl]}
+    (out / HIGHLIGHTS_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+    progress(f"[進行] 完了：見どころ {len(hl)} 本（{out}）")
+    return info
+
+
 def join_videos(files: list[Path], out: Path, cfg: dict[str, Any] | None = None, use_ffmpeg: bool = True) -> Path:
     """同じ大きさ・同じ書き方の動画をつなぐ。ffmpeg があれば書き直さずにつなぎ、なければ OpenCV で書き直す。"""
     ffmpeg = None
@@ -559,7 +758,8 @@ def join_videos(files: list[Path], out: Path, cfg: dict[str, Any] | None = None,
 # コマンド
 # =============================================================================
 def add_arguments(p: argparse.ArgumentParser) -> None:
-    p.add_argument("shots_dir", help="ショットの一覧の出力先（smash-speed shots の --out）")
+    p.add_argument("shots_dir", help="ショットの一覧の出力先（smash-speed shots の --out）か、基礎打ちの解析の出力先"
+                                     "（python -m smash_speed.drill の --out。--highlights で長く続いた打ち合いを書き出す）")
     p.add_argument("--video", help="元の動画（省略時は shot_list.json に書いた動画）")
     p.add_argument("--out", help="書き出す動画（省略時は <出力先>/overlay.mp4。--highlights ではフォルダ）")
     p.add_argument("--start", type=float, help="書き出す区間の始め [s]")
@@ -574,12 +774,23 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--top", type=int, default=5, help="--highlights：速い順に何本か")
     p.add_argument("--type", default="smash", help="--highlights：速い順に選ぶ種類（all ならすべて）")
     p.add_argument("--rallies", type=int, default=0, help="--highlights：長いラリーを何本足すか")
+    p.add_argument("--streaks", type=int, default=3, help="--highlights（基礎打ちの解析の出力先）：長く続いた打ち合いを何本")
     p.add_argument("--before", type=float, default=1.0, help="--highlights：打つ何秒前から")
     p.add_argument("--after", type=float, default=2.0, help="--highlights：打った何秒後まで")
 
 
 def run_from_args(a: argparse.Namespace, cfg: dict[str, Any] | None = None) -> int:
     draw = DrawOptions(trail=not a.no_trail, trajectory=not a.no_trajectory, labels=not a.no_labels)
+    if is_drill_dir(Path(a.shots_dir)):
+        if not a.highlights:
+            raise AnalysisError("基礎打ちの解析の結果は、見どころ（--highlights）だけを書き出せます。", ["--highlights を付けてください。"])
+        write_drill_highlights(DrillHighlightOptions(Path(a.shots_dir), Path(a.out) if a.out else None,
+                                                     Path(a.video) if a.video else None, a.streaks, a.before,
+                                                     a.after, height=a.height,
+                                                     draw=DrawOptions(trail=not a.no_trail, trajectory=False,
+                                                                      labels=False),
+                                                     audio=not a.no_audio), cfg, use_ffmpeg=not a.opencv)
+        return 0
     if a.highlights:
         write_highlights(HighlightOptions(Path(a.shots_dir), Path(a.out) if a.out else None,
                                           Path(a.video) if a.video else None, a.top,

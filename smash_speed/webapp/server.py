@@ -800,6 +800,17 @@ def run(kind: str):
                 args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
             title = "速さを重ねた動画を書き出す"
         t = start_task(title, [cli(*args)])
+    elif kind == "drill_highlights":
+        # 基礎打ちの見どころ：長く続いた打ち合いの上位を書き出す（コート合わせなし。ROADMAP v2 の K2）
+        from smash_speed import video_queue as vq
+
+        if not st.get("video"):
+            return err("先に動画を開いてください。")
+        dd = vq.drill_dir(root, Path(st["video"]).stem)
+        if not (dd / vq.DRILL_DONE).exists():
+            return err("先に「基礎打ちを解析する」を押してください。")
+        t = start_task("基礎打ちの見どころを書き出す",
+                       [cli("overlay", dd, "--highlights", "--streaks", int(b.get("n", 3)))])
     elif kind == "drill":
         # 開いている動画の基礎打ちの解析（コート合わせはいらない。ホームの「基礎打ちを解析する」）
         from smash_speed import video_queue as vq
@@ -909,6 +920,14 @@ def home_status() -> dict[str, Any]:
         out["drill"] = {"done": True, "dir": str(dd), "n_hits": info.get("n_hits"),
                         "hits_per_min": info.get("hits_per_min"), "n_onsets": info.get("n_onsets"),
                         "duration_s": info.get("duration_s") or (float(S.meta.timestamps[-1]) if S.meta else None)}
+        hj = dd / "highlights" / "highlights.json"
+        if hj.exists():   # 基礎打ちの見どころ（K2）
+            try:
+                h = json.loads(hj.read_text(encoding="utf-8"))
+                out["drill"]["highlights"] = str(dd / "highlights" / (h.get("joined") or ""))
+                out["drill"]["n_highlights"] = len(h.get("clips") or [])
+            except (OSError, json.JSONDecodeError):
+                pass
     sd = Path(_shots_dir_for_video())
     if (sd / SHOT_LIST_FILE).exists():
         try:
