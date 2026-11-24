@@ -197,3 +197,57 @@ def test_real_video_check_retracks_the_baseline_hitters(session, tmp_path):
     # 2 回目も元の大まかな推定（hitter_rough）から選び、hitter_rough は書き換えない
     chk.retrack_hitters(entry, d / "synthetic.mp4", cfg, det, tmp_path / "w2")
     assert entry["candidates"][0]["hitter_rough"] == rough
+
+
+def _two_players(t_s=(0.9, 1.0, 1.1)):
+    """手前（h。画像の左下の大きな枠）と奥（o。右上の小さな枠）の選手。"""
+    import pandas as pd
+
+    rows = []
+    for t in t_s:
+        rows.append({"t": t, "frame": int(round(t * 30)), "side": "h", "player": 0, "x": -5.0, "y": 0.0,
+                     "x0": 400.0, "y0": 800.0, "x1": 700.0, "y1": 1600.0})
+        rows.append({"t": t, "frame": int(round(t * 30)), "side": "o", "player": 1, "x": 5.0, "y": 0.0,
+                     "x0": 2600.0, "y0": 600.0, "x1": 2750.0, "y1": 950.0})
+    return pd.DataFrame(rows)
+
+
+def _track(points, t0=1.0, fps=30.0):
+    import pandas as pd
+
+    return pd.DataFrame({"timestamp": t0 + np.arange(len(points)) / fps, "x_px": [p[0] for p in points],
+                         "y_px": [p[1] for p in points], "visible": 1})
+
+
+def test_shuttle_side_takes_the_player_next_to_the_shuttle_after_the_hit():
+    from smash_speed.batch import shuttle_side
+
+    pl = _two_players()
+    # 手前の選手の頭の上から、奥へ速く飛ぶ（3 点目からは奥の選手の近く）。最初の 2 点で手前
+    near_h = _track([(650, 760), (1200, 760), (2400, 700), (2650, 700)])
+    assert shuttle_side(pl, near_h, 1.0) == "h"
+    near_o = _track([(2700, 580), (2300, 640), (900, 800)])
+    assert shuttle_side(pl, near_o, 1.0) == "o"
+    # 両側から（枠の高さを単位に）同じくらいの所・軌道がない・打った後に見えていないなら決めない
+    assert shuttle_side(pl, _track([(2020, 800), (2025, 800)]), 1.0) == ""
+    assert shuttle_side(pl, None, 1.0) == ""
+    assert shuttle_side(pl, near_h, 0.5) == ""
+
+
+def test_candidate_hitters_use_the_shuttle_side_over_the_rough_side(monkeypatch):
+    """大まかな推定の打点が逆の側（o）でも、打った直後のシャトルが手前の選手の近くなら手前の選手（IMG_5109 4.34 s）。"""
+    import pandas as pd
+
+    import smash_speed.players as players
+    from smash_speed.batch import Candidate, candidate_hitters
+
+    pl = _two_players(np.arange(0.0, 2.01, 1 / 30))
+    monkeypatch.setattr(players, "detect_in_windows", lambda *a, **k: (pd.DataFrame(), pd.Series(dtype=float)))
+    monkeypatch.setattr(players, "track_between", lambda *a, **k: pl)
+    c = Candidate(id=1, t_onset=1.0, strength=1.0, start_s=0.5, end_s=2.0, status="ok", t_impact=1.0,
+                  hitter={"x": 3.7, "y": -1.0})
+    track = _track([(650, 760), (1200, 760), (2400, 700)])
+    for shuttle, want in (({1: track}, -5.0), (None, 5.0)):
+        cc = Candidate(**{**c.__dict__, "hitter": dict(c.hitter)})
+        assert candidate_hitters([cc], None, None, {}, None, progress=lambda s: None, shuttle=shuttle) == 1
+        assert cc.hitter["x"] == want

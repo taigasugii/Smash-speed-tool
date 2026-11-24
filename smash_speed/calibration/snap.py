@@ -47,6 +47,40 @@ for (_n, _, _), _c in zip(Y_LINES, Y_CENTERS):
                  ((-HALF_L, -SHORT_SERVICE), (SHORT_SERVICE, HALF_L)) if _n == "center" else ((-HALF_L, HALF_L),))
 
 
+# レンズの放射のゆがみ（ROADMAP v2 の J3）。画像の点 p（ゆがんだまま）から、ゆがみのない点を
+#   p_u = c + (p − c)(1 + κ r²)、r = |p − c| / s（c は画像の中心、s は画像の長い辺 [px]）
+# で求める（ゆがんだ点から直接計算できる形）。ホモグラフィ H はゆがみのない点に対するもの。κ ≈ −k1·(s/f)²
+# （``solve`` のカメラの k1 は、ゆがみのない点からゆがんだ点を出す向き）
+MAX_KAPPA = 1.0          # 求める κ の上限（樽型のゆがみ κ ≥ 0 だけを求める。スマートフォンの広角は樽型）
+KAPPA_SIGMA = 0.5        # κ の事前の不確かさ（ラインが少ないときに暴れないように）
+
+
+def undistort_points(uv: np.ndarray, kappa: float, center: np.ndarray, scale: float) -> np.ndarray:
+    """ゆがんだ画像の点 (N, 2) から、ゆがみのない点。"""
+    uv = np.asarray(uv, float)
+    if kappa == 0.0:
+        return uv
+    d = uv - center
+    r2 = np.sum(d * d, axis=-1, keepdims=True) / (scale * scale)
+    return center + d * (1.0 + kappa * r2)
+
+
+def distort_points(uv: np.ndarray, kappa: float, center: np.ndarray, scale: float) -> np.ndarray:
+    """ゆがみのない点 (N, 2) から、ゆがんだ画像の点（``undistort_points`` の逆。半径の 3 次式をニュートン法で）。"""
+    uv = np.asarray(uv, float)
+    if kappa == 0.0:
+        return uv
+    d = uv - center
+    ru = np.linalg.norm(d, axis=-1, keepdims=True) / scale
+    rd = ru.copy()
+    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+        for _ in range(8):
+            g = rd * (1.0 + kappa * rd * rd) - ru
+            rd = rd - g / (1.0 + 3.0 * kappa * rd * rd)
+        f = np.where(ru > 0, rd / np.where(ru > 0, ru, 1.0), 1.0)
+    return center + d * f
+
+
 def _world_line(ax: str, c: float) -> np.ndarray:
     return np.array([1.0, 0.0, -c]) if ax == "x" else np.array([0.0, 1.0, -c])
 
@@ -76,6 +110,15 @@ class SnapResult:
     line_rms_px: float = float("nan")
     message: str = ""
     color: np.ndarray | None = None
+    # レンズの放射のゆがみ（``undistort_points`` の κ）と、その中心・長さの単位 [px]。ゆがみを求めなければ 0
+    kappa: float = 0.0
+    center: np.ndarray | None = None
+    scale: float = 1.0
+
+    def project(self, XY: np.ndarray) -> np.ndarray:
+        """床の点 (N, 2) [m] の画像の位置 [px]（ゆがみつき）。"""
+        uv = _apply_h(self.homography, np.atleast_2d(np.asarray(XY, float)))
+        return uv if self.center is None else distort_points(uv, self.kappa, self.center, self.scale)
 
 
 class CourtSnapper:
@@ -89,11 +132,28 @@ class CourtSnapper:
     LAB_W = AutoCourtCalibrator.LAB_W
 
     def __init__(self, radii_px: tuple[float, ...] = (6.0, 4.0, 3.0), click_sigma_px: float = 8.0,
-                 search_px: float = 25.0) -> None:
+                 search_px: float = 25.0, estimate_kappa: bool = True) -> None:
         self.radii_px = radii_px
         self.click_sigma_px = click_sigma_px
         self.search_px = search_px
         self.front: np.ndarray | None = None     # カメラの前にあると分かっている床の点 [m]（クリックした点）
+        # ラインに合わせるときにレンズの放射のゆがみ κ も求める（ROADMAP v2 の J3）。今の κ と、その中心・長さの単位
+        self.estimate_kappa = estimate_kappa
+        self.kappa = 0.0
+        self.center = np.zeros(2)
+        self.scale = 1.0
+
+    def set_image(self, shape: tuple[int, ...], kappa: float = 0.0) -> None:
+        """ゆがみの中心・長さの単位を画像の大きさから決め、κ を ``kappa`` にする。"""
+        h, w = shape[:2]
+        self.center, self.scale, self.kappa = np.array([w / 2.0, h / 2.0]), float(max(h, w)), float(kappa)
+
+    def proj(self, Hm: np.ndarray, XY: np.ndarray) -> np.ndarray:
+        """床の点 [m] の画像の位置 [px]（ホモグラフィの後に今の κ のゆがみをかける）。"""
+        return distort_points(_apply_h(Hm, XY), self.kappa, self.center, self.scale)
+
+    def _undist(self, uv: np.ndarray, kappa: float | None = None) -> np.ndarray:
+        return undistort_points(uv, self.kappa if kappa is None else kappa, self.center, self.scale)
 
     # ------------------------------------------------------------------ 入口
     def snap(self, frame: np.ndarray, clicks: dict[str, tuple[float, float]],
@@ -135,6 +195,7 @@ class CourtSnapper:
         k = max(h, w) / 1920.0
         if lab is None:
             lab = self.prepare(frame)
+        self.set_image(frame.shape)
         sg = np.ones(len(W)) if sigma is None else np.asarray(sigma, float)
         self.front = np.asarray(W[0], float)
         Hm = H0 / H0[2, 2]
@@ -144,26 +205,33 @@ class CourtSnapper:
             # 1. コート全体の形を保ったまま、全ラインの応答の合計が最大になるように動かす（隣のラインに飛び移らない）
             Hm = self._align(lab, Hm, color, k, W, P, sg, W if grow_from is None else np.atleast_2d(grow_from))
         found: dict[str, np.ndarray] = {}
-        for r in self.radii_px:
-            # 2. 各ラインの近くで中心を測り、ホモグラフィを詰める
+        # 2. 各ラインの近くで中心を測り、ホモグラフィを詰める。ゆがみ κ は、ゆがみなしで詰め終えた後にもう 1 回、
+        #    いちばん狭い幅で測り直して一緒に求める（はじめから求めると、ゆがみのない動画で κ がほかのずれを吸って
+        #    別のコートへ滑ることがある）
+        passes = [(r, False) for r in self.radii_px] + ([(self.radii_px[-1], True)] if self.estimate_kappa else [])
+        for r, with_kappa in passes:
+            # κ は、両方の向きのラインが 2 本以上ずつ・合わせて 6 本以上測れたときだけ求める（少ないとほかのずれを吸う）
+            if with_kappa and not (len(found) >= 6 and all(sum(LINES[n][0] == a for n in found) >= 2 for a in "xy")):
+                break
             meas = self._measure(lab, Hm, r * k, color)
             fits = self._fit_lines(meas, k)
             if not fits:
                 break
-            Hn, keep = self._fit_h(Hm, fits, W, P, k, sg)
+            Hn, keep, kap = self._fit_h(Hm, fits, W, P, k, sg, with_kappa)
             if Hn is None:
                 break
-            Hm, found = Hn, {n: fits[n] for n in keep}
-        res = SnapResult(Hm)
+            Hm, found, self.kappa = Hn, {n: fits[n] for n in keep}, kap
+        res = SnapResult(Hm, kappa=self.kappa, center=self.center.copy(), scale=self.scale)
         res.color = color
         res.lines_found = {n: len(p) for n, p in found.items()}
         if found:
-            r_all = np.concatenate([np.c_[p, np.ones(len(p))] @ _image_line(Hm, *LINES[n][:2]) for n, p in found.items()])
+            r_all = np.concatenate([np.c_[self._undist(p), np.ones(len(p))] @ _image_line(Hm, *LINES[n][:2])
+                                    for n, p in found.items()])
             res.line_rms_px = float(np.sqrt(np.mean(r_all ** 2)))
         for n, X in table.items():
             if abs(float(X[2])) > 1e-6:
                 continue
-            uv = _apply_h(Hm, np.asarray(X[:2], float)[None])[0]
+            uv = self.proj(Hm, np.asarray(X[:2], float)[None])[0]
             if not self.in_front(Hm, np.asarray(X[:2], float)[None])[0]:
                 continue
             if not (np.isfinite(uv).all() and -0.02 * w <= uv[0] <= 1.02 * w and -0.02 * h <= uv[1] <= 1.02 * h):
@@ -233,6 +301,7 @@ class CourtSnapper:
         q = np.c_[both, np.ones(len(both))] @ Hm.T
         with np.errstate(divide="ignore", invalid="ignore"):
             q = q[:, :2] / q[:, 2:3]
+            q = distort_points(q, self.kappa, self.center, self.scale)
         n0 = len(XY)
         uv, e1 = q[:n0], q[n0:]
         ok = np.isfinite(q[:n0]).all(1) & np.isfinite(e1).all(1) & (uv[:, 0] > 2) & (uv[:, 1] > 2) & \
@@ -310,7 +379,7 @@ class CourtSnapper:
 
                 def f(x: np.ndarray) -> float:
                     Hc = to_h(x)
-                    d = np.linalg.norm(_apply_h(Hc, W) - P, axis=1)
+                    d = np.linalg.norm(self.proj(Hc, W) - P, axis=1)
                     return -self._court_score(img, Hc, model, color, blur * k) + 0.5 * float(np.sum((d / sig) ** 2))
 
                 simplex = np.vstack([np.zeros(8), np.eye(8) * step * k])
@@ -363,16 +432,17 @@ class CourtSnapper:
         cross = sorted({v for n2, (ax2, v, _) in LINES.items() if ax2 != ax})
         s = s[np.min(np.abs(s[:, None] - np.array(cross)[None]), axis=1) > 0.12]
         XY = np.c_[np.full(len(s), c), s] if ax == "x" else np.c_[s, np.full(len(s), c)]
-        uv = _apply_h(Hm, XY)
+        uv = self.proj(Hm, XY)
         other = [v for n2, (ax2, v, _) in LINES.items() if ax2 == ax and n2 != name]
         gap = np.full(len(s), np.inf)
         for v in other:
             XY2 = XY.copy()
             XY2[:, 0 if ax == "x" else 1] = v
-            gap = np.minimum(gap, np.linalg.norm(_apply_h(Hm, XY2) - uv, axis=1))
+            gap = np.minimum(gap, np.linalg.norm(self.proj(Hm, XY2) - uv, axis=1))
         # ラインの幅 [px]
         d = np.array([1.0, 0.0]) if ax == "x" else np.array([0.0, 1.0])
-        width = np.linalg.norm(_apply_h(Hm, XY + d * LINE_WIDTH_M / 2) - _apply_h(Hm, XY - d * LINE_WIDTH_M / 2), axis=1)
+        width = np.linalg.norm(self.proj(Hm, XY + d * LINE_WIDTH_M / 2) - self.proj(Hm, XY - d * LINE_WIDTH_M / 2),
+                               axis=1)
         h, w = shape
         ok = np.isfinite(uv).all(1) & (uv[:, 0] > 4) & (uv[:, 1] > 4) & (uv[:, 0] < w - 5) & (uv[:, 1] < h - 5) & \
             self.in_front(Hm, XY)
@@ -471,7 +541,7 @@ class CourtSnapper:
         Hi = np.linalg.inv(Hm)
         near = {}
         for n, m in meas.items():
-            w = _apply_h(Hi, m["pts"])
+            w = _apply_h(Hi, self._undist(m["pts"]))
             keep = np.linalg.norm(w - np.asarray(XY, float)[None], axis=1) <= radius_m
             if keep.sum() >= 4:
                 near[n] = {"dv": m["dv"][keep], "val": m["val"][keep]}
@@ -507,46 +577,59 @@ class CourtSnapper:
         return fits
 
     def _fit_h(self, H0: np.ndarray, fits: dict[str, np.ndarray], W: np.ndarray, P: np.ndarray, k: float,
-               sg: np.ndarray):
+               sg: np.ndarray, with_kappa: bool = False):
         """測った点がモデルのラインに乗り、クリックした点とも大きくずれないように H を詰める。
 
         ほかのラインと合わないライン（別の線に吸い付いたもの）を外しながら当てはめ直す。
         """
         keep = list(fits)
         h0 = (H0 / H0[2, 2]).ravel()[:8]
+        est = with_kappa
+        if est:
+            h0 = np.r_[h0, self.kappa]
         sig_c = (self.click_sigma_px * k * sg)[:, None]
         Hm = None
+        kap = self.kappa
         for _ in range(4):
             if not keep:
-                return None, []
+                return None, [], self.kappa
             items = [(fits[n], LINES[n][:2]) for n in keep]
             # 長いラインほど点が多いので、1 本あたりの重みをそろえる（点の数の平方根で割る）
             wts = [1.0 / math.sqrt(len(p) / 20.0) if len(p) > 20 else 1.0 for p, _ in items]
 
             def resid(hv: np.ndarray) -> np.ndarray:
-                Hc = np.r_[hv, 1.0].reshape(3, 3)
+                Hc = np.r_[hv[:8], 1.0].reshape(3, 3)
+                kp = float(hv[8]) if est else self.kappa
+                n_out = sum(len(p) for p, _ in items) + 2 * len(W) + int(est)
+                if not 0.0 <= kp <= MAX_KAPPA:
+                    return np.full(n_out, 1e3)
                 try:
                     Hi = np.linalg.inv(Hc)
                 except np.linalg.LinAlgError:
-                    return np.full(sum(len(p) for p, _ in items) + 2 * len(W), 1e3)
+                    return np.full(n_out, 1e3)
                 out = []
                 for (p, (ax, c)), wt in zip(items, wts):
                     li = Hi.T @ _world_line(ax, c)
                     li = li / np.linalg.norm(li[:2])
-                    out.append(wt * (np.c_[p, np.ones(len(p))] @ li))
-                out.append(((_apply_h(Hc, W) - P) / sig_c).ravel())
+                    out.append(wt * (np.c_[self._undist(p, kp), np.ones(len(p))] @ li))
+                d = distort_points(_apply_h(Hc, W), kp, self.center, self.scale) - P
+                out.append((d / sig_c).ravel())
+                if est:
+                    out.append(np.array([kp / KAPPA_SIGMA]))
                 return np.concatenate(out)
 
             sol = least_squares(resid, h0, loss="huber", f_scale=1.5 * k, x_scale="jac", max_nfev=300)
-            Hm = np.r_[sol.x, 1.0].reshape(3, 3)
-            med = {n: float(np.median(np.abs(np.c_[fits[n], np.ones(len(fits[n]))] @ _image_line(Hm, *LINES[n][:2]))))
+            Hm = np.r_[sol.x[:8], 1.0].reshape(3, 3)
+            kap = float(sol.x[8]) if est else self.kappa
+            med = {n: float(np.median(np.abs(np.c_[self._undist(fits[n], kap), np.ones(len(fits[n]))]
+                                             @ _image_line(Hm, *LINES[n][:2]))))
                    for n in keep}
             worst = max(med, key=med.get)
             if med[worst] <= max(2.0 * k, 0.4 * float(np.median(list(med.values()))) + 1.5 * k):
-                return Hm, keep
+                return Hm, keep, kap
             keep.remove(worst)
             h0 = sol.x
-        return Hm, keep
+        return Hm, keep, kap
 
     @staticmethod
     def _both_lines(name: str, X: np.ndarray, found: dict) -> bool:

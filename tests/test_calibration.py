@@ -152,3 +152,34 @@ def test_calibration_excludes_misclicked_points(cfg, truth, tmp_path):
     # 正しい点だけなら何も外さない
     names, world, image = _visible_landmarks(cfg, truth, np.random.default_rng(4), noise=2.0)
     assert calibrate(names, world, image, truth.width, truth.height).excluded == []
+
+
+def test_net_band_points_fix_the_height_direction():
+    """床の点だけでは、合わせの点にレンズのゆがみが残ると高さの向きの誤差が出る。ネットの上の帯の点（横方向の位置は
+    分からない）を足すと、カメラの高さが本当に近づく（低いカメラ。ROADMAP v2 の J4）。"""
+    from dataclasses import replace
+
+    from smash_speed.calibration import landmark_table
+    from smash_speed.calibration.solve import calibrate, distance_to_polyline, net_top_curve
+    from smash_speed.config import load_config
+    from smash_speed.synth_rally import named_rally_camera
+
+    cfg = load_config()
+    cam = named_rally_camera("low", cfg)
+    table = landmark_table(cfg)
+    names = [n for n, X in table.items() if abs(X[2]) < 1e-6]
+    W = np.array([table[n] for n in names])
+    kc = replace(cam, k1=-0.1)                     # 合わせの点だけにゆがみ（合わせでは k1 を求めない）
+    uv = kc.project(W)
+    ok = np.isfinite(uv).all(1) & (uv[:, 0] > 0) & (uv[:, 0] < cam.width) & (uv[:, 1] > 0) & (uv[:, 1] < cam.height)
+    names, W, uv = [n for n, o in zip(names, ok) if o], W[ok], uv[ok]
+    rng = np.random.default_rng(0)
+    band = kc.project(net_top_curve(200))[rng.choice(200, 8, replace=False)]
+    floor = calibrate(names, W, uv, cam.width, cam.height, reject_outliers=False)
+    net = calibrate(names, W, uv, cam.width, cam.height, reject_outliers=False, net_band=band)
+    assert "+net" in net.method and net.net_band_px is not None and len(net.net_band_px) == 8
+    # カメラの高さの誤差（作った時点で 0.22 → 0.14 m）
+    assert abs(net.camera.center[2] - cam.center[2]) < 0.8 * abs(floor.camera.center[2] - cam.center[2])
+    # 帯の線までの距離：線の上の点は 0
+    curve = cam.project(net_top_curve())
+    np.testing.assert_allclose(distance_to_polyline(curve[[3, 30, 50]], curve), 0.0, atol=1e-9)
