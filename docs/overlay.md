@@ -34,6 +34,22 @@ smash-speed overlay <一覧の出力先> --highlights [--top 5] [--type smash|al
 
 `python -m smash_speed.overlay …` も同じ。
 
+## 基礎打ちの見どころ（コート合わせなし、ROADMAP v2 の K2）
+
+基礎打ちの解析（`python -m smash_speed.drill`、GUI のホームの「基礎打ちを解析する」）の出力先を渡すと、コート合わせがなくても
+**長く続いた打ち合いの上位 N 本** を見どころとして書き出す（`overlay.write_drill_highlights`）。
+
+```powershell
+smash-speed overlay outputs\drills\IMG_5287 --highlights --streaks 3
+```
+
+- 描くもの：シャトルの通り道（検出の点、黄色）・打った所の印（打球の時刻にいちばん近いシャトルの点に広がる赤い輪）・左上に順位と本数・
+  右上にその打ち合いの今までの本数（「27 本」）。当てはめた軌道・種類・初速はコート合わせがないので描かない。
+- 続いた打ち合いは、G4 の区切り（`drill_segments.csv`）があればそれを、なければ打球の間が 2.5 秒より空いた所で区切る（`drill_streaks`）。
+- 1 本は打ち合いの始まりの 1 秒前から終わりの 2 秒後まで（長いものは 60 秒まで）。出力は `<出力先>/highlights/`（1 本ずつと、つないだ
+  `highlights.mp4`・`highlights.json`）。GUI ではホームの基礎打ちの行の「見どころの動画を作る」。
+- 練習の動画 IMG_5287（4K・30fps・438 秒、打球 594 本）：打ち合い 24 本、上位 3 本（112・50・50 本。60・32・32 秒）を 1080p で 2 分 20 秒。
+
 ## 書き方
 
 - フレームを 1 枚ずつ読んで描いて書くので、長い動画でもメモリは増えない。

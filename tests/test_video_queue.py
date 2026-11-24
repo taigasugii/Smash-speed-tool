@@ -167,3 +167,30 @@ def test_home_status_follows_the_first_run_order(tmp_path, monkeypatch):
     (sd / "shot_list.json").write_text(json.dumps({"video": str(video), "n_hits": 5, "n_rallies": 1}), encoding="utf-8")
     r = client.get("/api/home").get_json()
     assert r["shots"]["done"] and r["shots"]["n_shots"] == 5 and r["next"] == "view"
+
+
+def test_home_drill_highlights(tmp_path, monkeypatch):
+    """ホームの基礎打ちの行の「見どころの動画を作る」：解析の前は断り、書き出した後は「見どころを開く」の場所を返す（K2）。"""
+    from smash_speed.config import load_config
+    from smash_speed.validate import make_synthetic_session
+    from smash_speed.webapp import server
+
+    cfg = load_config()
+    cfg["synthetic"]["camera"].update(width=640, height=360, f_px=500.0)
+    d = tmp_path / "web"
+    make_synthetic_session(cfg, d, speed=60.0, fps=60.0)
+    monkeypatch.setattr(server, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(server, "S", server.Session())
+    out = tmp_path / "out"
+    server.S.state = {"out_root": str(out)}
+    server.TASKS.clear()
+    client = server.app.test_client()
+    client.post("/api/video", json={"path": str(d / "synthetic.mp4")})
+    assert not client.post("/api/run/drill_highlights", json={}).get_json()["ok"]
+    dd = vq.drill_dir(out, "synthetic")
+    (dd / "highlights").mkdir(parents=True)
+    (dd / vq.DRILL_DONE).write_text(json.dumps({"n_hits": 3}), encoding="utf-8")
+    (dd / "highlights" / "highlights.json").write_text(json.dumps({"joined": "highlights.mp4", "clips": [{}, {}, {}]}),
+                                                     encoding="utf-8")
+    r = client.get("/api/home").get_json()
+    assert r["drill"]["n_highlights"] == 3 and r["drill"]["highlights"].endswith("highlights.mp4")

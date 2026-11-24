@@ -60,6 +60,22 @@
 - 品質チェック：`agent/eval_gate.py` は全部通過（e1ee7c3、2026-11-24 17:51）。テストは pytest が 0 で終わった（ゲートの表示の「0 件通過」は `addopts = "-q"` と重なって件数の行が出ないため。前からある）。合成の初速 MAPE は基準どおり、check_real_videos 最大のずれ 0.02%、check_real_hits 0.900 / 0.797、check_real_hits_model 0.971 / 0.944、ほかもすべて OK（今の解析は保存済みの合わせを使うので、候補の出し方の変更では変わらない）。
 - 次にやること：H2b の ②。IMG_5287 の手順 ① なし。
 
+## 2026-11-24 16:30 K2 練習の見どころの動画（済み）・K4（進めていない。Opus の別セッション、ブランチ `opus/drill-extras`）
+- 選んだ理由：人からの依頼（v2 の K2 → K4）。PR #24（重ねた動画）・#21（ダブルス）は agent/dev に入っている（`overlay.py`・`player_ids.py` がある）。
+- やったこと（K2）：`overlay.py` に、基礎打ちの解析の出力先（`drill_detect.json`・`hits.csv`・`detections.csv`）から、コート合わせなしで描ける見どころを足した
+  （`DrillOverlayData`・`DrillPainter`・`pick_longest_streaks`・`write_drill_highlights`）。描くのはシャトルの通り道（黄）・打った所の赤い輪（打球の時刻に
+  いちばん近いシャトルの点）・左上の順位と本数・右上のその打ち合いの今までの本数。続いた打ち合いは G4 の `drill_segments.csv` があればそれ、
+  なければ打球の間 2.5 秒で区切る（`drill_streaks`。IMG_5287 の間の 95% 点 2.1 秒）。`smash-speed overlay <基礎打ちの出力先> --highlights --streaks N`。
+  GUI はホームの「この動画の進み具合」の基礎打ちの行に「見どころの動画を作る」「見どころを開く」（G6 の画面がまだないので）。`drill.py` は変えていない。
+  手引き（6 章・1 章）と `docs/overlay.md` に書いた。テスト 4 件（`tests/test_overlay.py` 3 件・`tests/test_video_queue.py` 1 件）。
+- 結果（数字）：IMG_5287（4K・438 秒、打球 594 本）で打ち合い 24 本、上位 3 本（112 本 60 秒（上限）・50 本 32 秒・50 本 32 秒）を 1080p で 2 分 20 秒。
+  1 本目の 455 コマ目を見て、通り道・赤い輪がシャトルに重なり、右上に「27 本」、左上に「長く続いた打ち合い 1 位：112 本」が出ることを確かめた。
+- K4：進めていない。選手の追跡（`players.analyze_players`・`player_ids.track_sides`）は人の足元をコートの座標にして手前・奥を分けるので、
+  コート合わせのない練習の動画 4 本では `--doubles auto` と `off` を比べられない（ショットの一覧も選手もコート合わせが要る）。人の合わせ（2026-11-16 の決まり）
+  か H3 の答え（仮の合わせ）待ち。QUESTIONS の H3 に 1 行足した。片側だけ 2 人（球出しの人など）なら自動でも 1 対 1 のままになることは、
+  合成のテスト（`test_auto_needs_two_players_on_both_sides`）で確かめられている。
+- 品質チェック：最後のコミットで `eval_gate`（PR に結果）。
+
 ## 2026-11-24 09:40 H2 一部しか見えないコートの候補（済み。H2b が残る）
 - 選んだ理由：H1 の続き（同じ依頼・ブランチ `opus/drill-calib`）。
 - やったこと（`smash_speed/calibration/propose.py`）：
