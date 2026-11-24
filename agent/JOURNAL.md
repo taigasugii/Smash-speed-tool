@@ -14,7 +14,7 @@
 
 ---
 
-## 2026-11-24 10:30 K2 練習の見どころの動画（済み）・K4（進めていない。Opus の別セッション、ブランチ `opus/drill-extras`）
+## 2026-11-24 16:30 K2 練習の見どころの動画（済み）・K4（進めていない。Opus の別セッション、ブランチ `opus/drill-extras`）
 - 選んだ理由：人からの依頼（v2 の K2 → K4）。PR #24（重ねた動画）・#21（ダブルス）は agent/dev に入っている（`overlay.py`・`player_ids.py` がある）。
 - やったこと（K2）：`overlay.py` に、基礎打ちの解析の出力先（`drill_detect.json`・`hits.csv`・`detections.csv`）から、コート合わせなしで描ける見どころを足した
   （`DrillOverlayData`・`DrillPainter`・`pick_longest_streaks`・`write_drill_highlights`）。描くのはシャトルの通り道（黄）・打った所の赤い輪（打球の時刻に
