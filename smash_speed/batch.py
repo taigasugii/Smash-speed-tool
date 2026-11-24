@@ -478,13 +478,54 @@ def find_candidates(o: BatchOptions, cfg: dict[str, Any],
     return cands
 
 
+SHUTTLE_POINTS = 2         # 打った側を決めるのに使う、打った直後のシャトルの点の数（速いスマッシュは 0.1 秒で 9 m 進み、
+                           # 相手の近くまで行くので、最初の数点だけにする）
+SHUTTLE_SIDE_MARGIN = 0.3  # 両側の選手の枠からシャトルまでの距離（枠の高さが単位）がこれ以上違えば、近い方を打った側にする
+
+
+def shuttle_side(players: Any, track: pd.DataFrame | None, t_hit: float, n_points: int = SHUTTLE_POINTS,
+                 margin: float = SHUTTLE_SIDE_MARGIN, lead_s: float = 0.1, max_after_s: float = 0.2) -> str:
+    """打った直後のシャトルの画像の位置（``t_hit - lead_s`` 以降の最初の ``n_points`` 点。打った時刻が打球音の時刻なら
+    音の遅れの分だけ遅いので少し前から）に、枠が近い方の選手の側（h | o）。決められなければ ""。
+
+    距離は ``hits.player_reach``（その選手の枠の高さが単位。枠の中なら 0）。両側の選手が測れて、近い方が
+    ``margin`` 以上近いときだけ決める（ネットの近くの球など、両側から同じくらいの所は決めない）。
+    最初の点が ``t_hit + max_after_s`` より後なら決めない（打った所が見えていない）。
+    """
+    from smash_speed.hits import Hit, player_reach
+
+    if track is None or players is None or players.empty or track.empty:
+        return ""
+    det = track[track["timestamp"] >= t_hit - lead_s].sort_values("timestamp").head(n_points)
+    if det.empty or float(det["timestamp"].iloc[0]) > t_hit + max_after_s:
+        return ""
+    t0, t1 = float(det["timestamp"].iloc[0]), float(det["timestamp"].iloc[-1])
+    r = player_reach([Hit(0.5 * (t0 + t1))], det, players, 0.5 * (t1 - t0) + 1e-6)[0]
+    if "h" not in r or "o" not in r or abs(r["h"] - r["o"]) < margin:
+        return ""
+    return "h" if r["h"] < r["o"] else "o"
+
+
+def _candidate_track(c: Candidate, det_dir: Path | None, shuttle: dict[int, pd.DataFrame] | None
+                     ) -> pd.DataFrame | None:
+    if shuttle is not None and c.id in shuttle:
+        return shuttle[c.id]
+    if det_dir is not None and c.detections and (Path(det_dir) / c.detections).exists():
+        return pd.read_csv(Path(det_dir) / c.detections)
+    return None
+
+
 def candidate_hitters(cands: list[Candidate], meta: VideoMeta, camera: Camera, cfg: dict[str, Any],
                       detector: Any, o_players: Any = None, window_s: float = 1.0,
-                      progress: Callable[[str], None] = print, notes: dict[int, str] | None = None) -> int:
+                      progress: Callable[[str], None] = print, notes: dict[int, str] | None = None,
+                      det_dir: Path | None = None, shuttle: dict[int, pd.DataFrame] | None = None) -> int:
     """軌道が見つかった候補ごとに、打った時刻の前後 ``window_s`` だけ選手を検出・追跡し、
     打つ人の足元の初めの値を選手の足元にする。置き換えた数を返す。
 
-    打った側は、大まかな推定の打点（``hitter``）に近い選手で決める。選手の位置が足りない・ダブルスで
+    打った側は、打った直後のシャトルの画像の位置に枠が近い選手の側（``shuttle_side``。候補の軌道は
+    ``shuttle``（候補の番号ごとの検出）か ``det_dir`` の ``Candidate.detections``）。決められなければ、
+    大まかな推定の打点（``hitter``）の側（推定の側が逆だと逆の選手を選ぶ。IMG_5109 4.34 s）。
+    その側の中では打点に近い選手（ダブルス）。選手の位置が足りない・ダブルスで
     どちらか決められない候補は、大まかな推定のまま残す（``notes`` を渡すと、候補の番号ごとに理由を入れる）。
     確認済みの候補は変えない。``detector`` は ``players.PersonDetector``（``detect(img)`` で枠を返すもの）。
     """
@@ -503,10 +544,11 @@ def candidate_hitters(cands: list[Candidate], meta: VideoMeta, camera: Camera, c
     for c in todo:
         pl = track_between(people, frame_t, *windows[c.id], camera, cfg, po)
         t_hit = c.t_impact if c.t_impact is not None else c.t_onset
-        e = hitter_at(pl, t_hit, "", (c.hitter["x"], c.hitter["y"]))
+        side = shuttle_side(pl, _candidate_track(c, det_dir, shuttle), t_hit)
+        e = hitter_at(pl, t_hit, side, (c.hitter["x"], c.hitter["y"]))
         if e is None or e.ambiguous:
             if notes is not None:
-                notes[c.id] = _no_hitter_note(pl, t_hit, side_of(c.hitter["x"]), e, HitterOptions())
+                notes[c.id] = _no_hitter_note(pl, t_hit, side or side_of(c.hitter["x"]), e, HitterOptions())
             continue
         c.hitter_rough = dict(c.hitter)
         c.hitter = {"x": round(e.x, 3), "y": round(e.y, 3)}
@@ -542,7 +584,7 @@ def players_step(o: BatchOptions, cfg: dict[str, Any], meta: VideoMeta, camera: 
     po = PlayerOptions()
     try:
         detector = PersonDetector(ensure_model(po.model, progress=progress), po.min_score, po.nms_iou)
-        n = candidate_hitters(cands, meta, camera, cfg, detector, po, o.player_window_s, progress)
+        n = candidate_hitters(cands, meta, camera, cfg, detector, po, o.player_window_s, progress, det_dir=o.out_dir)
     except Exception as e:  # noqa: BLE001  （モデルの取得の失敗・onnxruntime の失敗など）
         progress(f"[注意] 選手の位置から打つ人の足元は入れられませんでした：{e}")
         return {"error": str(e)}

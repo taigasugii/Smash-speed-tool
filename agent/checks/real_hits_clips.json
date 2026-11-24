@@ -31,6 +31,12 @@
     "n_found": 34,
     "tp": 29,
     "side_correct": 27
+   },
+   "expected_model": {
+    "n_true": 32,
+    "n_found": 32,
+    "tp": 32,
+    "side_correct": 32
    }
   },
   {
@@ -63,6 +69,12 @@
     "n_found": 20,
     "tp": 13,
     "side_correct": 13
+   },
+   "expected_model": {
+    "n_true": 15,
+    "n_found": 17,
+    "tp": 14,
+    "side_correct": 14
    }
   },
   {
@@ -91,6 +103,12 @@
     "k2": 0.0
    },
    "expected": {
+    "n_true": 9,
+    "n_found": 9,
+    "tp": 8,
+    "side_correct": 8
+   },
+   "expected_model": {
     "n_true": 9,
     "n_found": 9,
     "tp": 8,
@@ -127,6 +145,12 @@
     "n_found": 16,
     "tp": 13,
     "side_correct": 13
+   },
+   "expected_model": {
+    "n_true": 14,
+    "n_found": 14,
+    "tp": 14,
+    "side_correct": 14
    }
   }
  ]

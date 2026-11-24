@@ -1,6 +1,7 @@
 """GUI（ローカル Web アプリ）のサーバー側のテスト。"""
 
 import json
+from pathlib import Path
 import time
 
 import numpy as np
@@ -217,6 +218,19 @@ def test_shot_list_uses_the_trained_model_only_when_chosen(client, tmp_path, mon
     assert client.post("/api/run/shots", json={"model": True}).get_json()["ok"]
     assert "--baseline-detector" in started[0] and "--baseline-detector" not in started[1]
     assert started[0][:started[0].index("--baseline-detector")] == started[1]
+
+
+def test_shots_api_tells_how_to_export_the_model(client, monkeypatch):
+    """学習したモデルを動かせない PC では、画面に ONNX に書き出す手順を出す（K1）。動かせれば出さない。"""
+    import smash_speed.shot_list as sl
+
+    monkeypatch.setattr(sl, "default_tracknet", lambda cfg: None)
+    monkeypatch.setattr(sl, "tracknet_hint", lambda cfg: "model_ft1.onnx を作ってください")
+    g = client.get("/api/shots").get_json()
+    assert g["model"] is False and g["model_hint"] == "model_ft1.onnx を作ってください"
+    monkeypatch.setattr(sl, "default_tracknet", lambda cfg: Path("model_ft1.pt"))
+    g = client.get("/api/shots").get_json()
+    assert g["model"] is True and g["model_hint"] is None
 
 
 def test_shot_list_flow(client, tmp_path):

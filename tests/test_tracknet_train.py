@@ -243,3 +243,18 @@ xin = torch.rand(1, 27, 32, 64); src.eval(); dst.eval()
 print(json.dumps({{"n": n, "n_src": len(renamed), "n_bias": len(conv_bias), "same": float((src(xin) - dst(xin)).abs().max())}}))
 """, device="cpu")
     assert out["n_bias"] > 0 and out["n"] == out["n_src"] and out["same"] < 1e-6
+
+
+def test_heatmap_point_weighted_center_is_finer_than_the_grid():
+    """塊の重み付きの中心は、熱の地図の格子（外枠の中心は半画素）に丸めない（I8）。"""
+    hm = np.zeros((tt.HEIGHT, tt.WIDTH), np.uint8)
+    hm[100, 300:303] = [128, 255, 128]
+    hm[100, 303] = 64          # 右に少しだけ伸びた塊：外枠の中心は 302.0、熱の重みでは左に寄る
+    bx, by = tt.heatmap_point(hm, 0.2, center="box")
+    wx, wy = tt.heatmap_point(hm, 0.2, center="weighted")
+    assert (bx, by) == (302.0, 100.5)
+    assert wx == pytest.approx(300.5 + (128 * 0 + 255 * 1 + 128 * 2 + 64 * 3) / (128 + 255 + 128 + 64))
+    assert wy == pytest.approx(100.5)
+    assert tt.heatmap_point(hm, 0.2) == (bx, by)            # 既定は外枠の中心のまま（初速が悪くなったので）
+    with pytest.raises(ValueError):
+        tt.heatmap_point(hm, 0.2, center="peak")

@@ -245,3 +245,46 @@ def test_gate_short_task_finishing_before_the_others_start(monkeypatch):
         x.join(5)
     assert not any(x.is_alive() for x in ts), "ほかのラリーの当てはめが待ち続けた"
     assert out == [[("job",)], [("job",)]]
+
+
+def test_stalled_fits_stop_early():
+    """ずれが大きいまま減らなくなった当てはめは打ち切る。ずれが小さい・まだ減っている当てはめは打ち切らない（ROADMAP v2 の I4）。"""
+    from smash_speed.fit_batch import _stalled
+
+    m, fs = 20, 2.0
+    flat_big = [m * 100.0 ** 2] * 31                       # 100 px のまま 30 回
+    assert _stalled(flat_big, m, fs)
+    assert not _stalled(flat_big[:20], m, fs)              # 評価の回数が少ないうちは続ける
+    flat_small = [m * 4.0 ** 2] * 60                       # 4 px（f_scale の 2 倍）のまま
+    assert not _stalled(flat_small, m, fs)
+    shrinking = [m * (100.0 * 0.97 ** k) ** 2 for k in range(60)]   # 1 回ごとに 3% ずつ減っている
+    assert not _stalled(shrinking, m, fs)
+    flat_mid = [m * 10.0 ** 2] * 25                        # 10 px：下の規則（25 倍）には当たらず、上の規則の 30 回まで続ける
+    assert not _stalled(flat_mid, m, fs)
+    assert _stalled(flat_mid + [m * 10.0 ** 2] * 6, m, fs)
+
+
+def test_stalled_fit_stops_with_the_same_point_as_before(rally, monkeypatch):
+    """打ち切りを止めると、合っている当てはめ（合成ラリー）は打ち切りありと 1 ビットも同じ。"""
+    opts = FitOptions(refine_plane=True, quadratic_priors=True, ci_method="none")
+    jobs = _jobs(rally, opts)
+    a = fit_trajectories(jobs)
+    monkeypatch.setattr(fit_batch, "STALL_RULES", ())
+    b = fit_trajectories(jobs)
+    assert len(a) == len(b)
+    for fa, fb in zip(a, b):
+        np.testing.assert_array_equal(fa.theta, fb.theta)
+
+
+def test_end_prior_fits_match_in_batch(rally):
+    """飛行の終わりの目安のある当てはめも、まとめて解いた結果が ``fit_trajectory`` とほぼ同じ（積分の誤差の分だけ違う）。"""
+    r, _, obs = rally
+    s, o = r.segments[1], obs[1]
+    end = (float(o.t[-1]), s.p0[:2] + 3.0 * np.r_[np.sign(s.v0[0]), 0.0], 1.0)
+    opts = FitOptions(refine_plane=True, quadratic_priors=True, ci_method="none", p0_prior_m=s.p0,
+                      p0_prior_sigma_m=(0.5, 0.5), end_prior=end)
+    job = (o, s.t_hit, "plane", grid_planes(s.side)[1], PHYS, opts, None)
+    (fb,) = fit_trajectories([job])
+    fc = fit_trajectory(*job)
+    np.testing.assert_allclose(fb.theta, fc.theta, rtol=1e-5, atol=1e-5)
+    assert abs(fb.speed0 - fc.speed0) * 3.6 < 0.01

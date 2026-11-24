@@ -121,3 +121,20 @@ def test_empty_players():
     summary, tracks = movement_summary(pd.DataFrame(columns=["frame", "t", "side", "player", "x", "y"]))
     assert summary["players"] == {} and tracks.empty
     assert movement_svg(tracks) == ""
+
+
+def test_noisy_far_feet_are_smoothed_more_for_the_peak_speed():
+    """足元の揺れが床の上で大きい選手（``foot_noise_m``）ほど、最高の速さを強くならす（I5）。"""
+    import numpy as np
+    import pandas as pd
+
+    from smash_speed.movement import MovementOptions, smooth_track
+
+    rng = np.random.default_rng(0)
+    t = np.arange(0, 6, 1 / 30)
+    x = np.where(t < 3, 0.0, 1.0) + rng.normal(0, 0.15, len(t))
+    track = pd.DataFrame({"t": t, "x": x, "y": 0.0, "side": "o", "player": 0})
+    plain = smooth_track(track, MovementOptions())["peak_speed"].max()
+    noisy = smooth_track(track.assign(foot_noise_m=0.2), MovementOptions())["peak_speed"].max()
+    near = smooth_track(track.assign(foot_noise_m=0.08), MovementOptions())["peak_speed"].max()
+    assert noisy < plain and near == plain

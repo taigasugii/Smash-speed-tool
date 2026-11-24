@@ -119,3 +119,23 @@ def test_synthetic_benchmark_small():
     assert r["prep_s"]["median_abs"] <= 0.07
     assert r["reaction_s"]["median_abs"] <= 0.1
     assert r["uncertain_share"] < 0.2
+
+
+def test_foot_noise_and_uncertain_feet_are_used():
+    """K3：``foot_noise_m`` の大きい選手は最高の速さを強くならし、「足元が不確か」の多い窓は確かでないとする。"""
+    import numpy as np
+    import pandas as pd
+
+    from smash_speed.footwork import FootworkOptions, _uncertain, player_tracks
+
+    rng = np.random.default_rng(1)
+    t = np.arange(0, 4, 1 / 30)
+    x = np.where(t < 2, 4.0, 5.0) + rng.normal(0, 0.15, len(t))
+    pl = pd.DataFrame({"t": t, "frame": np.arange(len(t)), "side": "o", "player": 0, "x": x, "y": 0.0,
+                       "foot_noise_m": 0.25, "foot_uncertain": t > 1.0})
+    on = player_tracks(pl, o=FootworkOptions())[("o", 0)]
+    off = player_tracks(pl, o=FootworkOptions(use_foot_noise=False))[("o", 0)]
+    assert on["peak_speed"].max() < off["peak_speed"].max()
+    why = _uncertain(on, 1.5, 3.0, True, FootworkOptions())
+    assert any("足元が不確か" in w for w in why)
+    assert not any("足元が不確か" in w for w in _uncertain(off, 1.5, 3.0, True, FootworkOptions()))

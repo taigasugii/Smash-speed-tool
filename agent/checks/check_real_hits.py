@@ -31,15 +31,17 @@ TOL_S = 0.3             # 正解と組にする時刻の差 [s]
 MARGIN = 0.03           # 基準からこれより下がったら失敗（たまたまの 1〜2 本の違いでは落ちないように）
 
 
-def analyze_clip(clip: dict[str, Any], video: Path, cfg: dict[str, Any], work: Path) -> dict[str, Any]:
-    """1 区間の打球を見つけて正解と比べる。"""
+def analyze_clip(clip: dict[str, Any], video: Path, cfg: dict[str, Any], work: Path,
+                 tracknet: Path | None = None) -> dict[str, Any]:
+    """1 区間の打球を見つけて正解と比べる。``tracknet`` があれば、シャトルの検出をその学習したモデルで行う
+    （ショットの一覧の既定と同じ閾値。``check_real_hits_model``）。"""
     import pandas as pd
 
     from smash_speed.calibration.io import load_calibration
     from smash_speed.hits import find_hits, match_hits
     from smash_speed.pipeline import _camera_for_video
     from smash_speed.players import PLAYERS_FILE, analyze_players
-    from smash_speed.shot_list import detect_all, hit_onsets, shuttle_tracks
+    from smash_speed.shot_list import TRACKNET_THRESHOLD, detect_all, hit_onsets, load_detections, shuttle_tracks
     from smash_speed.video_io import probe
 
     work.mkdir(parents=True, exist_ok=True)
@@ -50,7 +52,13 @@ def analyze_clip(clip: dict[str, Any], video: Path, cfg: dict[str, Any], work: P
     camera, _ = load_calibration(calib)
     camera = _camera_for_video(camera, meta)
     onsets = hit_onsets(meta, cfg, work, None, s0, s1)
-    det = detect_all(meta, cfg, s0, s1, exclusive=False, progress=lambda s: None)
+    if tracknet is None:
+        det = detect_all(meta, cfg, s0, s1, exclusive=False, progress=lambda s: None)
+    else:
+        from smash_speed.train.tracknet_train import detect_video
+
+        detect_video(video, tracknet, work / "tracknet", s0, s1, TRACKNET_THRESHOLD, progress=lambda m: None)
+        det = load_detections(work / "tracknet" / "detections.csv", meta, s0, s1)
     det, _ = shuttle_tracks(det, camera, cfg)
     analyze_players(video, calib, work, cfg, start_s=s0, end_s=s1, progress=lambda s: None)
     players = pd.read_csv(work / PLAYERS_FILE)
@@ -69,34 +77,37 @@ def totals(rows: dict[str, dict[str, Any]]) -> dict[str, float]:
     return {"recall": tp / max(n_true, 1), "precision": tp / max(n_found, 1), "side": side / max(tp, 1)}
 
 
-def run(ctx: dict[str, Any], keep_hits: bool = False) -> dict[str, Any]:
+def run(ctx: dict[str, Any], keep_hits: bool = False, tracknet: Path | None = None, expected_key: str = "expected",
+        label: str = "実動画の打球", side_margin: float = 1e-9) -> dict[str, Any]:
+    """4 区間を測って基準（各区間の ``expected_key``）と比べる。``tracknet`` は ``analyze_clip`` へ渡す。
+    打った側の正解の割合は、基準から ``side_margin`` より下がったら失敗にする。"""
     sys.path.insert(0, str(ROOT))
     from smash_speed.config import load_config
 
     if not CLIPS.exists():
-        return {"ok": True, "skipped": True, "summary": "実動画の打球：区間の一覧がないので飛ばしました"}
+        return {"ok": True, "skipped": True, "summary": f"{label}：区間の一覧がないので飛ばしました"}
     clips = json.loads(CLIPS.read_text(encoding="utf-8"))["clips"]
     videos_dir = (ctx.get("config") or {}).get("videos_dir")
     found = [(c, Path(videos_dir) / c["video"] if videos_dir else None) for c in clips]
     todo = [(c, v) for c, v in found if v is not None and v.exists()]
     missing = [c["name"] for c, v in found if v is None or not v.exists()]
     if not todo:
-        return {"ok": True, "skipped": True, "summary": "実動画の打球：動画が見つからないので飛ばしました"}
+        return {"ok": True, "skipped": True, "summary": f"{label}：動画が見つからないので飛ばしました"}
     cfg = load_config()
     rows: dict[str, dict[str, Any]] = {}
     with tempfile.TemporaryDirectory() as td:
         for c, v in todo:
-            rows[c["name"]] = analyze_clip(c, v, cfg, Path(td) / c["name"])
+            rows[c["name"]] = analyze_clip(c, v, cfg, Path(td) / c["name"], tracknet)
     cur = totals(rows)
-    exp = totals({c["name"]: c["expected"] for c, _ in todo if c.get("expected")}) if all(
-        c.get("expected") for c, _ in todo) else None
+    exp = totals({c["name"]: c[expected_key] for c, _ in todo if c.get(expected_key)}) if all(
+        c.get(expected_key) for c, _ in todo) else None
     bad = []
     if exp:
         bad = [f"{k} {exp[k]:.3f}→{cur[k]:.3f}" for k in ("recall", "precision") if cur[k] < exp[k] - MARGIN]
-        if cur["side"] < exp["side"] - 1e-9:
+        if cur["side"] < exp["side"] - side_margin:
             bad.append(f"打った側 {exp['side']:.3f}→{cur['side']:.3f}")
     parts = [f"{n} {r['tp']}/{r['n_true']}・見つけた {r['n_found']}" for n, r in rows.items()]
-    summary = (f"実動画の打球 {len(rows)} 区間：再現率 {cur['recall']:.3f}・適合率 {cur['precision']:.3f}・"
+    summary = (f"{label} {len(rows)} 区間：再現率 {cur['recall']:.3f}・適合率 {cur['precision']:.3f}・"
                f"打った側 {cur['side']:.3f}（" + "、".join(parts) + "）"
                + (f"、基準より下がった：{'、'.join(bad)}" if bad else "")
                + ("" if exp else "、基準がないので比べていない")

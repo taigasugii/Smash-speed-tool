@@ -25,7 +25,7 @@ from smash_speed.errors import AnalysisError
 from smash_speed.hits import Hit, find_hits, match_hits
 from smash_speed.shot_list import (DETECTIONS_FILE, TRACKNET_THRESHOLD, ShotListOptions, TrackFilter, choose_tracknet,
                                    detect_all, hit_onsets, load_detections, one_per_frame, select_tracks,
-                                   tracknet_detections)
+                                   tracknet_detections, tracknet_hint)
 from smash_speed.synth_drill import DrillOptions
 from smash_speed.video_io import probe
 
@@ -154,9 +154,14 @@ def detect(o: DrillDetectOptions, cfg: dict[str, Any], progress: Callable[[str],
             note = f"学習したモデルで検出できなかったので、今の検出で探した（{str(e).strip()[-300:]}）"
             progress(f"[進行] {note}")
             tracknet = None
+    hint = None
     if det_path is not None:
         det = load_detections(det_path, meta, o.start_s, o.end_s)
     else:
+        # 既定のモデルのファイルはあるのに、この PC で動かせないとき（torch も .onnx もない）は、書き出し方を出す（K1）
+        hint = tracknet_hint(cfg)
+        if hint:
+            progress(f"[進行] {hint}")
         det = detect_all(meta, cfg, o.start_s, o.end_s, o.roi, exclusive=False, progress=progress)
     lap("shuttle_detect")
     det, tab = drill_tracks(det, meta.width)
@@ -176,7 +181,7 @@ def detect(o: DrillDetectOptions, cfg: dict[str, Any], progress: Callable[[str],
             "n_visible": n_vis, "n_tracks": int(tab.selected.sum()), "n_onsets": None if onsets is None else len(onsets),
             "n_hits": len(hits), "hits_per_min": round(len(hits) / minutes, 2),
             "detector": "tracknet" if tracknet is not None else ("detections" if det_path is not None else "baseline"),
-            "detector_note": note, "timings_s": timings, "elapsed_s": round(time.time() - t0, 2)}
+            "detector_note": note, "detector_hint": hint, "timings_s": timings, "elapsed_s": round(time.time() - t0, 2)}
     (out / DETECT_INFO_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     progress(f"[進行] 打球 {len(hits)} 本（1 分あたり {info['hits_per_min']}）")
     return info
