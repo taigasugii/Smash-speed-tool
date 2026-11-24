@@ -4,7 +4,9 @@
    （全自動はいちばんよい 1 つだけを使うが、ラインの取り違えで 2 番目以降が正しいことがある）
 2. 候補ごとに、四隅の予想位置を「おおよそのクリック」として半自動と同じ方法（``CourtSnapper.refine``）で
    ラインに吸い付けて詰める
-3. 詰めたあとのラインらしさで並べ、同じコートになったものをまとめて、上から ``n`` 個を返す
+3. 詰めたあとのラインらしさ（＋測れたランドマークの数）で並べ、同じコートになったものをまとめて、上から ``n`` 個を返す。
+   上位の候補は、ラインを 1 本取り違えた形（いちばん遠いラインを隣のラインに付け替えたもの）も吸い付けて比べる
+   （ゆがみのある広角の動画では、正しいコートと 1 本取り違えたコートの点数がほぼ同じになる。ROADMAP v2 の J3）
 
 手順 ① のカメラのおおよその位置が分かるときは、消失点から決めたカメラの向きと、その位置の近くで
 線分がコートのラインに重なる高さ・位置からも候補を作る（``vanishing_candidates``。全自動のラインの組の
@@ -35,6 +37,28 @@ _TO_AUTO = np.array([[1.0, 0, NET_X_M], [0, 1.0, COURT_WIDTH_M / 2], [0, 0, 1.0]
 # コートを 180° 回す（打つ人の側を入れ替える）
 _ROT180 = np.diag([-1.0, -1.0, 1.0])
 _CORNERS = np.array([[-HALF_L, -HALF_W], [-HALF_L, HALF_W], [HALF_L, -HALF_W], [HALF_L, HALF_W]])
+# 並べるときの、2 本のラインとも測れたランドマーク 1 点あたりの点数の上乗せ。1 本取り違えたコートは、ほかの競技の
+# ラインや継ぎ目に乗る分でラインらしさの合計が正しいコートとほぼ同じになるが、測れるランドマークが少なくなる
+POINT_BONUS = 1.0
+# ラインの取り違えを試す上位の候補の数と、試す候補の点数（``rank_score``）がいちばんよい候補からこれ以内のときだけ試す
+# （点数の差が大きいときは迷っていない）
+N_SHIFT = 2
+SHIFT_MARGIN = 5.0
+# 取り違えを直した候補で、動かさなかったラインが画像の上で動いてよい量 [px]（横 1920 px に換算）
+SHIFT_KEEP_PX = 6.0
+# 消失点からの向きの候補のうち、世界の上向きが画像の上からこれより傾くもの（縦の消失点を床の向きに取った、壁を床と
+# みなす向き）は使わない [°]。体育館の壁・客席の手すりの線分が床のラインより多い動画（練習の動画 IMG_5288）では、
+# 壁を床とみなした向きの方が線分の点数が高くなり、正しい向きの候補が残らない（H1）
+MAX_TILT_DEG = 60.0
+# 手順 ① のカメラの位置がないとき、消失点からの候補で探すカメラの位置：コートの外側の線からこの距離まで [m]（コートの中は、
+# 外側の線から ``NO_CAM_INSIDE_M`` 内側までを除く）と、高さ [m]。練習の動画は外側の線から 0.4〜1 m 外・高さ 1.5 m（H1）
+NO_CAM_AROUND_M = 6.0
+NO_CAM_INSIDE_M = 0.5
+NO_CAM_HEIGHTS_M = (1.0, 2.0)
+# 手順 ① がないときに、高さごと・向きごとに残す 1 次元の山の数（探す範囲が広いので多めに）
+NO_CAM_PEAKS = 10
+# 手順 ① がなくても消失点からの候補を出す（H2b。偽にすると前と同じ：全自動の候補だけ）
+VANISH_WITHOUT_CAM = True
 
 
 @dataclass
@@ -50,6 +74,51 @@ class Proposal:
     result: SnapResult
     score: float
     n_snapped: int
+
+    @property
+    def rank_score(self) -> float:
+        """並べる点数（ラインらしさ + 測れたランドマークの数 × ``POINT_BONUS``）。"""
+        return self.score + POINT_BONUS * self.n_snapped
+
+
+def _line_moved_px(a: SnapResult, b: SnapResult, line: tuple[str, float]) -> float:
+    """ライン ``line`` = (向き, 位置) の、2 つの吸い付けの結果での画像の上の位置の違い（ラインに沿った点の中央値）[px]。"""
+    ax, c = line
+    s = np.linspace(-HALF_W, HALF_W, 21) if ax == "x" else np.linspace(-HALF_L, HALF_L, 41)
+    XY = np.c_[np.full(len(s), c), s] if ax == "x" else np.c_[s, np.full(len(s), c)]
+    d = np.linalg.norm(a.project(XY) - b.project(XY), axis=1)
+    d = d[np.isfinite(d)]
+    return float(np.median(d)) if len(d) else float("inf")
+
+
+def line_shift_alternatives(res: SnapResult) -> list[tuple[np.ndarray, tuple[str, float]]]:
+    """ラインを 1 本取り違えたかもしれない所を直した、はじめのホモグラフィ（吸い付ける前）と、動かさなかったライン
+    (向き, 位置) の組のリスト。
+
+    x・y の向きごとに、測れたラインのうち点のいちばん多いラインを動かさず、そこからいちばん遠い測れたラインを、
+    隣のライン（コートの同じ向きのラインの並びで 1 つ内側・外側）に付け替える（床の座標をその向きに伸び縮みさせる）。
+    """
+    out = []
+    for ax in ("x", "y"):
+        names = [n for n in res.lines_found if LINES[n][0] == ax]
+        if len(names) < 2:
+            continue
+        allc = sorted({float(LINES[n][1]) for n in LINES if LINES[n][0] == ax})
+        c0 = float(LINES[max(names, key=lambda n: res.lines_found[n])][1])
+        c1 = float(LINES[max(names, key=lambda n: abs(float(LINES[n][1]) - c0))][1])
+        if c1 == c0:
+            continue
+        i = allc.index(c1)
+        for j in (i - 1, i + 1):
+            if not 0 <= j < len(allc) or allc[j] == c0:
+                continue
+            # 付け替えた床の座標（c1 にあったラインが allc[j]）→ 今の床の座標：old = a·new + b（c0 は動かさない）
+            a = (c1 - c0) / (allc[j] - c0)
+            T = np.eye(3)
+            r = 0 if ax == "x" else 1
+            T[r, r], T[r, 2] = a, c0 - a * c0
+            out.append((res.homography @ T, (ax, c0)))
+    return out
 
 
 def _orient(Hm: np.ndarray, shape: tuple[int, int], cam_xy: tuple[float, float] | None) -> np.ndarray:
@@ -221,7 +290,12 @@ def _joint_score(L: dict[str, np.ndarray], lines, z: float, Cn: np.ndarray, Ca: 
     return out
 
 
-def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_candidates: int = 6,
+def _tilt_deg(R: np.ndarray) -> float:
+    """向き ``R``（列 = 世界の軸のカメラでの向き）で、世界の上向きが画像の上（カメラの −y）からどれだけ傾くか [°]。"""
+    return float(np.degrees(np.arccos(np.clip(-R[1, 2], -1.0, 1.0))))
+
+
+def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float] | None, max_candidates: int = 6,
                          cam_sigma_m: float = 3.0, heights_m: np.ndarray | None = None,
                          n_peaks: int = 6, n_check: int = 40,
                          progress: Callable[[float, str], None] | None = None) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -245,12 +319,20 @@ def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_can
     segs, wts, vps = _floor_segments(frame)
     if len(vps) < 2:
         return []
-    hyps = rotation_hypotheses(vps, (h, w))
-    z = np.arange(0.3, 4.01, 0.05) if heights_m is None else np.asarray(heights_m, float)
-    span = 2.0 * cam_sigma_m
+    hyps = [hy for hy in rotation_hypotheses(vps, (h, w)) if _tilt_deg(hy.R) < MAX_TILT_DEG]
     step = 0.03
-    cam = np.asarray(cam_xy, float)
-    grid = [np.arange(cam[i] - span, cam[i] + span + 1e-9, step) for i in (0, 1)]
+    if cam_xy is None:
+        # 手順 ① なし：コートの周り・高さ 1〜2 m を、位置の手がかりなし（罰なし）で探す
+        lo, hi_ = NO_CAM_HEIGHTS_M
+        z = np.arange(lo, hi_ + 1e-9, 0.05) if heights_m is None else np.asarray(heights_m, float)
+        grid = [np.arange(-L - NO_CAM_AROUND_M, L + NO_CAM_AROUND_M + 1e-9, step) for L in (HALF_L, HALF_W)]
+        n_peaks = max(n_peaks, NO_CAM_PEAKS)
+        cam, prior = np.zeros(2), 0.0
+    else:
+        z = np.arange(0.3, 4.01, 0.05) if heights_m is None else np.asarray(heights_m, float)
+        span = 2.0 * cam_sigma_m
+        cam, prior = np.asarray(cam_xy, float), 1.0
+        grid = [np.arange(cam[i] - span, cam[i] + span + 1e-9, step) for i in (0, 1)]
     cands = []
     for hi, hyp in enumerate(hyps):
         # Ls[0]：x 方向に伸びる線分（y = 一定のラインに合わせる）、Ls[1]：y 方向に伸びる線分
@@ -259,15 +341,21 @@ def vanishing_candidates(frame: np.ndarray, cam_xy: tuple[float, float], max_can
         for axis in (0, 1):
             G = grid[1 - axis]
             s = _axis_score(Ls[axis], _LINE_POS["y" if axis == 0 else "x"], z, G)
-            s1d.append(s - 0.5 * ((G[None, :] - cam[1 - axis]) / cam_sigma_m) ** 2)
+            s1d.append(s - prior * 0.5 * ((G[None, :] - cam[1 - axis]) / cam_sigma_m) ** 2)
         for i, zi in enumerate(z):
             jy = _peaks(s1d[0][i], n_peaks, round(0.2 / step))
             jx = _peaks(s1d[1][i], n_peaks, round(0.2 / step))
             Cy = np.repeat(grid[1][jy], len(jx))
             Cx = np.tile(grid[0][jx], len(jy))
             sc = _joint_score(Ls[0], _LINE_SPANS["y"], zi, Cy, Cx) + _joint_score(Ls[1], _LINE_SPANS["x"], zi, Cx, Cy)
-            sc -= 0.5 * ((Cx - cam[0]) ** 2 + (Cy - cam[1]) ** 2) / cam_sigma_m ** 2
+            sc -= prior * 0.5 * ((Cx - cam[0]) ** 2 + (Cy - cam[1]) ** 2) / cam_sigma_m ** 2
+            if cam_xy is None:
+                # コートの中（外側の線から少し内側まで）のカメラは除く
+                inside = (np.abs(Cx) < HALF_L - NO_CAM_INSIDE_M) & (np.abs(Cy) < HALF_W - NO_CAM_INSIDE_M)
+                sc = np.where(inside, -np.inf, sc)
             for b in np.argsort(-sc)[:2]:
+                if not np.isfinite(sc[b]):
+                    continue
                 cands.append((float(sc[b]), hi, np.array([Cx[b], Cy[b], zi])))
     cands.sort(key=lambda c: -c[0])
     picked: list[tuple[int, np.ndarray]] = []
@@ -355,6 +443,46 @@ def camera_from_homography(Hm: np.ndarray, shape: tuple[int, int]) -> tuple[np.n
     return None if C is None else (K, C)
 
 
+def floor_depths(Hm: np.ndarray, K: np.ndarray, XY: np.ndarray) -> np.ndarray | None:
+    """内部パラメータ ``K`` のカメラで床のホモグラフィ ``Hm`` に写る床の点 ``XY`` の、カメラからの奥行きの符号つきの大きさ。
+
+    負ならカメラの後ろ（ホモグラフィでは画像の中に写ってしまう）。カメラが床より上にある向きに符号を決める。
+    """
+    B = np.linalg.inv(K) @ Hm
+    n = float(np.linalg.norm(B[:, 0]))
+    if not np.isfinite(B).all() or n < 1e-12:
+        return None
+    B = B / n
+    R = np.c_[B[:, 0], B[:, 1], np.cross(B[:, 0], B[:, 1])]
+    if float(-(R.T @ B[:, 2])[2]) < 0:                     # カメラの高さが負なら符号を逆にする
+        B = -B
+    return np.c_[XY, np.ones(len(XY))] @ B[2]
+
+
+def _support_points(Hm: np.ndarray, K: np.ndarray | None, shape: tuple[int, int],
+                    table: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """吸い付けの手がかりの点（実寸、画像）。ふつうはコートの四隅。
+
+    四隅のどれかがカメラの後ろにある（ネットの近くの横・コートの中から撮った）ときは、四隅の代わりに、カメラの前にあって
+    画像に写る床のランドマークを使う。``refine`` は 1 点目をカメラの前の点とみなすので、後ろの角が 1 点目だと、
+    写っているラインを全部「後ろ」として測らなくなる（H1）。
+    """
+    P = _apply_h(Hm, _CORNERS)
+    if K is None:
+        cam = camera_from_homography(Hm, shape)
+        if cam is None:
+            return _CORNERS, P
+        K = cam[0]
+    dep = floor_depths(Hm, K, _CORNERS)
+    if dep is None or (dep > 0).all():
+        return _CORNERS, P
+    h, w = shape
+    L = np.array([v[:2] for v in table.values() if abs(float(v[2])) < 1e-6], float)
+    uv = _apply_h(Hm, L)
+    ok = (floor_depths(Hm, K, L) > 0) & np.isfinite(uv).all(axis=1) & (uv[:, 0] >= 0) & (uv[:, 0] < w) &         (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    return (L[ok], uv[ok]) if ok.sum() >= 4 else (_CORNERS, P)
+
+
 def _orient_by_camera(Hm: np.ndarray, shape: tuple[int, int], cam_xy: tuple[float, float]) -> np.ndarray:
     """コートを 180° 回した方が、カメラの位置が手順 ① の位置に近くなるなら回す。"""
     d = []
@@ -400,39 +528,69 @@ def propose_calibrations(frame: np.ndarray, table: dict[str, np.ndarray], n: int
         (_orient(H0, (h, w), cam_xy), None) for H0 in candidate_homographies(frame, max_candidates)]
     if cam_xy is not None:
         starts = [(_orient_by_camera(H0, (h, w), cam_xy), K) for H0, K in starts]
-    if cam_xy is not None:
+    if cam_xy is not None or VANISH_WITHOUT_CAM:
         report(0.1, "線の向きからカメラの向きを求めています")
-        starts += vanishing_candidates(frame, cam_xy, max_candidates,
-                                       progress=lambda f, m: report(0.1 + 0.25 * f, m))
-    # かかる時間の大半は吸い付け（1 つ約 5 秒）なので、残りの割合はその数で配る
-    for i, (H0, K) in enumerate(starts):
-        report(0.35 + 0.65 * i / max(len(starts), 1), f"候補をコートのラインに合わせています（{i + 1} / {len(starts)}）")
-        P = _apply_h(H0, _CORNERS)
+        vc = vanishing_candidates(frame, cam_xy, max_candidates, progress=lambda f, m: report(0.1 + 0.25 * f, m))
+        # 手順 ① がなければ、全自動の候補と同じく、画面の下の端を打つ人の側にする
+        starts += vc if cam_xy is not None else [(_orient(H0, (h, w), None), K) for H0, K in vc]
+    def snap_one(H0: np.ndarray, K: np.ndarray | None) -> Proposal | None:
+        W, P = _support_points(H0, K, (h, w), table)
         if not np.isfinite(P).all():
-            continue
+            return None
         try:
-            res = snapper.refine(frame, H0, _CORNERS, P, table, sigma=np.full(4, 4.0), lab=lab)
+            res = snapper.refine(frame, H0, W, P, table, sigma=np.full(len(W), 4.0), lab=lab)
         except (ValueError, np.linalg.LinAlgError):
-            continue
+            return None
         if res.color is None:
-            continue
+            return None
         # 消失点からの候補は、詰めた後もカメラ K で撮った床として正しいものだけ（コートを細い帯につぶした解などを除く）
         if K is not None and OneClickCalibrator._metric_error(res.homography, K) > 0.3:
-            continue
+            return None
         # 手順 ① のカメラの位置が分かれば、そこから離れたカメラになる候補（他の競技のラインに合ったものなど）を除く
         if cam_xy is not None:
             cam = camera_from_homography(res.homography, (h, w))
-            if cam is None or not (0.25 * w < cam[0][0, 0] < 3.0 * w) or                     np.hypot(*(cam[1] - np.asarray(cam_xy))) > max_cam_dist_m:
-                continue
+            if cam is None or not (0.25 * w < cam[0][0, 0] < 3.0 * w) or \
+                    np.hypot(*(cam[1] - np.asarray(cam_xy))) > max_cam_dist_m:
+                return None
+        elif K is not None:
+            # 手順 ① なしの消失点からの候補は、詰めた後もカメラが探した範囲（コートの周り）にあるものだけ
+            cam = camera_from_homography(res.homography, (h, w))
+            if cam is None or not (0.25 * w < cam[0][0, 0] < 3.0 * w) or \
+                    abs(cam[1][0]) > HALF_L + NO_CAM_AROUND_M + 1.0 or abs(cam[1][1]) > HALF_W + NO_CAM_AROUND_M + 1.0:
+                return None
+        # 点数は、その候補の κ（レンズのゆがみ）で描いたライン（``refine`` の後の ``snapper.kappa``）で測る
         score = snapper._court_score(img1, res.homography, full, res.color, k)
-        found.append(Proposal(res, float(score), sum(s == "snapped" for s in res.status.values())))
+        return Proposal(res, float(score), sum(s == "snapped" for s in res.status.values()))
+
+    def distinct(props: list[Proposal]) -> list[Proposal]:
+        # 詰めたら同じコートになったものは、よい方だけ残す
+        inv = np.linalg.inv(_TO_AUTO)
+        out: list[Proposal] = []
+        for p in sorted(props, key=lambda p: -p.rank_score):
+            if not any(AutoCourtCalibrator._same_court(p.result.homography @ inv, q.result.homography @ inv, (h, w))
+                       for q in out):
+                out.append(p)
+        return out
+
+    # かかる時間の大半は吸い付け（1 つ約 5 秒）なので、残りの割合はその数で配る
+    n_steps = len(starts) + 4 * N_SHIFT
+    for i, (H0, K) in enumerate(starts):
+        report(0.35 + 0.65 * i / n_steps, f"候補をコートのラインに合わせています（{i + 1} / {len(starts)}）")
+        p = snap_one(H0, K)
+        if p is not None:
+            found.append(p)
+    # 上位の候補は、ラインを 1 本取り違えた形も吸い付けて比べる
+    top = distinct(found)[:N_SHIFT]
+    alts = [(Ha, c0, p) for p in top if p.rank_score >= top[0].rank_score - SHIFT_MARGIN
+            for Ha, c0 in line_shift_alternatives(p.result)]
+    for i, (Ha, c0, orig) in enumerate(alts):
+        report(0.35 + 0.65 * (len(starts) + i) / n_steps, f"ラインの取り違えを確かめています（{i + 1} / {len(alts)}）")
+        p = snap_one(Ha, None)
+        # 動かさなかったライン（点のいちばん多いライン）が、画像の上で元の候補と同じ所にあるものだけ（ほかの組の線へ
+        # 滑った吸い付けを除く）
+        # また、測れたランドマークが元の候補より少ないものは使わない（付け替えた形の方がよく合うときだけ）
+        if p is not None and _line_moved_px(orig.result, p.result, c0) <= SHIFT_KEEP_PX * k and \
+                p.n_snapped >= orig.n_snapped:
+            found.append(p)
     report(1.0, f"候補を {len(found)} 個見つけました")
-    # 詰めたら同じコートになったものは、よい方だけ残す
-    found.sort(key=lambda p: -p.score)
-    inv = np.linalg.inv(_TO_AUTO)
-    out: list[Proposal] = []
-    for p in found:
-        if not any(AutoCourtCalibrator._same_court(p.result.homography @ inv, q.result.homography @ inv, (h, w))
-                   for q in out):
-            out.append(p)
-    return out[:n]
+    return distinct(found)[:n]

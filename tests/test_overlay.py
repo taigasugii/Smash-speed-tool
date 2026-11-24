@@ -182,3 +182,69 @@ def test_gui_starts_overlay_and_highlights(shots_dir, tmp_path, monkeypatch):
         assert files["overlay"].endswith("overlay.mp4") and "highlights" not in files
     finally:
         (d / "overlay.mp4").unlink()
+
+
+# ---- 基礎打ちの見どころ（コート合わせなし。ROADMAP v2 の K2）
+@pytest.fixture(scope="module")
+def drill_dir(shots_dir, tmp_path_factory):
+    """合成のラリー動画を、基礎打ちの解析の出力（検出・打球・drill_detect.json。コート合わせなし）の形にしたもの。"""
+    out, shots, truth = shots_dir
+    d = tmp_path_factory.mktemp("drill")
+    truth.to_csv(d / DETECTIONS_FILE, index=False)
+    pd = __import__("pandas")
+    pd.DataFrame({"t": [s.t_hit_s for s in shots], "side": "", "method": "track"}).to_csv(d / "hits.csv", index=False)
+    video = json.loads((out / SHOT_LIST_FILE).read_text(encoding="utf-8"))["video"]
+    (d / "drill_detect.json").write_text(json.dumps({"video": video, "n_hits": len(shots)}), encoding="utf-8")
+    return d, shots
+
+
+def test_drill_streaks_split_at_long_gaps():
+    from smash_speed.overlay import drill_streaks
+
+    t = np.array([0.0, 0.6, 1.2, 5.0, 5.5, 9.0])
+    assert drill_streaks(t, 2.5) == [(0, 3), (3, 5), (5, 6)]
+    assert drill_streaks(np.zeros(0)) == []
+
+
+@pytest.mark.parametrize("ffmpeg", [False] + ([True] if HAS_FFMPEG else []))
+def test_drill_highlights_without_calibration(drill_dir, tmp_path, ffmpeg):
+    """コート合わせなしで、長く続いた打ち合いの上位 3 本を書き出す。シャトルの通り道（黄）・打球の印（赤い輪）・
+    続いた本数（右上）が描かれ、長い方が先に並ぶ。"""
+    from smash_speed.overlay import (DrillHighlightOptions, DrillOverlayData, is_drill_dir, pick_longest_streaks,
+                                     write_drill_highlights)
+
+    d, shots = drill_dir
+    assert is_drill_dir(d)
+    t = np.array([s.t_hit_s for s in shots])
+    gap = float(np.sort(np.diff(t))[-3]) - 1e-3        # いちばん長い 3 つの間で区切る → 4 本の打ち合い
+    data = DrillOverlayData(d, max_gap_s=gap)
+    assert len(data.streaks) == 4
+    hl = pick_longest_streaks(data, 3)
+    assert [h.rank for h in hl] == [1, 2, 3] and hl[0].n_shots >= hl[1].n_shots >= hl[2].n_shots
+    info = write_drill_highlights(DrillHighlightOptions(d, tmp_path / "hl", n=3, max_gap_s=gap, after_s=0.5),
+                                 CFG, progress=lambda m: None, use_ffmpeg=ffmpeg)
+    assert len(info["clips"]) == 3 and (tmp_path / "hl" / "highlights.mp4").exists()
+    h0 = info["clips"][0]
+    frames = _frames(tmp_path / "hl" / h0["file"])
+    assert abs(len(frames) - round((h0["end_s"] - h0["start_s"]) * FPS)) <= 2
+    # 打った直後のコマ：黄色の通り道と、右上の続いた本数の文字（白い字に黒い縁取り）
+    k = int(round((h0["t_hit_s"] + 0.15 - h0["start_s"]) * FPS))
+    f = frames[k]
+    assert _yellow(f) > 20
+    h, w = f.shape[:2]
+    corner = f[: h // 8, -w // 4:]
+    assert (corner.max(axis=2) > 200).sum() > 30
+    # 打った所の赤い輪
+    red = (f[..., 2].astype(int) > 200) & (f[..., 1].astype(int) < 120) & (f[..., 0].astype(int) < 120)
+    assert red.sum() > 10
+
+
+def test_drill_highlights_from_the_command_line(drill_dir, tmp_path):
+    """``smash-speed overlay <基礎打ちの出力先> --highlights --streaks 2``（GUI のホームの「見どころの動画を作る」と同じ）。"""
+    d, _ = drill_dir
+    try:
+        cli_main(["overlay", str(d), "--highlights", "--streaks", "2", "--out", str(tmp_path / "hl"), "--opencv"])
+    except SystemExit as e:
+        assert e.code in (0, None)
+    info = json.loads((tmp_path / "hl" / "highlights.json").read_text(encoding="utf-8"))
+    assert len(info["clips"]) <= 2 and info["clips"][0]["kind"] == "streak"

@@ -133,3 +133,21 @@ def test_serve_hit_point_moves_along_the_plane_by_uncertainty():
     half = serve_hit_point(a, fit((0.5 / np.cos(0.3)) ** 2), "o", (2.5, 0.5))
     assert abs(half[0] - 3.05) < 0.01                          # 同じ不確かさなら真ん中
     assert np.array_equal(serve_hit_point(a, fit(100.0), "", (2.5, 0.5)), a)
+
+
+def test_receiver_feet_end_prior_on_the_corner_camera():
+    """角のカメラで、次の打つ人の足元を飛行の終わりの目安にすると、短いショットの初速の誤差が下がる（ROADMAP v2 の J2）。"""
+    from smash_speed.config import load_config
+    from smash_speed.shot_fit import synthetic_benchmark
+    from smash_speed.synth_rally import named_rally_camera
+
+    cfg = load_config()
+    cam = named_rally_camera("corner", cfg)
+    short = ("drive", "drop", "net", "serve")
+    errs = {}
+    for sigma in (None, 1.0):
+        r = synthetic_benchmark(2, 30.0, 0, "audio", camera=cam, cfg=cfg, feet_noise_m=0.3, receiver_sigma_m=sigma,
+                                workers=4)
+        df = r["rows"]
+        errs[sigma] = float(df[df.shot_type.isin(short)].err_pct.dropna().abs().mean())
+    assert errs[1.0] < errs[None]

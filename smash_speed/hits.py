@@ -282,7 +282,7 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
               rally_gap_s: float = 3.0, min_lag_pairs: int = 3, lag_tol_s: float = 0.03, weak_scale: float = 0.8,
               audio_before_start: bool = True,
               players: pd.DataFrame | None = None, max_reach: float = 0.8, reach_window_s: float = 0.1,
-              same_side_s: float = 0.6, same_reach_s: float = 0.3, **break_kw) -> list[Hit]:
+              same_side_s: float = 0.6, same_reach_s: float = 0.3, rally_both_sides: bool = True, **break_kw) -> list[Hit]:
     """打球の時刻と打った側を出す。
 
     Args:
@@ -312,6 +312,8 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
         same_reach_s: 片方の側の選手だけが届く所に続けて出た 2 本の間がこれより短ければ、同じ打球として
             確かでない方を捨てる [s]（相手の打球なら、シャトルがネットを越えるのに最短でもこれくらいかかる。
             選手の近くの別の物の軌道で届く側を間違えることがあるので、``same_side_s`` より短くする）
+        rally_both_sides: 偽なら、軌道の変化のない打球音は、前後どちらかにシャトルが見えていれば打球にする
+            （基礎打ちの、続いた打ち合いの最初と最後の打球は、片側にシャトルが見えない）
         **break_kw: ``track_breaks`` に渡す
 
     Returns:
@@ -370,8 +372,9 @@ def find_hits(det: pd.DataFrame | None, fps: float, onsets: list[tuple[float, fl
             if seen_before and seen_after:
                 continue
             # ラリーの外（前にも後にもしばらくシャトルが見えていない）の音は、打球ではない
-            if not (np.any((t_vis >= ta - rally_window_s) & (t_vis < ta))
-                    and np.any((t_vis > ta) & (t_vis <= ta + rally_window_s))):
+            before = bool(np.any((t_vis >= ta - rally_window_s) & (t_vis < ta)))
+            after = bool(np.any((t_vis > ta) & (t_vis <= ta + rally_window_s)))
+            if not ((before and after) if rally_both_sides else (before or after)):
                 continue
         if s < min_audio_strength:
             continue

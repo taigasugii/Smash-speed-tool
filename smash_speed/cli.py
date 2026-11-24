@@ -234,6 +234,7 @@ def cmd_overlay(a: argparse.Namespace, cfg: dict) -> int:
 
 def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
     from smash_speed.rally_fit import JointOptions
+    from smash_speed.shot_fit import ShotPriors
     from smash_speed.shot_list import ShotListOptions, analyze_video, choose_tracknet
 
     tracknet, fallback = choose_tracknet(Path(a.tracknet) if a.tracknet else None,
@@ -246,7 +247,9 @@ def cmd_shots(a: argparse.Namespace, cfg: dict) -> int:
                         detections=Path(a.detections) if a.detections else None,
                         tracknet=tracknet, tracknet_threshold=a.tracknet_threshold, tracknet_fallback=fallback,
                         joint_fit=a.joint_fit, joint_options=JointOptions(estimate_vt=not a.no_estimate_vt),
-                        fit_backend=a.fit_backend)
+                        fit_backend=a.fit_backend,
+                        priors=ShotPriors(serve_depth_m=None if a.serve_depth is None else tuple(a.serve_depth),
+                                          receiver_sigma_m=a.receiver_end))
     info = analyze_video(o, cfg, progress=lambda m: print(m, flush=True))
     print()
     print("種類ごとの本数")
@@ -674,6 +677,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ラリーの中のショットをつないでまとめて当てはめ直す（打点・打った時刻をとなりのショットと合わせ、"
                         "長いショットからシャトルの終端速度も求める）")
     p.add_argument("--no-estimate-vt", action="store_true", help="--joint-fit のとき、終端速度は設定の値のままにする")
+    p.add_argument("--serve-depth", type=float, nargs=2, default=None, metavar=("MEAN", "SD"),
+                   help="ラリーの最初の打球をサーブとみなし、打点のネットからの深さの目安（平均・標準偏差 [m]）にする")
+    p.add_argument("--receiver-end", type=float, nargs="?", const=1.0, default=None, metavar="SIGMA",
+                   help="次に打つ人の足元を、飛行の終わりの目安にする（--players と一緒に。水平の不確かさ [m]、既定 1.0）")
     p.add_argument("--fit-backend", default="auto", choices=["auto", "cpu", "batch"],
                    help="当てはめの計算の仕方（cpu：1 本ずつプロセスで並べる、batch：まとめて解く、auto：batch が使えれば batch）")
     p.set_defaults(func=cmd_shots)

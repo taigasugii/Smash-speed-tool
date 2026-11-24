@@ -19,7 +19,7 @@ App.views.shots = {
     this.notHit = r.not_hit || null;
     this.notHitLabel = r.not_hit_label || "打球ではない";
     this.stats = r.label_stats || null;
-    this.renderStart(el, info, shots.length > 0, !!r.model);
+    this.renderStart(el, info, shots.length > 0, !!r.model, r.model_hint);
     if (!mine) return;
     this.renderSummary(el, info, shots);
     this.renderExport(el, info, shots, r.files || {});
@@ -88,7 +88,7 @@ App.views.shots = {
   },
 
   // ---- 解析を始める
-  renderStart(el, info, has, model) {
+  renderStart(el, info, has, model, hint) {
     const dur = App.meta.duration;
     // 選手なしで動画の長さの 1.4〜2.2 倍、練習の動画（打球が多くラリーが少ない）は約 3 倍（docs/speed.md、F3d）
     const minutes = (s) => Math.max(1, Math.round(s * 2.5 / 60));
@@ -108,6 +108,7 @@ App.views.shots = {
         <label class="row small" title="相手が打つ時の小さなジャンプ（構え）、動き出しまでの時間、打った後に戻るまでの時間などを、ショットごとに出します。選手の立ち位置も記録します"><input type="checkbox" id="footwork" ${info.footwork ? "checked" : ""}> 選手の動き（構え・動き出し・戻り）と、ショットの出来の目安も出す</label>
         ${model ? `<label class="row small" title="この動画のようなバドミントンの動画で練習させたシャトルの見つけ方です。打った瞬間の見落としと、ほかの物をシャトルと間違えることが減ります"><input type="checkbox" id="model" ${info.detector === "baseline" ? "" : "checked"}> 練習させた見つけ方でシャトルを探す（おすすめ）</label>` : ""}
       </div>
+      ${!model && hint ? `<p class="muted small" id="modelhint" style="margin-top:6px">${esc(hint)}</p>` : ""}
       <div class="row" style="margin-top:12px"><button class="btn primary" id="go">${has ? "解析し直す" : "解析を始める"}</button>
         <span class="muted small" id="eta"></span></div></div>`);
     let part = info.start_s != null || info.end_s != null;
