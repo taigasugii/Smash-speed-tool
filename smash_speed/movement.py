@@ -58,6 +58,12 @@ class MovementOptions:
     cell_m: float = 0.5          # ヒートマップのマスの大きさ [m]
     margin_m: float = 1.5        # ヒートマップに入れる、コートの外側の線からの広げ幅 [m]
     rally_lead_s: float = 0.5    # ラリーの移動距離に含める、最初に打つ前の時間 [s]
+    # 枠の下の辺が枠の高さの 1% 動いたときの床の上の動き（``players.foot_noise_m``。列 ``foot_noise_m`` があるときだけ）：
+    # 区間の中央値がこれより大きければ、最高の速さのならしをその比の分だけ強くする（上限 ``max_peak_factor`` 倍）。
+    # 低いカメラの奥の選手は手前の 2〜3 倍動き、枠の下の辺の揺れが 8 m/s ほどの速さの山になる
+    # （IMG_3391 1.2 s・IMG_5096 12.7 s・IMG_5109 27.4 s）。手前の選手（0.06〜0.11 m）はほとんど変わらない
+    ref_noise_m: float = 0.10
+    max_peak_factor: float = 2.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -118,7 +124,12 @@ def smooth_track(track: pd.DataFrame, o: MovementOptions | None = None) -> pd.Da
             xs, ys = np.interp(ts, ts[~bad], xs[~bad]), np.interp(ts, ts[~bad], ys[~bad])
             out.loc[k, "outlier"] = bad
         sx, sy = _smooth(xs, fps, o.median_s, o.smooth_s), _smooth(ys, fps, o.median_s, o.smooth_s)
-        px, py = _smooth(xs, fps, o.median_s, o.peak_smooth_s), _smooth(ys, fps, o.median_s, o.peak_smooth_s)
+        peak_s = o.peak_smooth_s
+        if "foot_noise_m" in g:
+            noise = float(np.nanmedian(g.loc[k, "foot_noise_m"].to_numpy(float)))
+            if np.isfinite(noise) and noise > o.ref_noise_m:
+                peak_s *= min(o.max_peak_factor, noise / o.ref_noise_m)
+        px, py = _smooth(xs, fps, o.median_s, peak_s), _smooth(ys, fps, o.median_s, peak_s)
         out.loc[k, "x"], out.loc[k, "y"] = sx, sy
         out.loc[k, "speed"], out.loc[k, "peak_speed"] = _speed(ts, sx, sy), _speed(ts, px, py)
         # いた時間：前後のコマとの間隔の半分ずつ（区間の端は 1 コマ分）

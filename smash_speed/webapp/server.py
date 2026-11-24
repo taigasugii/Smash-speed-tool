@@ -85,10 +85,11 @@ S = Session()
 # 裏で動かすコマンド
 # =============================================================================
 class Task:
-    def __init__(self, title: str, commands: list[list[str]]):
+    def __init__(self, title: str, commands: list[list[str]], keep_going: bool = False):
         self.id = uuid.uuid4().hex[:10]
         self.title = title
         self.commands = commands
+        self.keep_going = keep_going   # 真なら、失敗したコマンドがあっても次へ進む（まとめて解析。最後は failed）
         self.lines: list[str] = []
         self.status = "running"   # running | done | failed | cancelled
         self.proc: subprocess.Popen | None = None
@@ -98,10 +99,14 @@ class Task:
     def _run(self) -> None:
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        failed = False
         for cmd in self.commands:
             if self.cancelled:
                 break
-            self.lines.append("$ smash-speed " + " ".join(cmd[3:]))
+            if cmd[1:3] == ["-m", "smash_speed.cli"]:
+                self.lines.append("$ smash-speed " + " ".join(cmd[3:]))
+            elif cmd[1:2] == ["-m"]:
+                self.lines.append("$ python -m " + " ".join(cmd[2:]))
             try:
                 self.proc = subprocess.Popen(cmd, cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              env=env, creationflags=flags, text=True, encoding="utf-8", errors="replace")
@@ -112,9 +117,13 @@ class Task:
             for line in self.proc.stdout:
                 self.lines.append(line.rstrip("\n"))
             if self.proc.wait() != 0:
+                if self.keep_going and not self.cancelled:
+                    failed = True
+                    self.lines.append("（失敗しました。次へ進みます）")
+                    continue
                 self.status = "cancelled" if self.cancelled else "failed"
                 return
-        self.status = "cancelled" if self.cancelled else "done"
+        self.status = "cancelled" if self.cancelled else ("failed" if failed else "done")
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -140,8 +149,8 @@ def cli(*args: Any) -> list[str]:
     return cmd + [str(a) for a in args]
 
 
-def start_task(title: str, commands: list[list[str]]) -> Task:
-    t = Task(title, commands)
+def start_task(title: str, commands: list[list[str]], keep_going: bool = False) -> Task:
+    t = Task(title, commands, keep_going)
     TASKS[t.id] = t
     return t
 
@@ -791,6 +800,33 @@ def run(kind: str):
                 args += ["--start", f"{float(b['start']):.3f}", "--end", f"{float(b['end']):.3f}"]
             title = "速さを重ねた動画を書き出す"
         t = start_task(title, [cli(*args)])
+    elif kind == "drill":
+        # 開いている動画の基礎打ちの解析（コート合わせはいらない。ホームの「基礎打ちを解析する」）
+        from smash_speed import video_queue as vq
+
+        if not st.get("video") or not Path(st["video"]).exists():
+            return err("先に動画を開いてください。")
+        item = vq.item_for(Path(st["video"]), root)
+        item.todo = ["drill"]          # 済んでいても、押したら解析し直す
+        args = vq.commands(item, root, cli, model=bool(b.get("model")), python=python_exe())[0]
+        if st.get("capture_fps"):
+            args += ["--capture-fps", str(st["capture_fps"])]
+        if st.get("audio"):
+            args += ["--audio", st["audio"]]
+        t = start_task("基礎打ちの解析", [args])
+    elif kind == "queue":
+        from smash_speed import video_queue as vq
+
+        paths = [str(x) for x in (b.get("paths") or [])]
+        items = [vq.item_for(Path(x), root) for x in paths if Path(x).is_file()]
+        items = [it for it in items if not it.done]
+        if not items:
+            return err("解析する動画がありません（選んだ動画はどれも解析済みです）。")
+        cmds = []
+        for it in items:
+            cmds.append([python_exe(), "-c", f"print({('▶ ' + it.name)!r}, flush=True)"])
+            cmds += vq.commands(it, root, cli, model=bool(b.get("model")), python=python_exe())
+        t = start_task(f"まとめて解析（{len(items)} 本）", cmds, keep_going=True)
     elif kind == "propose_calib":
         if S.meta is None:
             return err("動画を開いてください")
@@ -833,6 +869,77 @@ def run(kind: str):
     else:
         return err("不明な処理です")
     return ok(task=t.id)
+
+
+def videos_dir() -> str:
+    """まとめて解析する動画のフォルダ（画面で選んだもの。なければ ``.agent/config.json`` の ``videos_dir``）。"""
+    if S.state.get("videos_dir"):
+        return str(S.state["videos_dir"])
+    try:
+        return str(json.loads((PROJECT_ROOT / ".agent" / "config.json").read_text(encoding="utf-8-sig"))
+                   .get("videos_dir") or "")
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def home_status() -> dict[str, Any]:
+    """開いている動画の状態と、次にすること（ホーム。ROADMAP v2 の L2）。
+
+    順番は「動画を選ぶ → コートを合わせる（基礎打ちの解析は合わせなしで先にできる）→ 解析する → 見る」。
+    ``next`` は、その順でまだの最初のもの：video・calib・shots・view。
+    """
+    from smash_speed import video_queue as vq
+    from smash_speed.shot_list import SHOT_LIST_FILE
+
+    out: dict[str, Any] = {"video": None, "calibrated": False, "drill": {"done": False}, "shots": {"done": False},
+                           "next": "video"}
+    v = S.state.get("video")
+    if S.meta is None or not v:
+        return out
+    stem = Path(v).stem
+    out["video"] = Path(v).name
+    cam = load_camera()
+    out["calibrated"] = bool(cam and not cam.get("error"))
+    dd = vq.drill_dir(out_root(), stem)
+    if (dd / vq.DRILL_DONE).exists():
+        try:
+            info = json.loads((dd / vq.DRILL_DONE).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = {}
+        out["drill"] = {"done": True, "dir": str(dd), "n_hits": info.get("n_hits"),
+                        "hits_per_min": info.get("hits_per_min"), "n_onsets": info.get("n_onsets"),
+                        "duration_s": info.get("duration_s") or (float(S.meta.timestamps[-1]) if S.meta else None)}
+    sd = Path(_shots_dir_for_video())
+    if (sd / SHOT_LIST_FILE).exists():
+        try:
+            info = json.loads((sd / SHOT_LIST_FILE).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = {}
+        same = Path(str(info.get("video") or "")).name.lower() == Path(v).name.lower()
+        out["shots"] = {"done": same, "dir": str(sd), "n_shots": info.get("n_hits"), "n_rallies": info.get("n_rallies")}
+    out["next"] = "calib" if not out["calibrated"] else ("shots" if not out["shots"]["done"] else "view")
+    return out
+
+
+def _shots_dir_for_video() -> str:
+    return S.state.get("shots_dir") or str(out_root() / f"{Path(S.state['video']).stem}_shots")
+
+
+@app.get("/api/home")
+def home():
+    return ok(**home_status())
+
+
+@app.get("/api/queue")
+def queue():
+    """動画のフォルダの動画と、解析の状態（まとめて解析。ROADMAP v2 の L3）。"""
+    from smash_speed import video_queue as vq
+
+    d = videos_dir()
+    if not d or not Path(d).is_dir():
+        return ok(videos_dir=d, items=[], error="動画のフォルダを選んでください。" if not d else "フォルダが見つかりません。")
+    items = vq.list_videos(Path(d), out_root())
+    return ok(videos_dir=d, items=[it.to_dict() for it in items], out_root=str(out_root()))
 
 
 @app.get("/api/task/<tid>")
@@ -1002,17 +1109,19 @@ def shots_get():
 
     種類の正解ラベル（ROADMAP B6）は出力の場所の ``shot_labels.csv`` から付け直し、各ショットの ``truth`` に入れる。
     ``model`` は、学習したシャトルの検出（設定の ``detection.shot_list_model``。F1c）を使えるか（画面の選択肢を出すか）。
+    使えないがモデルのファイルはあるときは、``model_hint`` に ONNX に書き出す手順（``shot_list.tracknet_hint``。K1）。
     """
     from dataclasses import asdict
 
     from smash_speed.shot_labels import LABELS_FILE, NOT_A_HIT, NOT_A_HIT_LABEL, match_labels, read_labels
-    from smash_speed.shot_list import SHOT_LIST_FILE, default_tracknet
+    from smash_speed.shot_list import SHOT_LIST_FILE, default_tracknet, tracknet_hint
     from smash_speed.shots import SHOT_TYPE_LABELS, SHOTS_FILE, read_shots
 
     d = _shots_dir()
     model = default_tracknet(S.cfg()) is not None
+    hint = None if model else tracknet_hint(S.cfg())
     if not d or not (Path(d) / SHOT_LIST_FILE).exists() or not (Path(d) / SHOTS_FILE).exists():
-        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS, model=model)
+        return ok(shots=[], info={}, dir=d, labels=SHOT_TYPE_LABELS, model=model, model_hint=hint)
     info = json.loads((Path(d) / SHOT_LIST_FILE).read_text(encoding="utf-8"))
     shots = read_shots(Path(d) / SHOTS_FILE)
     labels = read_labels(out_root() / LABELS_FILE)
@@ -1032,7 +1141,7 @@ def shots_get():
              if (Path(d) / f).exists()}
     # 正しい種類として選べるのは、labels の 8 種類（unknown のほか）と「打球ではない」（not_hit）
     return ok(shots=rows, info=info, dir=d, labels=SHOT_TYPE_LABELS, not_hit=NOT_A_HIT, not_hit_label=NOT_A_HIT_LABEL,
-              files=files, model=model,
+              files=files, model=model, model_hint=hint,
               label_stats=_label_stats(labels, info.get("video", "")))
 
 

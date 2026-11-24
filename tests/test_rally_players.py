@@ -207,3 +207,46 @@ def test_rallies_with_players_rewrites_movement_with_final_rallies(tmp_path):
     assert len(new) == 2 and info["players"]["n_shots_outside_rallies"] == 0
     saved = json.loads((tmp_path / "movement.json").read_text("utf-8"))["players"]["h0"]
     assert [r["rally_id"] for r in saved["rallies"]] == [1, 2]
+
+
+def _rally_then_reset(serve_t=6.0, flying_before=False):
+    """ラリー（0.5〜4.4 秒、シャトルが飛んでいる）→ 1.6 秒ほどでシャトルを渡し、h がサービスコートで止まってサーブ（serve_t）。
+
+    打球の間はどれも 3 秒より短く、着地も次の打球の後なので、選手の動きを使わなければ 1 つのラリーになる。
+    """
+    shots = [Shot(t_hit_s=t, side=sd, speed_kmh=80, hit_x_m=x, hit_y_m=0.0, t_land_s=t + 1.5)
+             for t, sd, x in ((0.5, "h", -2.5), (1.4, "o", 3.0), (2.4, "h", -4.0), (3.3, "o", 4.0),
+                              (4.4, "h", -3.0))]
+    shots += [Shot(t_hit_s=serve_t, side="h", speed_kmh=60, hit_x_m=-2.5, hit_y_m=-0.7, t_land_s=serve_t + 1.8),
+              Shot(t_hit_s=serve_t + 1.2, side="o", speed_kmh=70, hit_x_m=3.0, hit_y_m=0.7, t_land_s=serve_t + 2.5),
+              Shot(t_hit_s=serve_t + 2.0, side="h", speed_kmh=90, hit_x_m=-2.5, hit_y_m=-0.7, t_land_s=serve_t + 2.6)]
+    t = np.arange(0, 10, 1 / FPS)
+    feet = {"h": np.tile(SERVE_H, (len(t), 1)), "o": np.tile(SERVE_O, (len(t), 1))}
+    # ラリーの中は素早く動き、渡すときは o が歩いてサーブの直前まで動く（受ける人は止まっていない）
+    feet["h"] = feet["h"] + _walk(t, [0, 0], [0, 2.5], 1.0, 1.5) - _walk(t, [0, 0], [0, 2.5], 2.6, 3.1)
+    feet["o"] = feet["o"] + _walk(t, [0, 0], [2.0, 0], 3.5, 4.0) - _walk(t, [0, 0], [2.0, 0], 4.6, serve_t - 0.1)
+    vis = ((t >= 0.5) & (t <= 4.9)) | ((t >= serve_t) & (t <= serve_t + 2.0))
+    if flying_before:
+        vis |= (t >= serve_t - 1.2) & (t < serve_t)
+    det = pd.DataFrame({"timestamp": t, "visible": vis.astype(int)})
+    return shots, det, _players(t, feet)
+
+
+def test_serve_after_a_short_reset_splits_the_rally():
+    from smash_speed.rallies import REASON_RESET
+
+    shots, det, players = _rally_then_reset()
+    no_pl = split_rallies([Shot(**vars(s)) for s in shots], det)
+    assert [r.n_shots for r in no_pl] == [8]
+    rallies = split_rallies(shots, det, players=players)
+    assert [r.n_shots for r in rallies] == [5, 3]
+    assert REASON_RESET in rallies[0].note
+    # 切れば今までと同じ
+    off = split_rallies([Shot(**vars(s)) for s in shots], det, RallyOptions(reset_split=False), players=players)
+    assert [r.n_shots for r in off] == [8]
+
+
+def test_serve_like_stance_with_the_shuttle_flying_does_not_split():
+    """打った人が止まって見えても、その前にシャトルが飛んでいればラリーの途中（区切らない）。"""
+    shots, det, players = _rally_then_reset(flying_before=True)
+    assert [r.n_shots for r in split_rallies(shots, det, players=players)] == [8]

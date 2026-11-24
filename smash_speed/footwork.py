@@ -13,7 +13,8 @@
   ``react_hold_s`` 続けて動き出すまで [s]。打つ所へ向かう向き（速度と打つ所への向きのなす角の cos が
   ``toward_cos`` 以上）だけを数える。負なら相手が打つ前に動き出した（読んでいた）。相手が打つ ``react_lead_s`` 前から
   もう打つ所へ向かって動いていたら、前の動きの続きなので空欄（練習の続けて打つ球に多い）。
-- **移動**：相手が打ってから自分が打つまでの移動距離と最高の速さ（``movement`` と同じならし方）。
+- **移動**：相手が打ってから自分が打つまでの移動距離と最高の速さ（``movement`` と同じならし方。足元の揺れが床の上で
+  大きい奥の選手（``players.foot_noise_m``）ほど最高の速さを強くならす。K3）。
 - **準備の時間**：打つ所（打った時の足元）から ``arrive_m`` 以内に着いてから打つまで [s]。
 - **戻り**：打った時の足元から、そのラリーでいちばん長くいた所（``base``。ラリーの間の足元の中央値）までの距離と、
   次に相手が打つまでに ``recover_m`` 以内へ戻るのにかかった時間 [s]（戻れなければ空欄）。
@@ -21,7 +22,8 @@
   ``players.ground_jumps`` が跳んでいるとしたコマがあれば、それも跳んだとする。
 
 浮いた高さは小さい（スプリットステップは 5〜12 cm、4K の奥の選手で数 px）ので、確かでないことがある。
-窓の中に、枠が画面の端に付いたコマ（体が切れている）、位置が出ていないコマ・補ったコマが多いときは
+窓の中に、枠が画面の端に付いたコマ（体が切れている）、位置が出ていないコマ・補ったコマ・足元が不確かなコマ
+（``players.uncertain_feet``。ネットの帯・ほかの選手の枠）が多いときは
 ``uncertain`` を真にして、理由を ``uncertain_reason`` に書く。まとめ（``footwork.json``）は確かな行だけで出す。
 
 **ショットの出来の目安**（``quality``、0〜100）は、決まった項目の点（それぞれ 0〜1）の平均。学習はしない。
@@ -81,6 +83,10 @@ class FootworkOptions:
     edge_px: float = 3.0            # 枠が画面の端からこれ以内なら、体が切れているかもしれない [px]
     max_missing: float = 0.3        # 窓の中の、位置が出ていないコマの割合の上限
     max_interpolated: float = 0.3   # 同・補ったコマの割合の上限
+    # 足元の確かさ（I5。``players.uncertain_feet``・``foot_noise_m``）を使う（K3）。``foot_noise_m`` のない古い
+    # ``players.csv`` でも、カメラと枠があればここで出し、奥の選手ほど最高の速さを強くならす（``movement``）
+    use_foot_noise: bool = True
+    max_foot_uncertain: float = 0.3  # 窓の中の「足元が不確か」のコマの割合の上限
     max_prev_gap_s: float = 2.5     # ラリーが分からないとき、受けた球とみなす 1 本前のショットまでの間隔の上限 [s]
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,6 +177,12 @@ def player_tracks(players: pd.DataFrame, camera: Camera | None = None, image_siz
         else:
             lift = jlift = jdepth = np.full(len(g), np.nan)
         fixed = g.copy()
+        if not o.use_foot_noise:
+            fixed = fixed.drop(columns=[c for c in ("foot_noise_m",) if c in fixed])
+        elif "foot_noise_m" not in fixed and camera is not None and has_box:
+            from smash_speed.players import foot_noise_m
+
+            fixed["foot_noise_m"] = foot_noise_m(fixed, camera)
         hop = np.nan_to_num(lift) > o.split_min_m
         if hop.any() and (~hop).sum() >= 2:
             for c in ("x", "y"):
@@ -191,6 +203,8 @@ def player_tracks(players: pd.DataFrame, camera: Camera | None = None, image_siz
         tr["vx"], tr["vy"] = _velocity(tr.assign(x=px, y=py))
         tr["airborne"] = g["airborne"].astype(bool).to_numpy() if "airborne" in g else False
         tr["interpolated"] = g["interpolated"].astype(bool).to_numpy() if "interpolated" in g else False
+        tr["foot_uncertain"] = (g["foot_uncertain"].astype(bool).to_numpy()
+                                if o.use_foot_noise and "foot_uncertain" in g else False)
         if has_box and image_size is not None:
             w, h = image_size
             e = o.edge_px
@@ -349,6 +363,8 @@ def _uncertain(tr: pd.DataFrame, t0: float, t1: float, has_lift: bool, o: Footwo
         why.append("補ったコマが多い")
     if len(w) and w["edge"].any():
         why.append("体が画面の端で切れている")
+    elif len(w) and "foot_uncertain" in w and w["foot_uncertain"].mean() > o.max_foot_uncertain:
+        why.append("足元が不確か（ネット・ほかの選手に隠れている）")
     if not has_lift:
         why.append("跳んだ高さが測れない（カメラなし）")
     return why

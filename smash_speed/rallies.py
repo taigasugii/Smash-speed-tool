@@ -33,6 +33,15 @@
 サーブを打つ前は 2 人とも止まって構えるので、サーブだけで終わったラリー（サービスエース・サーブのミス）は落とさない。
 選手の位置が出ていない所（``min_cover`` 未満）では確かめない。``players`` を渡さなければ今までと同じ。
 
+選手の位置があれば、間が短くて区切られなかった所でも、次の打球がサーブらしければ区切る（「構え直し」。``serve_reset``。I9）。
+打つ人が止まってサービスコートの辺りにいて、その前はシャトルがほとんど見えず（手に持っている）、打った後は飛んでいるもの。
+ラリーの終わりにシャトルを拾って渡し、すぐサーブを打つと、打球の間が 3 秒より短くなる（IMG_5109_1 の 9 s／10.8 s）。
+
+ラリーの最後の打球が、当てはめに失敗し、打った後シャトルがほとんど見えないものなら、ラリーが終わった後にシャトルを
+拾って渡したとき（の音・動き）を打球と取り違えたものとみなしてラリーから外す（``is_pickup``。後ろから順に。I9b）。
+外したショットは ``rally_id`` を空欄にし、メモに「ラリーの外：ラリーの後に拾った」と書く。外した後の最後の打球も
+当てはめに失敗していれば、その前の打球の軌道が床に着く時刻を終わりにする（IMG_5109 の 28.0 s）。
+
 ``python -m smash_speed.rallies --bench`` で、続けて打った合成ラリー（``synth_rally.make_session``）での精度を、
 打球の間隔だけで分ける今までのやり方（``shots.make_rallies``）と比べる。
 """
@@ -51,10 +60,12 @@ from smash_speed.shots import Rally, Shot, side_of
 REASON_GAP = "間隔"
 REASON_LANDED = "着地"
 REASON_END = "動画の終わり"
+REASON_RESET = "構え直し"
 # 選手の動きで落とした理由（``Shot.note`` に「ラリーの外：…」と書く）
 REASON_NO_HITTER = "打った人がいない"
 REASON_OFF_COURT = "選手がコートの外"
 REASON_NOT_READY = "選手が構えていない"
+REASON_PICKUP = "ラリーの後に拾った"
 
 
 @dataclass
@@ -73,6 +84,12 @@ class RallyOptions:
     still_mps: float = 1.0       # サーブの前の still_s の間、2 人ともこれより遅ければ止まって構えている [m/s]
     still_s: float = 1.0
     min_cover: float = 0.6       # 確かめる時間のうち、選手の位置が出ている割合がこれ未満なら確かめない
+    # ラリーの途中の構え直し（``split_rallies`` に ``players`` を渡したときだけ使う。I9）
+    reset_split: bool = True     # 次の打球がサーブらしければ、間が短くても区切る（``serve_reset``）
+    reset_flying_frac: float = 0.3  # サーブの前の ``still_s`` の間に、シャトルが見えたコマがこれ未満なら飛んでいない
+    reset_after_s: float = 0.5   # サーブの後これだけの間に、シャトルが ``flying_frac`` 以上見えていること [s]
+    trim_pickups: bool = True    # ラリーの終わりの、拾って渡すときの「打球」を外す（``is_pickup``。I9b）
+    pickup_flying_frac: float = 0.3  # 打った後 ``reset_after_s`` の間に、シャトルが見えたコマがこれ未満なら飛んでいない
 
 
 @dataclass
@@ -217,6 +234,53 @@ def check_short_rally(rally_shots: list[Shot], t_end: float | None, tracks: pd.D
     return "" if still and in_service else REASON_NOT_READY
 
 
+def serve_reset(nxt: Shot, tracks: pd.DataFrame, vis_t: np.ndarray, dt: float | None, o: RallyOptions,
+                court: dict[str, Any] | None = None, t_following: float = np.inf) -> bool:
+    """ショット ``nxt`` が、ラリーの途中ではなくサーブ（構え直してからの打球）らしいか。
+
+    打つ前の ``still_s`` の間、打った人が ``still_mps`` より遅く（止まって構えている）、サービスコートの辺りにいて、
+    その間シャトルがほとんど飛んでいない（見えたコマが ``reset_flying_frac`` 未満。サーブの前は打つ人が手に持っている）、
+    打った後 ``reset_after_s`` の間（次の打球 ``t_following`` まで）はシャトルが飛んでいる（見えたコマが ``flying_frac`` 以上）。
+    相手は止まっていなくてもよい（IMG_5109 では、受ける人はサーブの直前まで構える位置へ歩いている）。
+    ラリーの途中は、打った人が止まって見えても（低いカメラの奥の選手など）シャトルが飛んでいるので区切らない。
+    選手の位置・シャトルの検出が足りなければ区切らない。
+    """
+    c = court or {}
+    half_len = c.get("half_length_m", 6.70)
+    half_w = c.get("half_width_doubles_m", 3.05)
+    t0 = nxt.t_hit_s
+    if not nxt.side:
+        return False
+    pre0 = t0 - o.still_s - 0.1
+    frac = visible_fraction(vis_t, dt, pre0, t0 - 0.1, pad_s=0.0)
+    if frac is None or frac >= o.reset_flying_frac or not _covered(tracks, nxt.side, pre0, t0 - 0.1, o):
+        return False
+    # サーブならシャトルは打った後に飛んでいく（シャトルを拾って渡すときの音・動きを打球と取り違えたものは、後に見えない）
+    after = visible_fraction(vis_t, dt, t0, min(t0 + o.reset_after_s, t_following))
+    if after is None or after < o.flying_frac:
+        return False
+    before = _window(tracks, nxt.side, pre0, t0 - 0.1)
+    if not len(before) or float(np.nanmax(before["speed"].to_numpy(float))) >= o.still_mps:
+        return False
+    hitter = _nearest(tracks, nxt.side, t0)
+    return bool(len(hitter)) and bool(((hitter["x"].abs() >= 1.98 - 0.5) & (hitter["x"].abs() <= half_len + 0.3)
+                                       & (hitter["y"].abs() <= half_w + 0.3)).any())
+
+
+def is_pickup(s: Shot, vis_t: np.ndarray, dt: float | None, o: RallyOptions, t_following: float = np.inf) -> bool:
+    """ラリーの最後の打球 ``s`` が、ラリーが終わった後にシャトルを拾って渡したとき（の音・動き）を取り違えたものらしいか。
+
+    軌道の当てはめに失敗し（初速が出ていない）、打った後 ``reset_after_s`` の間（次の打球 ``t_following`` まで）に
+    シャトルがほとんど見えない（見えたコマが ``pickup_flying_frac`` 未満）もの。本当の打球なら、打った後シャトルは飛んで
+    見える（IMG_5109・IMG_5109_1 のラリーの途中の、当てはめに失敗した打球でも 36〜100%。拾う打球は 0〜25%）。
+    シャトルの検出がなければ外さない。
+    """
+    if s.speed_kmh is not None:
+        return False
+    after = visible_fraction(vis_t, dt, s.t_hit_s, min(s.t_hit_s + o.reset_after_s, t_following))
+    return after is not None and after < o.pickup_flying_frac
+
+
 def drop_false_rallies(rallies: list[Rally], shots: list[Shot], players: pd.DataFrame, o: RallyOptions,
                        court: dict[str, Any] | None = None) -> list[Rally]:
     """短いラリーを選手の動きで確かめ（``check_short_rally``）、ラリーではないものを落として番号を付け直す。
@@ -265,21 +329,59 @@ def split_rallies(shots: list[Shot], det: pd.DataFrame | None = None, opts: Rall
     order = sorted(shots, key=lambda s: s.t_hit_s)
     vis_t, dt = _visible_times(det), _frame_dt(det)
     bounds = [judge_gap(a, b, vis_t, dt, o) for a, b in zip(order[:-1], order[1:])]
-    rallies: list[Rally] = []
-    for i, s in enumerate(order):
-        if i == 0 or bounds[i - 1].split:
-            rallies.append(Rally(rally_id=len(rallies) + 1, t_start_s=s.t_hit_s))
-        r = rallies[-1]
-        r.n_shots += 1
-        s.rally_id, s.index_in_rally = r.rally_id, r.n_shots
+    if players is not None and o.reset_split and not players.empty:
+        from smash_speed.movement import movement_tracks
+
+        tracks = movement_tracks(players)
+        if not tracks.empty:
+            for i, (b, n) in enumerate(zip(bounds, order[1:])):
+                t_following = order[i + 2].t_hit_s if i + 2 < len(order) else np.inf
+                if not b.split and serve_reset(n, tracks, vis_t, dt, o, court, t_following):
+                    b.split, b.reason = True, REASON_RESET
+    # 区切りでまとめる（ラリーごとのショット・終わった理由・次のラリーの最初の打球の時刻）
+    groups: list[tuple[list[Shot], str, float]] = []
+    start = 0
+    for i in range(len(order)):
         if i < len(bounds) and not bounds[i].split:
             continue
-        reason, t_limit = (bounds[i].reason, order[i + 1].t_hit_s) if i < len(bounds) else (REASON_END, np.inf)
+        reason, t_next = (bounds[i].reason, order[i + 1].t_hit_s) if i < len(bounds) else (REASON_END, np.inf)
+        groups.append((order[start:i + 1], reason, t_next))
+        start = i + 1
+    rallies: list[Rally] = []
+    for mine, reason, t_next in groups:
+        # ラリーの終わりの、拾って渡すときの「打球」を外す（後ろから順に）
+        picked: list[Shot] = []
+        while o.trim_pickups and mine:
+            k = order.index(mine[-1])
+            t_following = order[k + 1].t_hit_s if k + 1 < len(order) else np.inf
+            if not is_pickup(mine[-1], vis_t, dt, o, t_following):
+                break
+            picked.insert(0, mine.pop())
+        for s in picked:
+            s.rally_id = s.index_in_rally = None
+            s.note = "・".join(x for x in (f"ラリーの外：{REASON_PICKUP}", s.note) if x)
+        if not mine:
+            continue
+        r = Rally(rally_id=len(rallies) + 1, t_start_s=mine[0].t_hit_s)
+        rallies.append(r)
+        for s in mine:
+            r.n_shots += 1
+            s.rally_id, s.index_in_rally = r.rally_id, r.n_shots
+        s = mine[-1]
+        t_limit = picked[0].t_hit_s if picked else t_next
         # ラリーの終わり：着地 → 最後に見えた時刻 → 打った時刻
         t_land = _land_time(s)
         landed = t_land is not None and t_land < t_limit
+        # 最後の打球の当てはめに失敗し、その前の打球の軌道がその後に床に着くなら、その着地を終わりにする
+        # （拾う打球を外した後の IMG_5109 の 27.78 s。打ち返せなかった・音を取り違えたもの。終わり方は分からない）
+        prev_land = _land_time(mine[-2]) if len(mine) > 1 and s.speed_kmh is None else None
         seen = vis_t[(vis_t > s.t_hit_s) & (vis_t < t_limit)]
-        r.t_end_s = t_land if landed else float(seen[-1]) if len(seen) else s.t_hit_s
+        if landed:
+            r.t_end_s = t_land
+        elif picked and prev_land is not None and s.t_hit_s < prev_land < t_limit:
+            r.t_end_s = prev_land
+        else:
+            r.t_end_s = float(seen[-1]) if len(seen) else s.t_hit_s
         r.end_reason, r.winner_side, note = rally_outcome(s, o, court) if landed else ("", "", "")
         r.note = "・".join(x for x in (f"終わり：{reason}", note) if x)
     if players is not None:

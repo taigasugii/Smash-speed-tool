@@ -173,7 +173,10 @@ def retrack_hitters(entry: dict[str, Any], video: Path, cfg: dict[str, Any], det
                        end_s=b["end_s"], status="ok", hitter=dict(b.get("hitter_rough") or b["hitter"]),
                        landing=b["landing"], confirmed=b["confirmed"]) for b in entry["candidates"]]
     notes: dict[int, str] = {}
-    candidate_hitters(cands, meta, camera, cfg, detector, progress=lambda s: None, notes=notes)
+    # 打った側は、基準の軌道（``detections_csv``）の打った直後の点に近い選手で決める（``batch.shuttle_side``）
+    shuttle = {b["id"]: pd.read_csv(io.StringIO(b["detections_csv"])).query("visible == 1")
+               for b in entry["candidates"] if b.get("detections_csv")}
+    candidate_hitters(cands, meta, camera, cfg, detector, progress=lambda s: None, notes=notes, shuttle=shuttle)
     n = 0
     for c in cands:
         b = by_id[c.id]
