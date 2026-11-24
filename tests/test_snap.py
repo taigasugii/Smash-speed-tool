@@ -307,3 +307,20 @@ def test_propose_finds_court_from_net_side_oblique_camera():
     err = min(float(np.median(np.linalg.norm(_apply_h(H, W[m]) - ref[m], axis=1)))
               for H in (props[0].result.homography, props[0].result.homography @ np.diag([-1.0, -1, 1])))
     assert err < 3.0
+
+
+def test_vanishing_candidates_without_camera_position():
+    from smash_speed.calibration.propose import vanishing_candidates
+
+    table = landmark_table(load_config())
+    # 練習の動画の撮り方（手前の半面の横、外側の線から 0.9 m 外・高さ 1.5 m からネットの向こうへ）。手順 ① の位置はない
+    frame, Hm = _floor_render((-6.1, 3.9, 1.5), (4.0, -1.0, 1.2), 900.0, size=(540, 960))
+    cands = vanishing_candidates(frame, None)
+    assert cands
+    W = np.array([v[:2] for v in table.values() if abs(v[2]) < 1e-6])
+    ref = _apply_h(Hm, W)
+    q = np.c_[W, np.ones(len(W))] @ Hm.T
+    m = (q[:, 2] > 0) & (ref[:, 0] >= 0) & (ref[:, 0] < 960) & (ref[:, 1] >= 0) & (ref[:, 1] < 540)
+    errs = [min(float(np.median(np.linalg.norm(_apply_h(H @ s, W[m]) - ref[m], axis=1)))
+                for s in (np.eye(3), np.diag([-1.0, -1, 1]))) for H, _ in cands]
+    assert min(errs) < 5.0
